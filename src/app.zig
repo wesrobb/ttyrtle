@@ -161,9 +161,14 @@ pub fn run(mode: Mode) !void {
                 else => null,
             },
         );
+        model.setReplySink(.{
+            .context = session.?,
+            .write = queueTerminalReply,
+        });
         if (mode == .integration_input) try queueIntegrationInput();
     }
     defer if (session) |active_session| {
+        model.setReplySink(null);
         active_session.destroy();
         session = null;
     };
@@ -270,6 +275,7 @@ fn windowProc(
         },
         wm.WM_CLOSE => {
             if (session) |active_session| {
+                model.setReplySink(null);
                 active_session.destroy();
                 session = null;
             }
@@ -348,6 +354,13 @@ fn queueEncodedInput(event: input.NormalizedKey) !void {
     try active_session.queueInputOwned(encoded);
 }
 
+fn queueTerminalReply(context: *anyopaque, bytes: []const u8) !void {
+    const active_session: *conpty.Session = @ptrCast(@alignCast(context));
+    const owned = try std.heap.smp_allocator.dupe(u8, bytes);
+    errdefer std.heap.smp_allocator.free(owned);
+    try active_session.queueInputOwned(owned);
+}
+
 fn currentModifiers() input.Mods {
     return .{
         .shift = keyIsDown(0x10),
@@ -387,6 +400,22 @@ fn paint(window: foundation.HWND) bool {
 
     _ = user32.FillRect(dc, &paint_state.rcPaint, background);
     _ = gdi32.SetBkMode(dc, gdi.TRANSPARENT);
+
+    for (frame.rectangles.items) |rectangle| {
+        const brush = gdi32.CreateSolidBrush(toColorRef(rectangle.color)) orelse
+            return false;
+        defer _ = gdi32.DeleteObject(brush);
+        const bounds: foundation.RECT = .{
+            .left = rectangle.left,
+            .top = rectangle.top,
+            .right = rectangle.right,
+            .bottom = rectangle.bottom,
+        };
+        _ = if (rectangle.outline)
+            user32.FrameRect(dc, &bounds, brush)
+        else
+            user32.FillRect(dc, &bounds, brush);
+    }
 
     for (frame.text_runs.items) |*text_run| {
         _ = gdi32.SetTextColor(dc, toColorRef(text_run.color));
@@ -455,6 +484,7 @@ fn handleConptyOutput(window: foundation.HWND) void {
         changed = true;
     }
 
+    applyTerminalEffects(window);
     if (changed) _ = user32.InvalidateRect(window, null, 0);
 
     if (active_mode == .integration_resize and
@@ -500,6 +530,22 @@ fn handleConptyOutput(window: foundation.HWND) void {
         if (active_session.childExitCode() != null)
             _ = user32.DestroyWindow(window);
     }
+}
+
+fn applyTerminalEffects(window: foundation.HWND) void {
+    if (model.takeTitleChanged()) {
+        const title = model.core.getTitle() orelse "";
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(
+            std.heap.smp_allocator,
+            title,
+        ) catch null;
+        if (wide) |value| {
+            defer std.heap.smp_allocator.free(value);
+            _ = user32.SetWindowTextW(window, value);
+        }
+    }
+
+    if (model.takeBellCount() > 0) _ = user32.MessageBeep(.{});
 }
 
 fn isIntegrationMode(mode: Mode) bool {
