@@ -1,0 +1,16 @@
+.{
+    .name = .win32_terminal,
+    .version = "0.0.1",
+    .fingerprint = 0x8c20347537929472,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .ghostty = .{ .path = "../ghostty" },
+        .win32 = .{ .path = "../zigwin32" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
