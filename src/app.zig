@@ -8,6 +8,8 @@ const terminal = @import("terminal.zig");
 
 const foundation = win32.foundation;
 const gdi = win32.graphics.gdi;
+const memory = win32.system.memory;
+const ole = win32.system.ole;
 const wm = win32.ui.windows_and_messaging;
 const gdi32 = win32.gdi32;
 const kernel32 = win32.kernel32;
@@ -36,6 +38,8 @@ var output_finished = false;
 var session: ?*conpty.Session = null;
 var input_translator: input.Translator = .{};
 var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
+var selection_dragging = false;
+var pressed_mouse_button: ?input.MouseButton = null;
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
@@ -64,6 +68,8 @@ pub fn run(mode: Mode) !void {
     session = null;
     input_translator = .{};
     terminal_metrics = .forDpi(geometry.base_dpi);
+    selection_dragging = false;
+    pressed_mouse_button = null;
 
     try model.init(allocator, 24, 80);
     model_initialized = true;
@@ -113,6 +119,10 @@ pub fn run(mode: Mode) !void {
     defer if (user32.IsWindow(window) != 0) {
         _ = user32.DestroyWindow(window);
     };
+    const cursor_timer = user32.SetTimer(window, 1, 500, null);
+    defer {
+        if (cursor_timer != 0) _ = user32.KillTimer(window, cursor_timer);
+    }
 
     terminal_metrics = .forDpi(user32.GetDpiForWindow(window));
     try resizeForClient(window);
@@ -238,6 +248,13 @@ fn windowProc(
             };
             return 0;
         },
+        wm.WM_TIMER => {
+            if (wparam == 1) {
+                model.toggleCursorBlink();
+                _ = user32.InvalidateRect(window, null, 0);
+            }
+            return 0;
+        },
         conpty.output_message => {
             handleConptyOutput(window);
             return 0;
@@ -273,6 +290,30 @@ fn windowProc(
             input_translator.deadCharacter();
             return 0;
         },
+        wm.WM_SETFOCUS => {
+            queueFocus(.gained);
+            return 0;
+        },
+        wm.WM_KILLFOCUS => {
+            queueFocus(.lost);
+            return 0;
+        },
+        wm.WM_PASTE => {
+            pasteClipboard(window);
+            return 0;
+        },
+        wm.WM_LBUTTONDOWN,
+        wm.WM_MBUTTONDOWN,
+        wm.WM_RBUTTONDOWN,
+        wm.WM_LBUTTONUP,
+        wm.WM_MBUTTONUP,
+        wm.WM_RBUTTONUP,
+        wm.WM_MOUSEMOVE,
+        wm.WM_MOUSEWHEEL,
+        => {
+            handleMouseMessage(window, message, wparam, lparam);
+            return 0;
+        },
         wm.WM_CLOSE => {
             if (session) |active_session| {
                 model.setReplySink(null);
@@ -294,6 +335,19 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
     if (active_mode == .smoke or session == null) return;
 
     const is_down = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN;
+    if (is_down and currentModifiers().ctrl and currentModifiers().shift) {
+        switch (wparam) {
+            'V' => {
+                pasteClipboard(null);
+                return;
+            },
+            'C' => {
+                copySelection(null);
+                return;
+            },
+            else => {},
+        }
+    }
     const bits: usize = @bitCast(lparam);
     const action: input.Action = if (!is_down)
         .release
@@ -310,6 +364,189 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
         @truncate(bits & 0xffff),
     ) orelse return;
     encodeAndQueueInput(event);
+}
+
+const MouseButton = input.MouseButton;
+
+fn queueFocus(event: input.FocusEvent) void {
+    if (active_mode == .smoke or session == null) return;
+    const encoded = input.encodeFocusAlloc(
+        std.heap.smp_allocator,
+        event,
+        &model.core,
+    ) catch return;
+    queueOwnedInput(encoded);
+}
+
+fn queueOwnedInput(encoded: []u8) void {
+    if (encoded.len == 0) {
+        std.heap.smp_allocator.free(encoded);
+        return;
+    }
+    const active_session = session orelse {
+        std.heap.smp_allocator.free(encoded);
+        return;
+    };
+    active_session.queueInputOwned(encoded) catch {
+        std.heap.smp_allocator.free(encoded);
+    };
+}
+
+fn handleMouseMessage(
+    window: foundation.HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) void {
+    const local_selection = model.core.flags.mouse_event == .none or
+        currentModifiers().shift;
+    var point = messagePoint(lparam);
+    if (message == wm.WM_MOUSEWHEEL and
+        user32.ScreenToClient(window, &point) == 0) return;
+    const cell = pointToCell(point);
+
+    if (local_selection) {
+        switch (message) {
+            wm.WM_LBUTTONDOWN => {
+                model.startSelection(cell.row, cell.column);
+                selection_dragging = true;
+                _ = user32.SetCapture(window);
+                _ = user32.InvalidateRect(window, null, 0);
+            },
+            wm.WM_MOUSEMOVE => if (selection_dragging) {
+                model.updateSelection(cell.row, cell.column);
+                _ = user32.InvalidateRect(window, null, 0);
+            },
+            wm.WM_LBUTTONUP => if (selection_dragging) {
+                model.updateSelection(cell.row, cell.column);
+                selection_dragging = false;
+                _ = user32.ReleaseCapture();
+                _ = user32.InvalidateRect(window, null, 0);
+            },
+            else => {},
+        }
+        return;
+    }
+
+    const action: input.MouseAction = switch (message) {
+        wm.WM_LBUTTONDOWN,
+        wm.WM_MBUTTONDOWN,
+        wm.WM_RBUTTONDOWN,
+        wm.WM_MOUSEWHEEL,
+        => .press,
+        wm.WM_LBUTTONUP, wm.WM_MBUTTONUP, wm.WM_RBUTTONUP => .release,
+        else => .motion,
+    };
+    const button: ?MouseButton = switch (message) {
+        wm.WM_LBUTTONDOWN, wm.WM_LBUTTONUP => .left,
+        wm.WM_MBUTTONDOWN, wm.WM_MBUTTONUP => .middle,
+        wm.WM_RBUTTONDOWN, wm.WM_RBUTTONUP => .right,
+        wm.WM_MOUSEWHEEL => if (signedHighWord(wparam) > 0) .four else .five,
+        else => pressed_mouse_button,
+    };
+    if (action == .press and message != wm.WM_MOUSEWHEEL)
+        pressed_mouse_button = button;
+    if (action == .release) pressed_mouse_button = null;
+
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(window, &client) == 0) return;
+    const encoded = input.encodeMouseAlloc(
+        std.heap.smp_allocator,
+        .{
+            .action = action,
+            .button = button,
+            .mods = currentModifiers(),
+            .pos = .{
+                .x = @floatFromInt(point.x),
+                .y = @floatFromInt(point.y),
+            },
+        },
+        &model.core,
+        @intCast(@max(client.right, 0)),
+        @intCast(@max(client.bottom, 0)),
+        terminal_metrics.cell_width,
+        terminal_metrics.cell_height,
+        terminal_metrics.margin_x,
+        terminal_metrics.margin_y,
+        pressed_mouse_button != null,
+    ) catch return;
+    queueOwnedInput(encoded);
+}
+
+fn messagePoint(lparam: isize) foundation.POINT {
+    const bits: usize = @bitCast(lparam);
+    return .{
+        .x = @as(i16, @bitCast(@as(u16, @truncate(bits)))),
+        .y = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16)))),
+    };
+}
+
+fn signedHighWord(value: usize) i16 {
+    return @bitCast(@as(u16, @truncate(value >> 16)));
+}
+
+fn pointToCell(point: foundation.POINT) terminal.Cursor {
+    const x = @max(point.x - @as(i32, @intCast(terminal_metrics.margin_x)), 0);
+    const y = @max(point.y - @as(i32, @intCast(terminal_metrics.margin_y)), 0);
+    return .{
+        .row = @intCast(@divTrunc(y, @as(i32, @intCast(terminal_metrics.cell_height)))),
+        .column = @intCast(@divTrunc(x, @as(i32, @intCast(terminal_metrics.cell_width)))),
+        .style = .block,
+        .color = .{ .red = 0, .green = 0, .blue = 0 },
+        .visible = false,
+        .blinking = false,
+    };
+}
+
+fn pasteClipboard(window: ?foundation.HWND) void {
+    if (session == null or user32.OpenClipboard(window) == 0) return;
+    defer _ = user32.CloseClipboard();
+    const handle = user32.GetClipboardData(@intFromEnum(ole.CF_UNICODETEXT)) orelse
+        return;
+    const locked = kernel32.GlobalLock(@intCast(@intFromPtr(handle))) orelse return;
+    defer _ = kernel32.GlobalUnlock(@intCast(@intFromPtr(handle)));
+    const wide: [*:0]const u16 = @ptrCast(@alignCast(locked));
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(
+        std.heap.smp_allocator,
+        std.mem.span(wide),
+    ) catch return;
+    defer std.heap.smp_allocator.free(utf8);
+    const encoded = input.encodePasteAlloc(
+        std.heap.smp_allocator,
+        utf8,
+        &model.core,
+    ) catch return;
+    queueOwnedInput(encoded);
+}
+
+fn copySelection(window: ?foundation.HWND) void {
+    const utf8 = model.selectionTextAlloc(std.heap.smp_allocator) catch return;
+    defer std.heap.smp_allocator.free(utf8);
+    if (utf8.len == 0) return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(
+        std.heap.smp_allocator,
+        utf8,
+    ) catch return;
+    defer std.heap.smp_allocator.free(wide);
+
+    if (user32.OpenClipboard(window) == 0) return;
+    defer _ = user32.CloseClipboard();
+    if (user32.EmptyClipboard() == 0) return;
+    const byte_length = (wide.len + 1) * @sizeOf(u16);
+    const memory_handle = kernel32.GlobalAlloc(memory.GMEM_MOVEABLE, byte_length);
+    if (memory_handle == 0) return;
+    const locked = kernel32.GlobalLock(memory_handle) orelse {
+        _ = kernel32.GlobalFree(memory_handle);
+        return;
+    };
+    const destination = @as([*]u8, @ptrCast(locked))[0..byte_length];
+    @memcpy(destination[0 .. wide.len * @sizeOf(u16)], std.mem.sliceAsBytes(wide));
+    @memset(destination[wide.len * @sizeOf(u16) ..], 0);
+    _ = kernel32.GlobalUnlock(memory_handle);
+    if (user32.SetClipboardData(
+        @intFromEnum(ole.CF_UNICODETEXT),
+        @ptrFromInt(@as(usize, @intCast(memory_handle))),
+    ) == null) _ = kernel32.GlobalFree(memory_handle);
 }
 
 fn handleCharacterMessage(code_unit: u16) void {
@@ -481,6 +718,7 @@ fn handleConptyOutput(window: foundation.HWND) void {
             if (isIntegrationMode(active_mode)) _ = user32.DestroyWindow(window);
             return;
         };
+        model.resetCursorBlink();
         changed = true;
     }
 
@@ -550,7 +788,10 @@ fn applyTerminalEffects(window: foundation.HWND) void {
 
 fn isIntegrationMode(mode: Mode) bool {
     return switch (mode) {
-        .integration, .integration_input, .integration_resize => true,
+        .integration,
+        .integration_input,
+        .integration_resize,
+        => true,
         else => false,
     };
 }

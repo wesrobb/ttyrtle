@@ -54,13 +54,21 @@ pub const Frame = struct {
                     metrics.margin_y +
                         @as(u32, @intCast(row)) * metrics.cell_height,
                 );
-                if (!std.meta.eql(cell.background, frame.background)) {
+                const cell_background = if (cell.selected)
+                    cell.foreground
+                else
+                    cell.background;
+                const cell_foreground = if (cell.selected)
+                    cell.background
+                else
+                    cell.foreground;
+                if (!std.meta.eql(cell_background, frame.background)) {
                     try frame.rectangles.append(allocator, .{
                         .left = x,
                         .top = y,
                         .right = x + @as(i32, @intCast(metrics.cell_width)),
                         .bottom = y + @as(i32, @intCast(metrics.cell_height)),
-                        .color = cell.background,
+                        .color = cell_background,
                     });
                 }
                 const cursor_here = cursor.visible and
@@ -92,18 +100,18 @@ pub const Frame = struct {
                     !std.meta.eql(
                         frame.text_runs.items[active_run.?].color,
                         if (cursor_here and cursor.style == .block)
-                            cell.background
+                            cell_background
                         else
-                            cell.foreground,
+                            cell_foreground,
                     ))
                 {
                     try frame.text_runs.append(allocator, .{
                         .x = x,
                         .y = y,
                         .color = if (cursor_here and cursor.style == .block)
-                            cell.background
+                            cell_background
                         else
-                            cell.foreground,
+                            cell_foreground,
                     });
                     active_run = frame.text_runs.items.len - 1;
                 }

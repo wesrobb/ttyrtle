@@ -16,6 +16,7 @@ pub const CellSnapshot = struct {
     bold: bool,
     faint: bool,
     underline: bool,
+    selected: bool,
 };
 
 pub const CursorStyle = enum {
@@ -50,6 +51,9 @@ pub const TerminalModel = struct {
     bell_count: usize,
     cell_width: u32,
     cell_height: u32,
+    selection_anchor: ?Cursor,
+    selection_head: ?Cursor,
+    cursor_blink_visible: bool,
 
     pub fn init(
         self: *TerminalModel,
@@ -72,6 +76,9 @@ pub const TerminalModel = struct {
             .bell_count = 0,
             .cell_width = 0,
             .cell_height = 0,
+            .selection_anchor = null,
+            .selection_head = null,
+            .cursor_blink_visible = true,
         };
         errdefer self.core.deinit(allocator);
 
@@ -207,13 +214,85 @@ pub const TerminalModel = struct {
             },
             .color = rgb(raw_color),
             .visible = self.render_state.cursor.visible and
-                self.render_state.cursor.viewport != null,
+                self.render_state.cursor.viewport != null and
+                (!self.render_state.cursor.blinking or self.cursor_blink_visible),
             .blinking = self.render_state.cursor.blinking,
         };
     }
 
+    pub fn toggleCursorBlink(self: *TerminalModel) void {
+        self.cursor_blink_visible = !self.cursor_blink_visible;
+    }
+
+    pub fn resetCursorBlink(self: *TerminalModel) void {
+        self.cursor_blink_visible = true;
+    }
+
     pub fn background(self: *const TerminalModel) Rgb {
         return rgb(self.render_state.colors.background);
+    }
+
+    pub fn startSelection(self: *TerminalModel, row: u32, column: u32) void {
+        const point: Cursor = .{
+            .row = @min(row, self.rows() -| 1),
+            .column = @min(column, self.columns() -| 1),
+            .style = .block,
+            .color = .{ .red = 0, .green = 0, .blue = 0 },
+            .visible = false,
+            .blinking = false,
+        };
+        self.selection_anchor = point;
+        self.selection_head = point;
+    }
+
+    pub fn updateSelection(self: *TerminalModel, row: u32, column: u32) void {
+        if (self.selection_anchor == null) return;
+        self.selection_head = .{
+            .row = @min(row, self.rows() -| 1),
+            .column = @min(column, self.columns() -| 1),
+            .style = .block,
+            .color = .{ .red = 0, .green = 0, .blue = 0 },
+            .visible = false,
+            .blinking = false,
+        };
+    }
+
+    pub fn clearSelection(self: *TerminalModel) void {
+        self.selection_anchor = null;
+        self.selection_head = null;
+    }
+
+    pub fn selectionTextAlloc(
+        self: *const TerminalModel,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        const bounds = self.selectionBounds() orelse return allocator.alloc(u8, 0);
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        for (bounds.start.row..bounds.end.row + 1) |row| {
+            const first_column = if (row == bounds.start.row)
+                bounds.start.column
+            else
+                0;
+            const last_column = if (row == bounds.end.row)
+                bounds.end.column
+            else
+                self.columns() - 1;
+            var line: std.Io.Writer.Allocating = .init(allocator);
+            defer line.deinit();
+            for (first_column..last_column + 1) |column| {
+                const snapshot = self.cell(row, column) orelse continue;
+                if (snapshot.spacer) continue;
+                const codepoint = snapshot.codepoint orelse ' ';
+                try writeCodepoint(&line.writer, codepoint);
+                for (snapshot.grapheme) |grapheme|
+                    try writeCodepoint(&line.writer, grapheme);
+            }
+            const text = std.mem.trimEnd(u8, line.writer.buffered(), " ");
+            try output.writer.writeAll(text);
+            if (row != bounds.end.row) try output.writer.writeByte('\n');
+        }
+        return output.toOwnedSlice();
     }
 
     pub fn cell(self: *const TerminalModel, row: usize, column: usize) ?CellSnapshot {
@@ -275,7 +354,30 @@ pub const TerminalModel = struct {
             .bold = style.flags.bold,
             .faint = style.flags.faint,
             .underline = style.flags.underline != .none,
+            .selected = self.isSelected(@intCast(row), @intCast(column)),
         };
+    }
+
+    const SelectionBounds = struct {
+        start: Cursor,
+        end: Cursor,
+    };
+
+    fn selectionBounds(self: *const TerminalModel) ?SelectionBounds {
+        var start = self.selection_anchor orelse return null;
+        var end = self.selection_head orelse return null;
+        if (end.row < start.row or
+            (end.row == start.row and end.column < start.column))
+            std.mem.swap(Cursor, &start, &end);
+        return .{ .start = start, .end = end };
+    }
+
+    fn isSelected(self: *const TerminalModel, row: u32, column: u32) bool {
+        const bounds = self.selectionBounds() orelse return false;
+        if (row < bounds.start.row or row > bounds.end.row) return false;
+        if (row == bounds.start.row and column < bounds.start.column) return false;
+        if (row == bounds.end.row and column > bounds.end.column) return false;
+        return true;
     }
 
     pub fn rowTextUtf8(
@@ -301,6 +403,12 @@ pub const TerminalModel = struct {
 
 fn rgb(color: ghostty.color.RGB) Rgb {
     return .{ .red = color.r, .green = color.g, .blue = color.b };
+}
+
+fn writeCodepoint(writer: *std.Io.Writer, codepoint: u21) !void {
+    var encoded: [4]u8 = undefined;
+    const length = try std.unicode.utf8Encode(codepoint, &encoded);
+    try writer.writeAll(encoded[0..length]);
 }
 
 const VtHandler = @FieldType(ghostty.TerminalStream, "handler");
@@ -414,4 +522,19 @@ test "title and bell effects are retained until consumed" {
     try std.testing.expect(!model.takeTitleChanged());
     try std.testing.expectEqual(@as(usize, 1), model.takeBellCount());
     try std.testing.expectEqualStrings("working", model.core.getTitle().?);
+}
+
+test "selection extracts trimmed multiline Unicode text" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 3, 8);
+    defer model.deinit();
+    try model.write("héllo\r\nworld");
+    model.startSelection(0, 1);
+    model.updateSelection(1, 4);
+
+    const text = try model.selectionTextAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("éllo\nworld", text);
+    try std.testing.expect(model.cell(0, 1).?.selected);
+    try std.testing.expect(!model.cell(0, 0).?.selected);
 }

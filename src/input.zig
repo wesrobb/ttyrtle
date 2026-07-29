@@ -4,6 +4,9 @@ const ghostty = @import("ghostty-vt");
 pub const Key = ghostty.input.Key;
 pub const Action = ghostty.input.KeyAction;
 pub const Mods = ghostty.input.KeyMods;
+pub const FocusEvent = ghostty.input.FocusEvent;
+pub const MouseAction = ghostty.input.MouseAction;
+pub const MouseButton = ghostty.input.MouseButton;
 
 pub const NormalizedKey = struct {
     key: Key,
@@ -128,6 +131,72 @@ pub fn encodeAlloc(
             event.ghosttyEvent(),
             .fromTerminal(terminal),
         );
+    return output.toOwnedSlice();
+}
+
+pub fn encodeFocusAlloc(
+    allocator: std.mem.Allocator,
+    event: ghostty.input.FocusEvent,
+    terminal: *const ghostty.Terminal,
+) ![]u8 {
+    if (!terminal.modes.get(.focus_event)) return allocator.alloc(u8, 0);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try ghostty.input.encodeFocus(&output.writer, event);
+    return output.toOwnedSlice();
+}
+
+/// Encodes clipboard text using Ghostty's paste rules. Multiline text is
+/// rejected outside bracketed-paste mode so an ordinary shell cannot execute
+/// pasted commands without an application explicitly opting into paste fences.
+pub fn encodePasteAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    terminal: *const ghostty.Terminal,
+) ![]u8 {
+    const options = ghostty.input.PasteOptions.fromTerminal(terminal);
+    if (!options.bracketed and !ghostty.input.isSafePaste(text))
+        return error.UnsafePaste;
+
+    const mutable = try allocator.dupe(u8, text);
+    defer allocator.free(mutable);
+    const slices = ghostty.input.encodePaste(mutable, options);
+    const length = slices[0].len + slices[1].len + slices[2].len;
+    const result = try allocator.alloc(u8, length);
+    var offset: usize = 0;
+    for (slices) |slice| {
+        @memcpy(result[offset..][0..slice.len], slice);
+        offset += slice.len;
+    }
+    return result;
+}
+
+pub fn encodeMouseAlloc(
+    allocator: std.mem.Allocator,
+    event: ghostty.input.MouseEncodeEvent,
+    terminal: *const ghostty.Terminal,
+    screen_width: u32,
+    screen_height: u32,
+    cell_width: u32,
+    cell_height: u32,
+    margin_x: u32,
+    margin_y: u32,
+    any_button_pressed: bool,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var options = ghostty.input.MouseEncodeOptions.fromTerminal(terminal, .{
+        .screen = .{ .width = screen_width, .height = screen_height },
+        .cell = .{ .width = cell_width, .height = cell_height },
+        .padding = .{
+            .left = margin_x,
+            .right = margin_x,
+            .top = margin_y,
+            .bottom = margin_y,
+        },
+    });
+    options.any_button_pressed = any_button_pressed;
+    try ghostty.input.encodeMouse(&output.writer, event, options);
     return output.toOwnedSlice();
 }
 
@@ -377,4 +446,93 @@ test "repeat count emits one encoded sequence per Windows repeat" {
     }, &terminal);
     defer std.testing.allocator.free(encoded);
     try std.testing.expectEqualStrings("\x1b[D\x1b[D\x1b[D", encoded);
+}
+
+test "paste sanitizes controls and follows bracketed paste mode" {
+    var terminal: ghostty.Terminal = try .init(
+        std.testing.io,
+        std.testing.allocator,
+        .{ .rows = 2, .cols = 2 },
+    );
+    defer terminal.deinit(std.testing.allocator);
+
+    const plain = try encodePasteAlloc(
+        std.testing.allocator,
+        "hello\x03world",
+        &terminal,
+    );
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("hello world", plain);
+    try std.testing.expectError(
+        error.UnsafePaste,
+        encodePasteAlloc(std.testing.allocator, "one\ntwo", &terminal),
+    );
+
+    terminal.modes.set(.bracketed_paste, true);
+    const bracketed = try encodePasteAlloc(
+        std.testing.allocator,
+        "one\ntwo",
+        &terminal,
+    );
+    defer std.testing.allocator.free(bracketed);
+    try std.testing.expectEqualStrings(
+        "\x1b[200~one\ntwo\x1b[201~",
+        bracketed,
+    );
+}
+
+test "focus reports only when requested by terminal mode" {
+    var terminal: ghostty.Terminal = try .init(
+        std.testing.io,
+        std.testing.allocator,
+        .{ .rows = 2, .cols = 2 },
+    );
+    defer terminal.deinit(std.testing.allocator);
+
+    const disabled = try encodeFocusAlloc(
+        std.testing.allocator,
+        .gained,
+        &terminal,
+    );
+    defer std.testing.allocator.free(disabled);
+    try std.testing.expectEqual(@as(usize, 0), disabled.len);
+
+    terminal.modes.set(.focus_event, true);
+    const enabled = try encodeFocusAlloc(
+        std.testing.allocator,
+        .lost,
+        &terminal,
+    );
+    defer std.testing.allocator.free(enabled);
+    try std.testing.expectEqualStrings("\x1b[O", enabled);
+}
+
+test "mouse encoding uses terminal modes and cell geometry" {
+    var terminal: ghostty.Terminal = try .init(
+        std.testing.io,
+        std.testing.allocator,
+        .{ .rows = 10, .cols = 10 },
+    );
+    defer terminal.deinit(std.testing.allocator);
+    terminal.flags.mouse_event = .normal;
+    terminal.flags.mouse_format = .sgr;
+
+    const encoded = try encodeMouseAlloc(
+        std.testing.allocator,
+        .{
+            .action = .press,
+            .button = .left,
+            .pos = .{ .x = 25, .y = 45 },
+        },
+        &terminal,
+        100,
+        200,
+        10,
+        20,
+        5,
+        5,
+        true,
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings("\x1b[<0;3;3M", encoded);
 }
