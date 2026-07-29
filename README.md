@@ -29,6 +29,23 @@ zig build run
 
 `Nvy` is a design/reference dependency, not a linked source dependency.
 
+## Verification
+
+Run the complete automated verification suite before committing:
+
+```powershell
+zig build test              # Fast Ghostty/model/render-command unit tests
+zig build test-integration  # Hidden Win32 window lifecycle test
+zig build smoke             # Self-closing end-to-end executable
+zig build check             # Compile Debug and ReleaseFast
+zig build verify            # Formatting plus every check above
+```
+
+The smoke path requests a paint synchronously and then exits through the normal
+`WM_CLOSE`/`WM_DESTROY` message flow, so it does not depend on sleeps or manual
+interaction. GitHub Actions runs `zig build verify` on Windows with pinned
+Ghostty and zigwin32 revisions.
+
 ## Deliberately not included yet
 
 There is no PTY, shell process, keyboard input, resizing, font shaping, or GPU

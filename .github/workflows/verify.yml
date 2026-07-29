@@ -1,0 +1,40 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out win32-terminal
+        uses: actions/checkout@v4
+        with:
+          path: win32-terminal
+
+      - name: Check out Ghostty
+        uses: actions/checkout@v4
+        with:
+          repository: ghostty-org/ghostty
+          ref: 6ad1fe7d8cbda36c77b337a96c9bea8a77883699
+          path: ghostty
+
+      - name: Check out zigwin32
+        uses: actions/checkout@v4
+        with:
+          repository: marlersoft/zigwin32
+          ref: 9f15c276b4e9d05afd34a10d8662a7dfc34647ea
+          path: zigwin32
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Verify
+        working-directory: win32-terminal
+        run: zig build verify
