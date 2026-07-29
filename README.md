@@ -51,7 +51,8 @@ zig build verify            # Formatting plus every check above
 The smoke path requests a paint synchronously and then exits through the normal
 `WM_CLOSE`/`WM_DESTROY` message flow, so it does not depend on sleeps or manual
 interaction. The integration path launches a finite ConPTY child, verifies
-known truecolor VT output in the Ghostty model, and confirms reader teardown.
+known truecolor VT output in the Ghostty model, confirms reader teardown, and
+requires a hosted process to observe an exact window-driven terminal resize.
 GitHub Actions runs `zig build verify` on Windows with pinned Ghostty and
 zigwin32 revisions.
 
@@ -63,6 +64,7 @@ before the application exits.
 
 Basic keyboard input supports printable Unicode, common editing/navigation
 keys, function keys, modifiers, and repeats. IME candidate UI, paste, mouse
-input, and keybindings remain deferred. ConPTY and the Ghostty grid remain
-fixed at 80 by 24 cells, and cursor appearance, background colors, font
-shaping, selection, and GPU rendering are also deferred.
+input, and keybindings remain deferred. ConPTY and the Ghostty grid track the
+DPI-scaled client area; advanced DPI behavior still remains deferred. Cursor
+appearance, background colors, font shaping, selection, and GPU rendering are
+also deferred.

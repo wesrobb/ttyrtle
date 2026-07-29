@@ -21,6 +21,7 @@ pub const Mode = enum {
     smoke,
     integration,
     integration_input,
+    integration_resize,
     integration_host_close,
 };
 
@@ -29,6 +30,8 @@ var model_initialized = false;
 var active_mode: Mode = .normal;
 var paint_completed = false;
 var integration_succeeded = false;
+var integration_resize_requested = false;
+var integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 };
 var output_finished = false;
 var session: ?*conpty.Session = null;
 var input_translator: input.Translator = .{};
@@ -43,6 +46,8 @@ const integration_input_marker = "CONPTY_STEP_2_OK";
 const integration_input_command =
     "cmd.exe /d /q /v:on /c " ++
     "\"set /p value=& echo " ++ integration_input_marker ++ " >CON\"";
+const integration_resize_ready = "CONPTY_STEP_3_RESIZE_READY";
+const integration_resize_marker = "CONPTY_STEP_3_RESIZE_OK";
 const integration_host_close_command =
     "cmd.exe /d /q /c " ++
     "\"for /L %i in (1,1,200) do @echo shutdown-output-%i >CON " ++
@@ -53,6 +58,8 @@ pub fn run(mode: Mode) !void {
     active_mode = mode;
     paint_completed = false;
     integration_succeeded = false;
+    integration_resize_requested = false;
+    integration_resize_target = .{ .columns = 1, .rows = 1 };
     output_finished = false;
     session = null;
     input_translator = .{};
@@ -110,6 +117,37 @@ pub fn run(mode: Mode) !void {
     terminal_metrics = .forDpi(user32.GetDpiForWindow(window));
     try resizeForClient(window);
 
+    var integration_resize_command: ?[]u8 = null;
+    defer if (integration_resize_command) |command| allocator.free(command);
+    if (mode == .integration_resize) {
+        integration_resize_target = .{
+            .columns = model.columns() +| 7,
+            .rows = model.rows() +| 3,
+        };
+        const script = try std.fmt.allocPrint(
+            allocator,
+            "$ProgressPreference = 'SilentlyContinue'; " ++
+                "& cmd.exe /d /q /c \"echo " ++ integration_resize_ready ++
+                " > CON\"; $deadline = [DateTime]::UtcNow.AddSeconds(10); " ++
+                "$columns = '(?<!\\d){d}(?!\\d)'; " ++
+                "$rows = '(?<!\\d){d}(?!\\d)'; $matched = $false; " ++
+                "do {{ $status = (& mode.com con | Out-String); " ++
+                "if ($status -match $columns -and $status -match $rows) " ++
+                "{{ $matched = $true; break }}; Start-Sleep -Milliseconds 25 }} " ++
+                "while ([DateTime]::UtcNow -lt $deadline); " ++
+                "if ($matched) " ++
+                "{{ & cmd.exe /d /q /c \"echo " ++ integration_resize_marker ++
+                " > CON\" }} else {{ & cmd.exe /d /q /c " ++
+                "\"echo CONPTY_STEP_3_RESIZE_MISMATCH > CON\"; exit 1 }}",
+            .{
+                integration_resize_target.columns,
+                integration_resize_target.rows,
+            },
+        );
+        defer allocator.free(script);
+        integration_resize_command = try encodedPowerShellCommand(allocator, script);
+    }
+
     if (mode != .smoke) {
         session = try conpty.Session.create(
             allocator,
@@ -118,6 +156,7 @@ pub fn run(mode: Mode) !void {
             switch (mode) {
                 .integration => integration_command,
                 .integration_input => integration_input_command,
+                .integration_resize => integration_resize_command.?,
                 .integration_host_close => integration_host_close_command,
                 else => null,
             },
@@ -418,6 +457,18 @@ fn handleConptyOutput(window: foundation.HWND) void {
 
     if (changed) _ = user32.InvalidateRect(window, null, 0);
 
+    if (active_mode == .integration_resize and
+        !integration_resize_requested and
+        terminalContains(integration_resize_ready))
+    {
+        integration_resize_requested = true;
+        requestIntegrationResize(window) catch {
+            std.log.err("failed to request integration resize", .{});
+            _ = user32.DestroyWindow(window);
+            return;
+        };
+    }
+
     if (batch.failure) |failure| {
         switch (failure) {
             .out_of_memory => std.log.err(
@@ -436,10 +487,11 @@ fn handleConptyOutput(window: foundation.HWND) void {
     }
 
     if (isIntegrationMode(active_mode) and batch.finished) {
-        const marker = if (active_mode == .integration_input)
-            integration_input_marker
-        else
-            integration_marker;
+        const marker = switch (active_mode) {
+            .integration_input => integration_input_marker,
+            .integration_resize => integration_resize_marker,
+            else => integration_marker,
+        };
         integration_succeeded = batch.failure == null and
             terminalContains(marker);
         _ = user32.DestroyWindow(window);
@@ -451,7 +503,64 @@ fn handleConptyOutput(window: foundation.HWND) void {
 }
 
 fn isIntegrationMode(mode: Mode) bool {
-    return mode == .integration or mode == .integration_input;
+    return switch (mode) {
+        .integration, .integration_input, .integration_resize => true,
+        else => false,
+    };
+}
+
+fn requestIntegrationResize(window: foundation.HWND) !void {
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(window, &client) == 0)
+        return error.GetClientRectFailed;
+    var outer: foundation.RECT = undefined;
+    if (user32.GetWindowRect(window, &outer) == 0)
+        return error.GetWindowRectFailed;
+
+    const client_width = client.right - client.left;
+    const client_height = client.bottom - client.top;
+    const outer_width = outer.right - outer.left;
+    const outer_height = outer.bottom - outer.top;
+    const desired_client_width: i32 = @intCast(
+        @as(u32, integration_resize_target.columns) * terminal_metrics.cell_width +
+            terminal_metrics.margin_x * 2,
+    );
+    const desired_client_height: i32 = @intCast(
+        @as(u32, integration_resize_target.rows) * terminal_metrics.cell_height +
+            terminal_metrics.margin_y * 2,
+    );
+
+    if (user32.SetWindowPos(
+        window,
+        null,
+        0,
+        0,
+        outer_width + desired_client_width - client_width,
+        outer_height + desired_client_height - client_height,
+        .{ .NOMOVE = 1, .NOZORDER = 1, .NOACTIVATE = 1 },
+    ) == 0) return error.SetWindowPosFailed;
+
+    if (model.columns() != integration_resize_target.columns or
+        model.rows() != integration_resize_target.rows)
+        return error.ResizeDimensionsMismatch;
+}
+
+fn encodedPowerShellCommand(
+    allocator: std.mem.Allocator,
+    script: []const u8,
+) ![]u8 {
+    const utf16 = try std.unicode.utf8ToUtf16LeAlloc(allocator, script);
+    defer allocator.free(utf16);
+    const bytes = std.mem.sliceAsBytes(utf16);
+    const encoded_length = std.base64.standard.Encoder.calcSize(bytes.len);
+    const encoded = try allocator.alloc(u8, encoded_length);
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    return std.fmt.allocPrint(
+        allocator,
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {s}",
+        .{encoded},
+    );
 }
 
 fn terminalContains(needle: []const u8) bool {

@@ -116,8 +116,9 @@ failure, and child exit all converge on the same cleanup mechanism.
 - [x] Make session teardown idempotent.
 - [x] Keep output draining while `ClosePseudoConsole` runs.
 - [x] Join every worker and close every owned handle.
-- [ ] Add unit tests for pixel-to-cell sizing and state transitions.
+- [x] Add unit tests for pixel-to-cell sizing and state transitions.
 - [x] Add integration tests for child-driven exit and host-driven close.
+- [x] Exercise resize behavior from inside a hosted process.
 - [x] Exercise repeated create/close cycles to catch leaks and races.
 
 ## Verification
@@ -142,6 +143,11 @@ Manually confirm:
 - Repeated launch and close cycles do not leave shell processes behind.
 - Final output produced during shell shutdown is displayed or intentionally
   accounted for.
+
+Automated integration coverage resizes a hidden real window to an exact cell
+size, then requires the hosted process to observe those dimensions through its
+console before it can report success. Manual checks remain necessary for
+interactive wrapping, minimize/restore, and full-screen applications.
 
 ## Exit criteria
 

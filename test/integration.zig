@@ -12,6 +12,10 @@ test "finite ConPTY child receives encoded input and echoes it" {
     try app.run(.integration_input);
 }
 
+test "hosted ConPTY child observes an exact window resize" {
+    try app.run(.integration_resize);
+}
+
 test "host close drains and tears down busy ConPTY sessions repeatedly" {
     for (0..3) |_| try app.run(.integration_host_close);
 }
