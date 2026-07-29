@@ -151,10 +151,10 @@ interactive wrapping, minimize/restore, and full-screen applications.
 
 ## Exit criteria
 
-- [ ] Ghostty and ConPTY always share the same valid cell dimensions.
-- [ ] Hosted applications react correctly to window resizing.
-- [ ] Child exit is detected independently of output traffic.
-- [ ] All shutdown initiators converge on one idempotent path.
-- [ ] Output remains drained while the pseudoconsole closes.
-- [ ] No process, thread, pipe, or pseudoconsole handles leak.
-- [ ] Automated verification passes.
+- [x] Ghostty and ConPTY always share the same valid cell dimensions.
+- [x] Hosted applications react correctly to window resizing.
+- [x] Child exit is detected independently of output traffic.
+- [x] All shutdown initiators converge on one idempotent path.
+- [x] Output remains drained while the pseudoconsole closes.
+- [x] No process, thread, pipe, or pseudoconsole handles leak.
+- [x] Automated verification passes.

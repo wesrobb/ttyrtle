@@ -46,7 +46,7 @@ Update this table as steps move through the workflow.
 | --- | --- | --- | --- |
 | 1 | [ConPTY process and output](conpty-step-1-process-and-output.md) | Complete | A real shell launches and its output is rendered |
 | 2 | [Basic keyboard input](conpty-step-2-basic-input.md) | Complete | The shell accepts mode-aware Unicode, editing, navigation, and control input without blocking the UI |
-| 3 | [Resize and lifecycle](conpty-step-3-resize-and-lifecycle.md) | In progress | Resize, exit, and shutdown are reliable |
+| 3 | [Resize and lifecycle](conpty-step-3-resize-and-lifecycle.md) | Complete | Resize, exit, and shutdown are reliable |
 | 4 | [Terminal completeness](conpty-step-4-terminal-completeness.md) | Not started | Queries and common terminal side effects work |
 
 Allowed status values are `Not started`, `In progress`, `Blocked`, and
@@ -91,6 +91,7 @@ Add one entry when a step is completed.
 | --- | --- | --- | --- | --- |
 | 2026-07-29 | 1 | `master` (working tree) | `zig fmt build.zig src test`; `zig build test`; `zig build test-integration`; `zig build smoke`; `zig build verify` | Finite child writes known truecolor VT text and exits cleanly. |
 | 2026-07-29 | 2 | `master` (working tree) | `zig fmt build.zig src test`; `zig build test`; `zig build test-integration`; `zig build smoke`; `zig build verify` | Scan-code-aware input is Ghostty-encoded and queued to a dedicated writer; a finite child gates its output on received Unicode input. |
+| 2026-07-29 | 3 | `master` (working tree) | `zig fmt build.zig src test`; `zig build test`; `zig build test-integration`; `zig build smoke`; `zig build verify`; manual resize, minimize/restore, and full-screen application checks | Exact-cell integration resize and repeated busy-session shutdown pass; interactive resizing, minimize/restore, and full-screen applications behave correctly. |
 
 ## Deferred beyond this roadmap
 
