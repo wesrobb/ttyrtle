@@ -1,4 +1,4 @@
-# win32-terminal
+# ttyrtle
 
 A deliberately small native Windows terminal prototype:
 

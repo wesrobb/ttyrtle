@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = addExecutable(b, .{
-        .name = "win32-terminal",
+        .name = "ttyrtle",
         .target = target,
         .optimize = optimize,
         .smoke_test = false,
@@ -66,7 +66,7 @@ pub fn build(b: *std.Build) void {
     integration_step.dependOn(&run_integration_tests.step);
 
     const smoke_exe = addExecutable(b, .{
-        .name = "win32-terminal-smoke",
+        .name = "ttyrtle-smoke",
         .target = target,
         .optimize = .Debug,
         .smoke_test = true,
@@ -79,13 +79,13 @@ pub fn build(b: *std.Build) void {
     smoke_step.dependOn(&run_smoke.step);
 
     const check_debug = addExecutable(b, .{
-        .name = "win32-terminal-check-debug",
+        .name = "ttyrtle-check-debug",
         .target = target,
         .optimize = .Debug,
         .smoke_test = false,
     });
     const check_release = addExecutable(b, .{
-        .name = "win32-terminal-check-release",
+        .name = "ttyrtle-check-release",
         .target = target,
         .optimize = .ReleaseFast,
         .smoke_test = false,

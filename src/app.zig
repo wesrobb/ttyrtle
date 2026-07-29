@@ -12,8 +12,8 @@ const gdi32 = win32.gdi32;
 const kernel32 = win32.kernel32;
 const user32 = win32.user32;
 
-const class_name = std.unicode.utf8ToUtf16LeStringLiteral("Win32Terminal");
-const window_title = std.unicode.utf8ToUtf16LeStringLiteral("win32-terminal");
+const class_name = std.unicode.utf8ToUtf16LeStringLiteral("Ttyrtle");
+const window_title = std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle");
 
 pub const Mode = enum {
     normal,

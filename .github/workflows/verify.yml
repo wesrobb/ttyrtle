@@ -11,10 +11,10 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - name: Check out win32-terminal
+      - name: Check out ttyrtle
         uses: actions/checkout@v4
         with:
-          path: win32-terminal
+          path: ttyrtle
 
       - name: Check out Ghostty
         uses: actions/checkout@v4
@@ -36,5 +36,5 @@ jobs:
           version: 0.16.0
 
       - name: Verify
-        working-directory: win32-terminal
+        working-directory: ttyrtle
         run: zig build verify
