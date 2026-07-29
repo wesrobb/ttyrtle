@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
         .root_module = integration_root,
         .use_llvm = true,
     });
+    if (target.result.os.tag == .windows) integration_tests.subsystem = .Windows;
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_step = b.step(
         "test-integration",
