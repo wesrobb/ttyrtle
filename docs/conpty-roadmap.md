@@ -47,7 +47,7 @@ Update this table as steps move through the workflow.
 | 1 | [ConPTY process and output](conpty-step-1-process-and-output.md) | Complete | A real shell launches and its output is rendered |
 | 2 | [Basic keyboard input](conpty-step-2-basic-input.md) | Complete | The shell accepts mode-aware Unicode, editing, navigation, and control input without blocking the UI |
 | 3 | [Resize and lifecycle](conpty-step-3-resize-and-lifecycle.md) | Complete | Resize, exit, and shutdown are reliable |
-| 4 | [Terminal completeness](conpty-step-4-terminal-completeness.md) | Not started | Queries and common terminal side effects work |
+| 4 | [Terminal completeness](conpty-step-4-terminal-completeness.md) | In progress | Queries and common terminal side effects work |
 
 Allowed status values are `Not started`, `In progress`, `Blocked`, and
 `Complete`. When marking a step complete, also check its exit criteria in the
@@ -74,7 +74,7 @@ step plan and record verification below.
 - [x] Output crosses to the UI thread through an owned, synchronized queue.
 - [x] All visible terminal rows render from Ghostty state.
 - [x] Keyboard input is encoded using Ghostty terminal modes.
-- [ ] Ghostty-generated replies share the ConPTY input queue.
+- [x] Ghostty-generated replies share the ConPTY input queue.
 - [x] Window and pseudoconsole dimensions remain synchronized.
 - [x] Child exit and user-initiated close both terminate cleanly.
 - [x] Shutdown continues draining ConPTY output and cannot deadlock.

@@ -99,25 +99,25 @@ maintaining independent escape-sequence tables.
 
 ## Tasks
 
-- [ ] Construct a persistent Ghostty stream from a configurable handler.
-- [ ] Wire `write_pty` to an owned item in the ConPTY input queue.
-- [ ] Provide device attributes and size-query responses.
-- [ ] Handle terminal title changes on the UI thread.
-- [ ] Implement audible or visual bell behavior.
-- [ ] Render cell background colors and inverse video.
-- [ ] Render cursor position, shape, visibility, and blink state.
-- [ ] Improve wide-character and combining-mark rendering.
-- [ ] Add selection state and clipboard copy.
-- [ ] Add safe paste and bracketed paste.
-- [ ] Define a policy for OSC clipboard access.
-- [ ] Encode focus events when requested.
-- [ ] Encode mouse tracking events with correct coordinates.
-- [ ] Preserve a local-selection modifier while mouse tracking is active.
+- [x] Construct a persistent Ghostty stream from a configurable handler.
+- [x] Wire `write_pty` to an owned item in the ConPTY input queue.
+- [x] Provide device attributes and size-query responses.
+- [x] Handle terminal title changes on the UI thread.
+- [x] Implement audible or visual bell behavior.
+- [x] Render cell background colors and inverse video.
+- [x] Render cursor position, shape, visibility, and blink state.
+- [x] Improve wide-character and combining-mark rendering.
+- [x] Add selection state and clipboard copy.
+- [x] Add safe paste and bracketed paste.
+- [x] Define a policy for OSC clipboard access.
+- [x] Encode focus events when requested.
+- [x] Encode mouse tracking events with correct coordinates.
+- [x] Preserve a local-selection modifier while mouse tracking is active.
 - [ ] Complete IME composition handling.
-- [ ] Add unit tests for generated replies, paste, focus, and mouse encoding.
+- [x] Add unit tests for generated replies, paste, focus, and mouse encoding.
 - [ ] Add integration coverage using finite programs that issue terminal
       queries and validate the replies.
-- [ ] Update README with supported features and remaining limitations.
+- [x] Update README with supported features and remaining limitations.
 
 ## Verification
 
@@ -146,11 +146,11 @@ Manually exercise representative applications:
 
 ## Exit criteria
 
-- [ ] Common terminal queries receive correct, non-blocking replies.
-- [ ] Title and bell effects reach the Win32 UI safely.
-- [ ] Cursor and cell backgrounds render from Ghostty state.
+- [x] Common terminal queries receive correct, non-blocking replies.
+- [x] Title and bell effects reach the Win32 UI safely.
+- [x] Cursor and cell backgrounds render from Ghostty state.
 - [ ] Paste, focus, mouse, and IME paths respect active terminal modes.
-- [ ] Clipboard access follows a documented conservative policy.
+- [x] Clipboard access follows a documented conservative policy.
 - [ ] Full-screen terminal applications are practically usable.
-- [ ] README accurately records supported behavior and limitations.
-- [ ] Automated verification passes.
+- [x] README accurately records supported behavior and limitations.
+- [x] Automated verification passes.
