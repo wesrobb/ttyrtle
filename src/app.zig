@@ -1,6 +1,7 @@
 const std = @import("std");
 const win32 = @import("win32");
 const conpty = @import("conpty.zig");
+const geometry = @import("geometry.zig");
 const input = @import("input.zig");
 const render_commands = @import("render_commands.zig");
 const terminal = @import("terminal.zig");
@@ -20,6 +21,7 @@ pub const Mode = enum {
     smoke,
     integration,
     integration_input,
+    integration_host_close,
 };
 
 var model: terminal.TerminalModel = undefined;
@@ -27,8 +29,10 @@ var model_initialized = false;
 var active_mode: Mode = .normal;
 var paint_completed = false;
 var integration_succeeded = false;
+var output_finished = false;
 var session: ?*conpty.Session = null;
 var input_translator: input.Translator = .{};
+var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
@@ -39,14 +43,20 @@ const integration_input_marker = "CONPTY_STEP_2_OK";
 const integration_input_command =
     "cmd.exe /d /q /v:on /c " ++
     "\"set /p value=& echo " ++ integration_input_marker ++ " >CON\"";
+const integration_host_close_command =
+    "cmd.exe /d /q /c " ++
+    "\"for /L %i in (1,1,200) do @echo shutdown-output-%i >CON " ++
+    "& ping -n 30 127.0.0.1 >nul\"";
 
 pub fn run(mode: Mode) !void {
     const allocator = std.heap.smp_allocator;
     active_mode = mode;
     paint_completed = false;
     integration_succeeded = false;
+    output_finished = false;
     session = null;
     input_translator = .{};
+    terminal_metrics = .forDpi(geometry.base_dpi);
 
     try model.init(allocator, 24, 80);
     model_initialized = true;
@@ -97,13 +107,18 @@ pub fn run(mode: Mode) !void {
         _ = user32.DestroyWindow(window);
     };
 
+    terminal_metrics = .forDpi(user32.GetDpiForWindow(window));
+    try resizeForClient(window);
+
     if (mode != .smoke) {
         session = try conpty.Session.create(
             allocator,
             window,
+            .{ .columns = model.columns(), .rows = model.rows() },
             switch (mode) {
                 .integration => integration_command,
                 .integration_input => integration_input_command,
+                .integration_host_close => integration_host_close_command,
                 else => null,
             },
         );
@@ -123,6 +138,8 @@ pub fn run(mode: Mode) !void {
     } else {
         _ = user32.UpdateWindow(window);
     }
+    if (mode == .integration_host_close)
+        _ = user32.PostMessageW(window, wm.WM_CLOSE, 0, 0);
 
     var message: wm.MSG = undefined;
     while (true) {
@@ -152,12 +169,42 @@ fn windowProc(
             }
             return 0;
         },
+        wm.WM_SIZE => {
+            if (wparam != wm.SIZE_MINIMIZED) {
+                resizeForClient(window) catch {
+                    std.log.err("failed to resize terminal for client area", .{});
+                };
+            }
+            return 0;
+        },
+        wm.WM_DPICHANGED => {
+            terminal_metrics = .forDpi(@truncate(wparam));
+            const suggested: *const foundation.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            _ = user32.SetWindowPos(
+                window,
+                null,
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                wm.SWP_NOZORDER,
+            );
+            resizeForClient(window) catch {
+                std.log.err("failed to resize terminal after DPI change", .{});
+            };
+            return 0;
+        },
         conpty.output_message => {
             handleConptyOutput(window);
             return 0;
         },
         conpty.child_exit_message => {
-            if (session) |active_session| active_session.closeAfterChildExit();
+            if (session) |active_session| {
+                _ = active_session.beginClosing();
+                if (active_session.childExitCode()) |code|
+                    std.log.info("ConPTY child exited with code {d}", .{code});
+                if (output_finished) _ = user32.DestroyWindow(window);
+            }
             return 0;
         },
         conpty.input_failure_message => {
@@ -288,7 +335,11 @@ fn paint(window: foundation.HWND) bool {
     const dc = user32.BeginPaint(window, &paint_state) orelse return false;
     defer _ = user32.EndPaint(window, &paint_state);
 
-    var frame = render_commands.Frame.build(std.heap.smp_allocator, &model) catch
+    var frame = render_commands.Frame.build(
+        std.heap.smp_allocator,
+        &model,
+        terminal_metrics,
+    ) catch
         return false;
     defer frame.deinit();
     const background = gdi32.CreateSolidBrush(toColorRef(frame.background)) orelse
@@ -310,6 +361,40 @@ fn paint(window: foundation.HWND) bool {
     }
 
     return true;
+}
+
+fn resizeForClient(window: foundation.HWND) !void {
+    if (!model_initialized) return;
+
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(window, &client) == 0)
+        return error.GetClientRectFailed;
+    const dimensions = terminal_metrics.dimensions(
+        client.right - client.left,
+        client.bottom - client.top,
+    ) orelse return;
+    if (dimensions.rows == model.rows() and dimensions.columns == model.columns())
+        return;
+
+    const old_dimensions: geometry.Dimensions = .{
+        .columns = model.columns(),
+        .rows = model.rows(),
+    };
+    try model.resize(
+        dimensions.rows,
+        dimensions.columns,
+        terminal_metrics.cell_width,
+        terminal_metrics.cell_height,
+    );
+    errdefer model.resize(
+        old_dimensions.rows,
+        old_dimensions.columns,
+        terminal_metrics.cell_width,
+        terminal_metrics.cell_height,
+    ) catch {};
+
+    if (session) |active_session| _ = try active_session.resize(dimensions);
+    _ = user32.InvalidateRect(window, null, 0);
 }
 
 fn toColorRef(color: terminal.Rgb) win32.zig.COLORREF {
@@ -358,6 +443,10 @@ fn handleConptyOutput(window: foundation.HWND) void {
         integration_succeeded = batch.failure == null and
             terminalContains(marker);
         _ = user32.DestroyWindow(window);
+    } else if (batch.finished) {
+        output_finished = true;
+        if (active_session.childExitCode() != null)
+            _ = user32.DestroyWindow(window);
     }
 }
 

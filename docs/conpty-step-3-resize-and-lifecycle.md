@@ -65,6 +65,11 @@ Record the child exit code when it is available. A shell that exits normally
 should either close the window or leave a clear exited-session state according
 to a single documented policy.
 
+Ttyrtle closes the window after an observed child exit and after the output
+reader has delivered EOF and its final queued bytes. A user-initiated close
+drains the pipe during teardown but intentionally discards queued output
+because the window is already closing.
+
 ## Child observation
 
 Wait for the process handle outside the UI thread. On exit:
@@ -99,21 +104,21 @@ failure, and child exit all converge on the same cleanup mechanism.
 
 ## Tasks
 
-- [ ] Define terminal cell geometry, margins, and DPI scaling in one place.
-- [ ] Convert client pixels to validated non-zero cell dimensions.
-- [ ] Handle `WM_SIZE` and relevant DPI-change messages.
-- [ ] Add a resize method to `TerminalModel` using the Ghostty handler.
-- [ ] Call `ResizePseudoConsole` with matching dimensions.
-- [ ] Avoid redundant resize work.
-- [ ] Add an independent child-process waiter.
-- [ ] Capture and surface the child exit code.
-- [ ] Define explicit session states and legal transitions.
-- [ ] Make session teardown idempotent.
-- [ ] Keep output draining while `ClosePseudoConsole` runs.
-- [ ] Join every worker and close every owned handle.
+- [x] Define terminal cell geometry, margins, and DPI scaling in one place.
+- [x] Convert client pixels to validated non-zero cell dimensions.
+- [x] Handle `WM_SIZE` and relevant DPI-change messages.
+- [x] Add a resize method to `TerminalModel` using the Ghostty handler.
+- [x] Call `ResizePseudoConsole` with matching dimensions.
+- [x] Avoid redundant resize work.
+- [x] Add an independent child-process waiter.
+- [x] Capture and surface the child exit code.
+- [x] Define explicit session states and legal transitions.
+- [x] Make session teardown idempotent.
+- [x] Keep output draining while `ClosePseudoConsole` runs.
+- [x] Join every worker and close every owned handle.
 - [ ] Add unit tests for pixel-to-cell sizing and state transitions.
-- [ ] Add integration tests for child-driven exit and host-driven close.
-- [ ] Exercise repeated create/close cycles to catch leaks and races.
+- [x] Add integration tests for child-driven exit and host-driven close.
+- [x] Exercise repeated create/close cycles to catch leaks and races.
 
 ## Verification
 

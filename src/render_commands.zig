@@ -1,10 +1,6 @@
 const std = @import("std");
+const geometry = @import("geometry.zig");
 const terminal = @import("terminal.zig");
-
-pub const cell_width = 8;
-pub const cell_height = 16;
-pub const origin_x = 24;
-pub const origin_y = 24;
 
 pub const TextRun = struct {
     x: i32,
@@ -26,6 +22,7 @@ pub const Frame = struct {
     pub fn build(
         allocator: std.mem.Allocator,
         model: *const terminal.TerminalModel,
+        metrics: geometry.Metrics,
     ) !Frame {
         var frame: Frame = .{ .allocator = allocator };
         errdefer frame.deinit();
@@ -50,8 +47,14 @@ pub const Frame = struct {
                     ))
                 {
                     try frame.text_runs.append(allocator, .{
-                        .x = origin_x + @as(i32, @intCast(column)) * cell_width,
-                        .y = origin_y + @as(i32, @intCast(row)) * cell_height,
+                        .x = @intCast(
+                            metrics.margin_x +
+                                @as(u32, @intCast(column)) * metrics.cell_width,
+                        ),
+                        .y = @intCast(
+                            metrics.margin_y +
+                                @as(u32, @intCast(row)) * metrics.cell_height,
+                        ),
                         .color = cell.foreground,
                     });
                     active_run = frame.text_runs.items.len - 1;
@@ -97,7 +100,7 @@ test "frame groups adjacent terminal cells by foreground color" {
     defer model.deinit();
 
     try model.write("\x1b[31mred\x1b[32mgreen");
-    var frame = try Frame.build(std.testing.allocator, &model);
+    var frame = try Frame.build(std.testing.allocator, &model, .forDpi(96));
     defer frame.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), frame.text_runs.items.len);
@@ -115,7 +118,7 @@ test "frame encodes non-BMP codepoints as UTF-16 surrogate pairs" {
     defer model.deinit();
 
     try model.write("\xf0\x9f\x91\xbb");
-    var frame = try Frame.build(std.testing.allocator, &model);
+    var frame = try Frame.build(std.testing.allocator, &model, .forDpi(96));
     defer frame.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), frame.text_runs.items.len);
@@ -133,17 +136,18 @@ test "frame renders text on every row and preserves blank cell positions" {
     defer model.deinit();
 
     try model.write("top\x1b[24;80HX");
-    var frame = try Frame.build(std.testing.allocator, &model);
+    const metrics: geometry.Metrics = .forDpi(96);
+    var frame = try Frame.build(std.testing.allocator, &model, metrics);
     defer frame.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), frame.text_runs.items.len);
-    try std.testing.expectEqual(origin_y, frame.text_runs.items[0].y);
+    try std.testing.expectEqual(@as(i32, @intCast(metrics.margin_y)), frame.text_runs.items[0].y);
     try std.testing.expectEqual(
-        origin_y + 23 * cell_height,
+        @as(i32, @intCast(metrics.margin_y + 23 * metrics.cell_height)),
         frame.text_runs.items[1].y,
     );
     try std.testing.expectEqual(
-        origin_x + 79 * cell_width,
+        @as(i32, @intCast(metrics.margin_x + 79 * metrics.cell_width)),
         frame.text_runs.items[1].x,
     );
 }

@@ -11,3 +11,7 @@ test "finite ConPTY child output reaches the terminal model" {
 test "finite ConPTY child receives encoded input and echoes it" {
     try app.run(.integration_input);
 }
+
+test "host close drains and tears down busy ConPTY sessions repeatedly" {
+    for (0..3) |_| try app.run(.integration_host_close);
+}

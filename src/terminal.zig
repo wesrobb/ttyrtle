@@ -61,6 +61,24 @@ pub const TerminalModel = struct {
         try self.refresh();
     }
 
+    pub fn resize(
+        self: *TerminalModel,
+        row_count: u16,
+        column_count: u16,
+        cell_width: u32,
+        cell_height: u32,
+    ) !void {
+        try self.stream.handler.resize(.{
+            .rows = row_count,
+            .cols = column_count,
+            .cell_size_px = .{
+                .width = cell_width,
+                .height = cell_height,
+            },
+        });
+        try self.refresh();
+    }
+
     pub fn refresh(self: *TerminalModel) !void {
         try self.render_state.update(self.allocator, &self.core);
     }
@@ -173,4 +191,17 @@ test "row text reports insufficient output space" {
 
     var text: [4]u8 = undefined;
     try std.testing.expectError(error.NoSpaceLeft, model.rowTextUtf8(0, &text));
+}
+
+test "resize updates grid and carries cell pixel geometry" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+
+    try model.resize(12, 40, 9, 18);
+
+    try std.testing.expectEqual(@as(u16, 12), model.rows());
+    try std.testing.expectEqual(@as(u16, 40), model.columns());
+    try std.testing.expectEqual(@as(u32, 360), model.core.width_px);
+    try std.testing.expectEqual(@as(u32, 216), model.core.height_px);
 }

@@ -4,4 +4,6 @@ test {
     _ = @import("output_queue.zig");
     _ = @import("input_queue.zig");
     _ = @import("input.zig");
+    _ = @import("geometry.zig");
+    _ = @import("session_lifecycle.zig");
 }
