@@ -7,3 +7,7 @@ test "hidden Win32 window initializes, paints, and closes cleanly" {
 test "finite ConPTY child output reaches the terminal model" {
     try app.run(.integration);
 }
+
+test "finite ConPTY child receives encoded input and echoes it" {
+    try app.run(.integration_input);
+}

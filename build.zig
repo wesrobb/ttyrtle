@@ -49,7 +49,16 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
     if (target.result.os.tag == .windows) integration_tests.subsystem = .Windows;
-    const run_integration_tests = b.addRunArtifact(integration_tests);
+    // ConPTY children inspect the host process standard handles while
+    // initializing their console. Zig's test-server protocol reserves stdin
+    // for build-runner messages, so run Win32 integration tests with ordinary
+    // inherited stdio and use their exit code as the result.
+    const run_integration_tests = std.Build.Step.Run.create(
+        b,
+        "run integration-tests",
+    );
+    run_integration_tests.addArtifactArg(integration_tests);
+    run_integration_tests.stdio = .inherit;
     const integration_step = b.step(
         "test-integration",
         "Run tests that create a hidden Win32 window",

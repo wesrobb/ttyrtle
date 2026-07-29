@@ -7,12 +7,15 @@ A deliberately small native Windows terminal prototype:
 - terminal state and VT parsing via libghostty-vt
 - a real shell hosted by ConPTY
 - asynchronous, UI-thread-safe terminal output delivery
+- queued, mode-aware keyboard input via Ghostty's encoder
 - direct, minimal rendering inspired by Nvy's native approach
 
 Normal mode launches `%COMSPEC%` (falling back to `cmd.exe`), feeds its
 UTF-8/VT output through the Ghostty terminal model, and paints all 80 by 24
 cells with GDI. The UI remains responsive while the output reader blocks on an
-idle shell.
+idle shell. Keyboard input is encoded on the UI thread from the active Ghostty
+terminal modes, then written to ConPTY by a dedicated worker so a blocked child
+cannot stall painting or output.
 
 ## Build
 
@@ -58,7 +61,8 @@ before the application exits.
 
 ## Deliberately not included yet
 
-This milestone is intentionally one-way: there is no keyboard input yet.
-ConPTY and the Ghostty grid remain fixed at 80 by 24 cells, and cursor
-appearance, background colors, font shaping, selection, and GPU rendering are
-also deferred.
+Basic keyboard input supports printable Unicode, common editing/navigation
+keys, function keys, modifiers, and repeats. IME candidate UI, paste, mouse
+input, and keybindings remain deferred. ConPTY and the Ghostty grid remain
+fixed at 80 by 24 cells, and cursor appearance, background colors, font
+shaping, selection, and GPU rendering are also deferred.

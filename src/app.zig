@@ -1,6 +1,7 @@
 const std = @import("std");
 const win32 = @import("win32");
 const conpty = @import("conpty.zig");
+const input = @import("input.zig");
 const render_commands = @import("render_commands.zig");
 const terminal = @import("terminal.zig");
 
@@ -18,6 +19,7 @@ pub const Mode = enum {
     normal,
     smoke,
     integration,
+    integration_input,
 };
 
 var model: terminal.TerminalModel = undefined;
@@ -26,11 +28,17 @@ var active_mode: Mode = .normal;
 var paint_completed = false;
 var integration_succeeded = false;
 var session: ?*conpty.Session = null;
+var input_translator: input.Translator = .{};
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
     "cmd.exe /d /q /s /c \"echo \x1b[38;2;12;34;56m" ++
     integration_marker ++ "\x1b[0m > CON & ping -n 2 127.0.0.1 >nul\"";
+const integration_input_text = "\xc3\xa9";
+const integration_input_marker = "CONPTY_STEP_2_OK";
+const integration_input_command =
+    "cmd.exe /d /q /v:on /c " ++
+    "\"set /p value=& echo " ++ integration_input_marker ++ " >CON\"";
 
 pub fn run(mode: Mode) !void {
     const allocator = std.heap.smp_allocator;
@@ -38,6 +46,7 @@ pub fn run(mode: Mode) !void {
     paint_completed = false;
     integration_succeeded = false;
     session = null;
+    input_translator = .{};
 
     try model.init(allocator, 24, 80);
     model_initialized = true;
@@ -92,8 +101,13 @@ pub fn run(mode: Mode) !void {
         session = try conpty.Session.create(
             allocator,
             window,
-            if (mode == .integration) integration_command else null,
+            switch (mode) {
+                .integration => integration_command,
+                .integration_input => integration_input_command,
+                else => null,
+            },
         );
+        if (mode == .integration_input) try queueIntegrationInput();
     }
     defer if (session) |active_session| {
         active_session.destroy();
@@ -120,7 +134,7 @@ pub fn run(mode: Mode) !void {
     }
 
     if (mode == .smoke and !paint_completed) return error.SmokePaintFailed;
-    if (mode == .integration and !integration_succeeded)
+    if (isIntegrationMode(mode) and !integration_succeeded)
         return error.ConptyIntegrationFailed;
 }
 
@@ -146,6 +160,28 @@ fn windowProc(
             if (session) |active_session| active_session.closeAfterChildExit();
             return 0;
         },
+        conpty.input_failure_message => {
+            if (session) |active_session| {
+                if (active_session.inputFailureCode()) |code|
+                    std.log.err(
+                        "WriteFile for ConPTY input failed with Win32 error {d}",
+                        .{code},
+                    );
+            }
+            return 0;
+        },
+        wm.WM_KEYDOWN, wm.WM_SYSKEYDOWN, wm.WM_KEYUP, wm.WM_SYSKEYUP => {
+            handleKeyMessage(message, wparam, lparam);
+            return 0;
+        },
+        wm.WM_CHAR, wm.WM_SYSCHAR => {
+            handleCharacterMessage(@truncate(wparam));
+            return 0;
+        },
+        wm.WM_DEADCHAR, wm.WM_SYSDEADCHAR => {
+            input_translator.deadCharacter();
+            return 0;
+        },
         wm.WM_CLOSE => {
             if (session) |active_session| {
                 active_session.destroy();
@@ -160,6 +196,89 @@ fn windowProc(
         },
         else => return user32.DefWindowProcW(window, message, wparam, lparam),
     }
+}
+
+fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
+    if (active_mode == .smoke or session == null) return;
+
+    const is_down = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN;
+    const bits: usize = @bitCast(lparam);
+    const action: input.Action = if (!is_down)
+        .release
+    else if ((bits & (@as(usize, 1) << 30)) != 0)
+        .repeat
+    else
+        .press;
+    const event = input_translator.keyEvent(
+        @truncate(wparam),
+        @truncate((bits >> 16) & 0xff),
+        action,
+        currentModifiers(),
+        (bits & (@as(usize, 1) << 24)) != 0,
+        @truncate(bits & 0xffff),
+    ) orelse return;
+    encodeAndQueueInput(event);
+}
+
+fn handleCharacterMessage(code_unit: u16) void {
+    if (active_mode == .smoke or session == null) return;
+    const event = input_translator.characterEvent(
+        code_unit,
+        currentModifiers(),
+    ) orelse return;
+    encodeAndQueueInput(event);
+}
+
+fn queueIntegrationInput() !void {
+    try queueEncodedInput(.{
+        .key = .unidentified,
+        .action = .press,
+        .utf8 = integration_input_text,
+    });
+    try queueEncodedInput(.{
+        .key = .enter,
+        .action = .press,
+    });
+}
+
+fn encodeAndQueueInput(event: input.NormalizedKey) void {
+    queueEncodedInput(event) catch {
+        std.log.err("failed to encode or queue ConPTY input", .{});
+    };
+}
+
+fn queueEncodedInput(event: input.NormalizedKey) !void {
+    const active_session = session orelse return;
+    const encoded = input.encodeAlloc(
+        std.heap.smp_allocator,
+        event,
+        &model.core,
+    ) catch return error.InputEncodingFailed;
+    if (encoded.len == 0) {
+        std.heap.smp_allocator.free(encoded);
+        return;
+    }
+    errdefer std.heap.smp_allocator.free(encoded);
+    try active_session.queueInputOwned(encoded);
+}
+
+fn currentModifiers() input.Mods {
+    return .{
+        .shift = keyIsDown(0x10),
+        .ctrl = keyIsDown(0x11),
+        .alt = keyIsDown(0x12),
+        .super = keyIsDown(0x5b) or keyIsDown(0x5c),
+        .caps_lock = keyIsToggled(0x14),
+        .num_lock = keyIsToggled(0x90),
+    };
+}
+
+fn keyIsDown(virtual_key: i32) bool {
+    return (@as(u16, @bitCast(user32.GetKeyState(virtual_key))) & 0x8000) != 0;
+}
+
+fn keyIsToggled(virtual_key: i32) bool {
+    return (@as(u16, @bitCast(user32.GetKeyState(virtual_key))) & 1) != 0;
 }
 
 fn paint(window: foundation.HWND) bool {
@@ -206,7 +325,7 @@ fn handleConptyOutput(window: foundation.HWND) void {
     for (batch.chunks.items) |chunk| {
         model.write(chunk) catch {
             std.log.err("failed to apply ConPTY output to the terminal model", .{});
-            if (active_mode == .integration) _ = user32.DestroyWindow(window);
+            if (isIntegrationMode(active_mode)) _ = user32.DestroyWindow(window);
             return;
         };
         changed = true;
@@ -231,11 +350,19 @@ fn handleConptyOutput(window: foundation.HWND) void {
         }
     }
 
-    if (active_mode == .integration and batch.finished) {
+    if (isIntegrationMode(active_mode) and batch.finished) {
+        const marker = if (active_mode == .integration_input)
+            integration_input_marker
+        else
+            integration_marker;
         integration_succeeded = batch.failure == null and
-            terminalContains(integration_marker);
+            terminalContains(marker);
         _ = user32.DestroyWindow(window);
     }
+}
+
+fn isIntegrationMode(mode: Mode) bool {
+    return mode == .integration or mode == .integration_input;
 }
 
 fn terminalContains(needle: []const u8) bool {

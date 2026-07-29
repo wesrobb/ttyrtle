@@ -1,5 +1,6 @@
 const std = @import("std");
 const win32 = @import("win32");
+const input_queue = @import("input_queue.zig");
 const output_queue = @import("output_queue.zig");
 
 const console = win32.system.console;
@@ -10,6 +11,7 @@ const user32 = win32.user32;
 
 pub const output_message = win32.ui.windows_and_messaging.WM_APP + 1;
 pub const child_exit_message = win32.ui.windows_and_messaging.WM_APP + 2;
+pub const input_failure_message = win32.ui.windows_and_messaging.WM_APP + 3;
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -20,8 +22,11 @@ pub const Session = struct {
     process: ?foundation.HANDLE,
     primary_thread: ?foundation.HANDLE,
     reader_thread: ?std.Thread,
+    writer_thread: ?std.Thread,
     process_waiter_thread: ?std.Thread,
+    input: input_queue.InputQueue,
     output: output_queue.OutputQueue,
+    input_failure_code: std.atomic.Value(u32),
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -135,7 +140,7 @@ pub const Session = struct {
         errdefer closeHandle(&process_info.hThread);
 
         // ConPTY owns these ends after successful process creation. Keeping
-        // local copies open prevents EOF and broken-pipe detection.
+        // duplicate local handles open prevents deterministic disconnection.
         closeHandle(&input_read);
         closeHandle(&output_write);
 
@@ -149,8 +154,11 @@ pub const Session = struct {
             .process = process_info.hProcess,
             .primary_thread = process_info.hThread,
             .reader_thread = null,
+            .writer_thread = null,
             .process_waiter_thread = null,
+            .input = .init(allocator),
             .output = .init(allocator),
+            .input_failure_code = .init(0),
         };
 
         // Ownership has moved to the stable heap allocation used by the
@@ -163,13 +171,27 @@ pub const Session = struct {
 
         errdefer self.destroy();
         self.reader_thread = try std.Thread.spawn(.{}, readerMain, .{self});
+        self.writer_thread = try std.Thread.spawn(.{}, writerMain, .{self});
         self.process_waiter_thread = try std.Thread.spawn(.{}, processWaiterMain, .{self});
         return self;
     }
 
     pub fn destroy(self: *Session) void {
+        self.input.close();
+        if (self.writer_thread) |thread|
+            _ = kernel32.CancelSynchronousIo(@ptrCast(thread.getHandle()));
+        if (self.reader_thread) |thread|
+            _ = kernel32.CancelSynchronousIo(@ptrCast(thread.getHandle()));
         closeHandle(&self.input_write);
+        if (self.process) |process| {
+            _ = kernel32.TerminateProcess(process, 1);
+            _ = kernel32.WaitForSingleObject(process, 5000);
+        }
         closePseudoConsole(&self.pseudo_console);
+        if (self.writer_thread) |thread| {
+            thread.join();
+            self.writer_thread = null;
+        }
         if (self.reader_thread) |thread| {
             thread.join();
             self.reader_thread = null;
@@ -181,6 +203,7 @@ pub const Session = struct {
         closeHandle(&self.output_read);
         closeHandle(&self.primary_thread);
         closeHandle(&self.process);
+        self.input.deinit();
         self.output.deinit();
 
         const allocator = self.allocator;
@@ -192,9 +215,56 @@ pub const Session = struct {
         return self.output.drain();
     }
 
+    /// Takes ownership of bytes encoded by the UI thread.
+    pub fn queueInputOwned(self: *Session, bytes: []u8) !void {
+        return self.input.pushOwned(bytes);
+    }
+
+    pub fn inputFailureCode(self: *const Session) ?u32 {
+        const code = self.input_failure_code.load(.acquire);
+        return if (code == 0) null else code;
+    }
+
     pub fn closeAfterChildExit(self: *Session) void {
+        self.input.close();
+        if (self.writer_thread) |thread|
+            _ = kernel32.CancelSynchronousIo(@ptrCast(thread.getHandle()));
         closeHandle(&self.input_write);
         closePseudoConsole(&self.pseudo_console);
+    }
+
+    fn writerMain(self: *Session) void {
+        while (self.input.take()) |chunk| {
+            defer self.allocator.free(chunk);
+
+            var offset: usize = 0;
+            while (offset < chunk.len) {
+                var bytes_written: u32 = 0;
+                if (kernel32.WriteFile(
+                    self.input_write,
+                    chunk.ptr + offset,
+                    @intCast(chunk.len - offset),
+                    &bytes_written,
+                    null,
+                ) == 0 or bytes_written == 0) {
+                    const code: u32 = @intFromEnum(kernel32.GetLastError());
+                    if (code != @intFromEnum(foundation.ERROR_BROKEN_PIPE) and
+                        code != @intFromEnum(foundation.ERROR_OPERATION_ABORTED))
+                    {
+                        self.input_failure_code.store(code, .release);
+                        _ = user32.PostMessageW(
+                            self.window,
+                            input_failure_message,
+                            0,
+                            0,
+                        );
+                    }
+                    self.input.close();
+                    return;
+                }
+                offset += bytes_written;
+            }
+        }
     }
 
     fn readerMain(self: *Session) void {

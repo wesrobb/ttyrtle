@@ -99,20 +99,20 @@ arrive through the output pipe.
 
 ## Tasks
 
-- [ ] Add `src/input.zig`.
-- [ ] Define a testable Win32-independent normalized key representation.
-- [ ] Map required virtual keys and scan codes to Ghostty physical keys.
-- [ ] Track modifier, repeat, and release state.
-- [ ] Convert composed UTF-16 text to UTF-8 without losing surrogate pairs.
-- [ ] Prevent duplicate delivery between key and character messages.
-- [ ] Derive encoding options from the active Ghostty terminal.
-- [ ] Encode input with `ghostty.input.encodeKey`.
-- [ ] Add an owned, synchronized ConPTY input queue.
-- [ ] Add a dedicated blocking writer thread.
-- [ ] Handle partial writes, broken pipes, and child exit.
-- [ ] Add unit tests for printable, Unicode, navigation, modifier, and
+- [x] Add `src/input.zig`.
+- [x] Define a testable Win32-independent normalized key representation.
+- [x] Map required virtual keys and scan codes to Ghostty physical keys.
+- [x] Track modifier, repeat, and release state.
+- [x] Convert composed UTF-16 text to UTF-8 without losing surrogate pairs.
+- [x] Prevent duplicate delivery between key and character messages.
+- [x] Derive encoding options from the active Ghostty terminal.
+- [x] Encode input with `ghostty.input.encodeKey`.
+- [x] Add an owned, synchronized ConPTY input queue.
+- [x] Add a dedicated blocking writer thread.
+- [x] Handle partial writes, broken pipes, and child exit.
+- [x] Add unit tests for printable, Unicode, navigation, modifier, and
       application-cursor-mode cases.
-- [ ] Add an integration test that sends input to a finite child and verifies
+- [x] Add an integration test that sends input to a finite child and verifies
       its output.
 
 ## Verification
@@ -139,9 +139,9 @@ Manually confirm in both `cmd.exe` and PowerShell where available:
 
 ## Exit criteria
 
-- [ ] The shell is usable for ordinary command entry and editing.
-- [ ] Unicode text reaches the child as UTF-8.
-- [ ] Special-key sequences follow Ghostty’s current terminal modes.
-- [ ] Input never blocks the UI or output reader.
-- [ ] Input is not locally echoed by the renderer.
-- [ ] Automated verification passes.
+- [x] The shell is usable for ordinary command entry and editing.
+- [x] Unicode text reaches the child as UTF-8.
+- [x] Special-key sequences follow Ghostty’s current terminal modes.
+- [x] Input never blocks the UI or output reader.
+- [x] Input is not locally echoed by the renderer.
+- [x] Automated verification passes.
