@@ -86,13 +86,11 @@ resources, and presentation.
 
 ## Phase 2: Expose and consume Ghostty damage
 
-**Status:** In progress. Ghostty full/partial damage is now copied into an
+**Status:** Complete. Ghostty full/partial damage is copied into an
 application-owned, coalescing row-damage queue. Cursor movement and blinking,
 selection changes, resize, DPI changes, and global terminal visual changes feed
-the same queue. The Win32 path invalidates damaged row bands and acknowledges
-damage only after a successful paint. The transient GDI frame builder still
-scans the complete grid during paint; removing that remaining whole-grid work
-requires Phase 3's retained row cache.
+the same queue. The Win32 path invalidates damaged row bands, and model damage
+is acknowledged only after the retained cache has accepted it.
 
 ### Changes
 
@@ -124,6 +122,12 @@ requires Phase 3's retained row cache.
   and all global visual changes force a full rebuild.
 
 ## Phase 3: Introduce a retained row cache
+
+**Status:** Complete. `RenderCache` retains UTF-16 text, UTF-16-to-cell mapping,
+cell metadata, drawing runs, and per-row generations. It rebuilds only damaged
+rows, reuses row storage, resizes without stale entries, and supplies cached
+commands to expose paints without reading clean terminal rows. Phase 4 is the
+next implementation phase.
 
 ### Changes
 

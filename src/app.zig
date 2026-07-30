@@ -44,6 +44,8 @@ var selection_anchor: ?terminal.Cursor = null;
 var selection_head: ?terminal.Cursor = null;
 var pressed_mouse_button: ?input.MouseButton = null;
 var back_buffer: ?BackBuffer = null;
+var render_cache: render_commands.RenderCache = undefined;
+var render_cache_initialized = false;
 
 const BackBuffer = struct {
     dc: gdi.CreatedHDC,
@@ -93,6 +95,12 @@ pub fn run(mode: Mode) !void {
     pressed_mouse_button = null;
     back_buffer = null;
     defer deinitBackBuffer();
+    render_cache = .init(allocator);
+    render_cache_initialized = true;
+    defer {
+        render_cache.deinit();
+        render_cache_initialized = false;
+    }
 
     try model.init(allocator, 24, 80);
     model_initialized = true;
@@ -687,7 +695,7 @@ fn keyIsToggled(virtual_key: i32) bool {
 }
 
 fn paint(window: foundation.HWND) bool {
-    if (!model_initialized) return false;
+    if (!model_initialized or !render_cache_initialized) return false;
 
     var paint_state: gdi.PAINTSTRUCT = undefined;
     const dc = user32.BeginPaint(window, &paint_state) orelse return false;
@@ -712,14 +720,13 @@ fn paint(window: foundation.HWND) bool {
         paint_state.rcPaint.bottom,
     );
 
-    var frame = render_commands.Frame.build(
-        std.heap.smp_allocator,
+    render_cache.update(
         &model,
         terminal_metrics,
-    ) catch
-        return false;
-    defer frame.deinit();
-    const background = gdi32.CreateSolidBrush(toColorRef(frame.background)) orelse
+        model.damage(),
+    ) catch return false;
+    model.acknowledgeDamage();
+    const background = gdi32.CreateSolidBrush(toColorRef(render_cache.background)) orelse
         return false;
     defer _ = gdi32.DeleteObject(background);
     const font = gdi32.CreateFontW(
@@ -745,31 +752,40 @@ fn paint(window: foundation.HWND) bool {
     _ = user32.FillRect(target_dc, &paint_state.rcPaint, background);
     _ = gdi32.SetBkMode(target_dc, gdi.TRANSPARENT);
 
-    for (frame.rectangles.items) |rectangle| {
-        const brush = gdi32.CreateSolidBrush(toColorRef(rectangle.color)) orelse
-            return false;
-        defer _ = gdi32.DeleteObject(brush);
-        const bounds: foundation.RECT = .{
-            .left = rectangle.left,
-            .top = rectangle.top,
-            .right = rectangle.right,
-            .bottom = rectangle.bottom,
-        };
-        _ = if (rectangle.outline)
-            user32.FrameRect(target_dc, &bounds, brush)
-        else
-            user32.FillRect(target_dc, &bounds, brush);
-    }
+    const first_row = paintFirstRow(paint_state.rcPaint);
+    const last_row = paintLastRow(paint_state.rcPaint);
+    if (first_row < render_cache.rows.items.len) {
+        for (render_cache.rows.items[first_row..@min(
+            last_row +| 1,
+            render_cache.rows.items.len,
+        )]) |*row| {
+            for (row.rectangles.items) |rectangle| {
+                const brush = gdi32.CreateSolidBrush(toColorRef(rectangle.color)) orelse
+                    return false;
+                defer _ = gdi32.DeleteObject(brush);
+                const bounds: foundation.RECT = .{
+                    .left = rectangle.left,
+                    .top = rectangle.top,
+                    .right = rectangle.right,
+                    .bottom = rectangle.bottom,
+                };
+                _ = if (rectangle.outline)
+                    user32.FrameRect(target_dc, &bounds, brush)
+                else
+                    user32.FillRect(target_dc, &bounds, brush);
+            }
 
-    for (frame.text_runs.items) |*text_run| {
-        _ = gdi32.SetTextColor(target_dc, toColorRef(text_run.color));
-        if (gdi32.TextOutW(
-            target_dc,
-            text_run.x,
-            text_run.y,
-            @ptrCast(text_run.text.items.ptr),
-            @intCast(text_run.text.items.len - 1),
-        ) == 0) return false;
+            for (row.text_runs.items) |text_run| {
+                _ = gdi32.SetTextColor(target_dc, toColorRef(text_run.color));
+                if (gdi32.TextOutW(
+                    target_dc,
+                    text_run.x,
+                    text_run.y,
+                    @ptrCast(row.utf16.items[text_run.text_start..].ptr),
+                    @intCast(text_run.text_len),
+                ) == 0) return false;
+            }
+        }
     }
 
     const width = paint_state.rcPaint.right - paint_state.rcPaint.left;
@@ -785,8 +801,19 @@ fn paint(window: foundation.HWND) bool {
         paint_state.rcPaint.top,
         gdi.SRCCOPY,
     ) != 0;
-    if (copied) model.acknowledgeDamage();
     return copied;
+}
+
+fn paintFirstRow(rect: foundation.RECT) usize {
+    const margin_y: i32 = @intCast(terminal_metrics.margin_y);
+    const cell_height: i32 = @intCast(terminal_metrics.cell_height);
+    return @intCast(@divTrunc(@max(rect.top - margin_y, 0), cell_height));
+}
+
+fn paintLastRow(rect: foundation.RECT) usize {
+    const margin_y: i32 = @intCast(terminal_metrics.margin_y);
+    const cell_height: i32 = @intCast(terminal_metrics.cell_height);
+    return @intCast(@divTrunc(@max(rect.bottom - 1 - margin_y, 0), cell_height));
 }
 
 fn ensureBackBuffer(dc: gdi.HDC, width: i32, height: i32) ?*BackBuffer {
