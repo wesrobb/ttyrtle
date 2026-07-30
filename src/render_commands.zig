@@ -63,6 +63,23 @@ pub const CachedRow = struct {
         self.text_runs.clearRetainingCapacity();
         self.graphemes.clearRetainingCapacity();
     }
+
+    /// Simple primary-font rows can use one DirectWrite spacing range instead
+    /// of measuring and configuring every terminal cell independently.
+    pub fn hasUniformAsciiGrid(self: *const CachedRow) bool {
+        if (self.graphemes.items.len == 0 or
+            self.graphemes.items.len != self.cells.items.len)
+            return false;
+
+        for (self.graphemes.items) |grapheme| {
+            if (grapheme.text_len != 1 or grapheme.cell_count != 1 or
+                grapheme.text_start >= self.utf16.items.len)
+                return false;
+            const code_unit = self.utf16.items[grapheme.text_start];
+            if (code_unit < ' ' or code_unit > '~') return false;
+        }
+        return true;
+    }
 };
 
 const counters_enabled = builtin.mode == .Debug or builtin.is_test;
@@ -597,4 +614,24 @@ test "steady-state row rebuild reuses retained storage" {
     try std.testing.expectEqual(capacities[3], row.rectangles.capacity);
     try std.testing.expectEqual(capacities[4], row.text_runs.capacity);
     try std.testing.expectEqual(capacities[5], row.graphemes.capacity);
+}
+
+test "uniform ASCII grid excludes wide and combining graphemes" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 1, 8);
+    defer model.deinit();
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    try model.write("ascii");
+    try cache.update(&model, .forDpi(96), model.damage());
+    try std.testing.expect(cache.rows.items[0].hasUniformAsciiGrid());
+
+    try model.write("\x1b[1;1H界");
+    try cache.update(&model, .forDpi(96), model.damage());
+    try std.testing.expect(!cache.rows.items[0].hasUniformAsciiGrid());
+
+    try model.write("\x1b[1;1He\xcc\x81");
+    try cache.update(&model, .forDpi(96), model.damage());
+    try std.testing.expect(!cache.rows.items[0].hasUniformAsciiGrid());
 }

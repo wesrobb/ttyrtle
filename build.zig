@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/app.zig"),
         .target = target,
         .optimize = .Debug,
+        .ghostty_optimize = .ReleaseSafe,
         .include_win32 = true,
     });
     const integration_root = b.createModule(.{
@@ -121,6 +122,12 @@ fn addExecutable(
         .root_source_file = b.path("src/main.zig"),
         .target = options.target,
         .optimize = options.optimize,
+        // Keep application code debuggable without running Ghostty's mature
+        // VT parser through the prohibitively slow Debug code path.
+        .ghostty_optimize = if (options.optimize == .Debug)
+            .ReleaseSafe
+        else
+            options.optimize,
         .include_win32 = true,
     });
     const build_options = b.addOptions();
@@ -140,6 +147,7 @@ const ModuleOptions = struct {
     root_source_file: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    ghostty_optimize: ?std.builtin.OptimizeMode = null,
     include_win32: bool,
 };
 
@@ -155,7 +163,7 @@ fn createModule(
 
     const ghostty = b.dependency("ghostty", .{
         .target = options.target,
-        .optimize = options.optimize,
+        .optimize = options.ghostty_optimize orelse options.optimize,
         .@"emit-lib-vt" = true,
         .simd = false,
     });

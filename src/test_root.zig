@@ -1,6 +1,7 @@
 test {
     _ = @import("terminal.zig");
     _ = @import("render_commands.zig");
+    _ = @import("frame_trace.zig");
     _ = @import("output_queue.zig");
     _ = @import("input_queue.zig");
     _ = @import("input.zig");

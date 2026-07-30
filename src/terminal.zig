@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ghostty = @import("ghostty-vt");
+const frame_trace = @import("frame_trace.zig");
 
 pub const Rgb = struct {
     red: u8,
@@ -54,6 +55,9 @@ pub const TerminalModel = struct {
         output_batches: u64,
         chunks_parsed: u64,
         render_refreshes: u64,
+        parse_trace: frame_trace.Stats,
+        render_state_trace: frame_trace.Stats,
+        damage_trace: frame_trace.Stats,
     };
     allocator: std.mem.Allocator,
     core: ghostty.Terminal,
@@ -73,6 +77,9 @@ pub const TerminalModel = struct {
     output_batch_count: if (counters_enabled) u64 else void,
     chunks_parsed_count: if (counters_enabled) u64 else void,
     render_refresh_count: if (counters_enabled) u64 else void,
+    parse_trace: frame_trace.Counter,
+    render_state_trace: frame_trace.Counter,
+    damage_trace: frame_trace.Counter,
 
     pub fn init(
         self: *TerminalModel,
@@ -103,6 +110,9 @@ pub const TerminalModel = struct {
             .output_batch_count = if (counters_enabled) 0 else {},
             .chunks_parsed_count = if (counters_enabled) 0 else {},
             .render_refresh_count = if (counters_enabled) 0 else {},
+            .parse_trace = .{},
+            .render_state_trace = .{},
+            .damage_trace = .{},
         };
         errdefer self.core.deinit(allocator);
 
@@ -141,7 +151,9 @@ pub const TerminalModel = struct {
             self.output_batch_count +|= 1;
             self.chunks_parsed_count +|= chunks.len;
         }
+        const parse_start = frame_trace.timestamp();
         for (chunks) |bytes| self.stream.nextSlice(bytes);
+        self.parse_trace.recordSince(parse_start);
         if (self.reply_failed) {
             self.reply_failed = false;
             return error.ReplyDeliveryFailed;
@@ -227,9 +239,13 @@ pub const TerminalModel = struct {
 
     pub fn refresh(self: *TerminalModel) !void {
         const old_cursor_row = renderCursorRow(&self.render_state);
+        const render_state_start = frame_trace.timestamp();
         try self.render_state.update(self.allocator, &self.core);
+        self.render_state_trace.recordSince(render_state_start);
         if (counters_enabled) self.render_refresh_count +|= 1;
+        const damage_start = frame_trace.timestamp();
         try self.collectRenderDamage(old_cursor_row);
+        self.damage_trace.recordSince(damage_start);
     }
 
     pub fn diagnostics(self: *const TerminalModel) Diagnostics {
@@ -237,11 +253,17 @@ pub const TerminalModel = struct {
             .output_batches = 0,
             .chunks_parsed = 0,
             .render_refreshes = 0,
+            .parse_trace = .{},
+            .render_state_trace = .{},
+            .damage_trace = .{},
         };
         return .{
             .output_batches = self.output_batch_count,
             .chunks_parsed = self.chunks_parsed_count,
             .render_refreshes = self.render_refresh_count,
+            .parse_trace = self.parse_trace.snapshot(),
+            .render_state_trace = self.render_state_trace.snapshot(),
+            .damage_trace = self.damage_trace.snapshot(),
         };
     }
     pub fn damage(self: *const TerminalModel) RenderDamage {

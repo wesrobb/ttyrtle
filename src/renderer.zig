@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const win32 = @import("win32");
+const frame_trace = @import("frame_trace.zig");
 const geometry = @import("geometry.zig");
 const render_commands = @import("render_commands.zig");
 const terminal = @import("terminal.zig");
@@ -28,6 +29,11 @@ pub const Renderer = struct {
         gpu_present_count: u64,
         gpu_recreation_count: u64,
         layout_build_count: u64,
+        gpu_paint_trace: frame_trace.Stats,
+        scene_trace: frame_trace.Stats,
+        layout_trace: frame_trace.Stats,
+        copy_trace: frame_trace.Stats,
+        present_trace: frame_trace.Stats,
     };
 
     pub fn initialize(self: *Renderer, window: foundation.HWND) void {
@@ -151,6 +157,24 @@ pub const Renderer = struct {
             .gpu_present_count = 0,
             .gpu_recreation_count = 0,
             .layout_build_count = 0,
+            .gpu_paint_trace = .{},
+            .scene_trace = .{},
+            .layout_trace = .{},
+            .copy_trace = .{},
+            .present_trace = .{},
+        };
+        const gpu_traces = if (self.gpu) |*resources| .{
+            resources.paint_trace.snapshot(),
+            resources.scene_trace.snapshot(),
+            resources.layout_trace.snapshot(),
+            resources.copy_trace.snapshot(),
+            resources.present_trace.snapshot(),
+        } else .{
+            frame_trace.Stats{},
+            frame_trace.Stats{},
+            frame_trace.Stats{},
+            frame_trace.Stats{},
+            frame_trace.Stats{},
         };
         return .{
             .frames_requested = self.frame_request_count,
@@ -159,6 +183,11 @@ pub const Renderer = struct {
             .gpu_recreation_count = self.gpu_recreation_count,
             .layout_build_count = self.retired_layout_build_count +
                 if (self.gpu) |resources| resources.layout_build_count else 0,
+            .gpu_paint_trace = gpu_traces[0],
+            .scene_trace = gpu_traces[1],
+            .layout_trace = gpu_traces[2],
+            .copy_trace = gpu_traces[3],
+            .present_trace = gpu_traces[4],
         };
     }
 

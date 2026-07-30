@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const win32 = @import("win32");
+const frame_trace = @import("../frame_trace.zig");
 const geometry = @import("../geometry.zig");
 const render_commands = @import("../render_commands.zig");
 const terminal = @import("../terminal.zig");
@@ -66,6 +67,11 @@ pub const DeviceResources = struct {
     font_generation: u64,
     row_layouts: std.ArrayListUnmanaged(RowLayouts),
     layout_build_count: if (counters_enabled) u64 else void,
+    paint_trace: frame_trace.Counter,
+    scene_trace: frame_trace.Counter,
+    layout_trace: frame_trace.Counter,
+    copy_trace: frame_trace.Counter,
+    present_trace: frame_trace.Counter,
     brushes: [max_brushes]BrushEntry,
     brush_slots: resource_cache.KeySlots(max_brushes),
     simulate_device_loss: bool,
@@ -89,6 +95,11 @@ pub const DeviceResources = struct {
         resources.font_generation = 0;
         resources.row_layouts = .empty;
         resources.layout_build_count = if (counters_enabled) 0 else {};
+        resources.paint_trace = .{};
+        resources.scene_trace = .{};
+        resources.layout_trace = .{};
+        resources.copy_trace = .{};
+        resources.present_trace = .{};
         resources.brush_slots = .{};
         resources.simulate_device_loss = false;
 
@@ -322,6 +333,8 @@ pub const DeviceResources = struct {
         metrics: geometry.Metrics,
         dpi: u32,
     ) !void {
+        const trace_start = frame_trace.timestamp();
+        defer self.paint_trace.recordSince(trace_start);
         if (self.simulate_device_loss) {
             self.simulate_device_loss = false;
             return error.DeviceLost;
@@ -432,6 +445,8 @@ pub const DeviceResources = struct {
         metrics: geometry.Metrics,
         dpi: u32,
     ) !void {
+        const trace_start = frame_trace.timestamp();
+        defer self.scene_trace.recordSince(trace_start);
         const scene = self.scene_bitmap orelse return error.TargetUnavailable;
         self.d2d_context.SetTarget(@ptrCast(scene));
         const target = &self.d2d_context.ID2D1RenderTarget;
@@ -568,6 +583,8 @@ pub const DeviceResources = struct {
             layouts.font_generation == self.font_generation)
             return layouts;
 
+        const trace_start = frame_trace.timestamp();
+        defer self.layout_trace.recordSince(trace_start);
         layouts.clear();
         errdefer layouts.clear();
         const format = self.text_format orelse return error.TextFormatUnavailable;
@@ -597,30 +614,37 @@ pub const DeviceResources = struct {
         defer release(layout1);
         if (layout1.SetPairKerning(0, full_range).failed)
             return error.ConfigureTextLayoutFailed;
-        for (row.graphemes.items) |grapheme| {
+        if (row.hasUniformAsciiGrid()) {
+            const first = row.graphemes.items[0];
+            const measurement = try measureTextRange(
+                layout,
+                @intCast(first.text_start),
+                @intCast(first.text_len),
+            );
+            const grid_advance =
+                @as(f32, @floatFromInt(metrics.cell_width)) * scale;
+            if (layout1.SetCharacterSpacing(
+                0,
+                (grid_advance - measurement.advance) /
+                    @as(f32, @floatFromInt(measurement.hit_count)),
+                0,
+                full_range,
+            ).failed) return error.ConfigureTextLayoutFailed;
+        } else for (row.graphemes.items) |grapheme| {
             const range: dwrite.DWRITE_TEXT_RANGE = .{
                 .startPosition = @intCast(grapheme.text_start),
                 .length = @intCast(grapheme.text_len),
             };
-            var hit_metrics: [16]dwrite.DWRITE_HIT_TEST_METRICS = undefined;
-            var hit_count: u32 = 0;
-            if (layout.HitTestTextRange(
+            const measurement = try measureTextRange(
+                layout,
                 range.startPosition,
                 range.length,
-                0,
-                0,
-                &hit_metrics,
-                hit_metrics.len,
-                &hit_count,
-            ).failed or hit_count == 0 or hit_count > hit_metrics.len)
-                return error.MeasureTextClusterFailed;
-            var shaped_advance: f32 = 0;
-            for (hit_metrics[0..hit_count]) |hit| shaped_advance += hit.width;
+            );
             const grid_advance = @as(f32, @floatFromInt(
                 @as(u32, grapheme.cell_count) * metrics.cell_width,
             )) * scale;
-            const trailing = (grid_advance - shaped_advance) /
-                @as(f32, @floatFromInt(hit_count));
+            const trailing = (grid_advance - measurement.advance) /
+                @as(f32, @floatFromInt(measurement.hit_count));
             if (layout1.SetCharacterSpacing(0, trailing, 0, range).failed)
                 return error.ConfigureTextLayoutFailed;
         }
@@ -642,6 +666,7 @@ pub const DeviceResources = struct {
     }
 
     fn presentScene(self: *DeviceResources) !void {
+        const copy_start = frame_trace.timestamp();
         const target_bitmap = self.target_bitmap orelse
             return error.TargetUnavailable;
         const scene = self.scene_bitmap orelse return error.TargetUnavailable;
@@ -656,8 +681,11 @@ pub const DeviceResources = struct {
             null,
         );
         try checkDrawResult(target.EndDraw(null, null));
+        self.copy_trace.recordSince(copy_start);
 
+        const present_start = frame_trace.timestamp();
         const result = self.swap_chain.IDXGISwapChain.Present(1, 0);
+        self.present_trace.recordSince(present_start);
         if (!result.failed) return;
         if (isDeviceLoss(result)) return error.DeviceLost;
         return error.PresentFailed;
@@ -780,6 +808,28 @@ fn colorKey(color: terminal.Rgb) u32 {
     return @as(u32, color.red) << 16 |
         @as(u32, color.green) << 8 |
         color.blue;
+}
+
+fn measureTextRange(
+    layout: *dwrite.IDWriteTextLayout,
+    start: u32,
+    length: u32,
+) !struct { advance: f32, hit_count: u32 } {
+    var hit_metrics: [16]dwrite.DWRITE_HIT_TEST_METRICS = undefined;
+    var hit_count: u32 = 0;
+    if (layout.HitTestTextRange(
+        start,
+        length,
+        0,
+        0,
+        &hit_metrics,
+        hit_metrics.len,
+        &hit_count,
+    ).failed or hit_count == 0 or hit_count > hit_metrics.len)
+        return error.MeasureTextClusterFailed;
+    var shaped_advance: f32 = 0;
+    for (hit_metrics[0..hit_count]) |hit| shaped_advance += hit.width;
+    return .{ .advance = shaped_advance, .hit_count = hit_count };
 }
 
 fn checkDrawResult(result: win32.zig.HRESULT) !void {

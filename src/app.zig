@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const win32 = @import("win32");
 const conpty = @import("conpty.zig");
+const frame_trace = @import("frame_trace.zig");
 const geometry = @import("geometry.zig");
 const input = @import("input.zig");
 const render_commands = @import("render_commands.zig");
@@ -12,12 +13,15 @@ const foundation = win32.foundation;
 const gdi = win32.graphics.gdi;
 const memory = win32.system.memory;
 const ole = win32.system.ole;
+const file_system = win32.storage.file_system;
 const wm = win32.ui.windows_and_messaging;
 const kernel32 = win32.kernel32;
 const user32 = win32.user32;
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("Ttyrtle");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle");
+const trace_file_name =
+    std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle-frame-trace.log");
 
 pub const Mode = enum {
     normal,
@@ -48,6 +52,9 @@ var pressed_mouse_button: ?input.MouseButton = null;
 var active_renderer: renderer.Renderer = .{};
 var render_cache: render_commands.RenderCache = undefined;
 var render_cache_initialized = false;
+var output_trace: frame_trace.Counter = .{};
+var paint_trace: frame_trace.Counter = .{};
+var cache_trace: frame_trace.Counter = .{};
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
@@ -84,6 +91,9 @@ pub fn run(mode: Mode) !void {
     defer active_renderer.deinit();
     render_cache = .init(allocator);
     render_cache_initialized = true;
+    output_trace = .{};
+    paint_trace = .{};
+    cache_trace = .{};
     defer {
         render_cache.deinit();
         render_cache_initialized = false;
@@ -693,6 +703,8 @@ fn keyIsToggled(virtual_key: i32) bool {
 
 fn paint(window: foundation.HWND) bool {
     if (!model_initialized or !render_cache_initialized) return false;
+    const paint_start = frame_trace.timestamp();
+    defer paint_trace.recordSince(paint_start);
 
     var paint_state: gdi.PAINTSTRUCT = undefined;
     const dc = user32.BeginPaint(window, &paint_state) orelse return false;
@@ -702,11 +714,13 @@ fn paint(window: foundation.HWND) bool {
     if (user32.GetClientRect(window, &client) == 0) return false;
 
     const damage = model.damage();
+    const cache_start = frame_trace.timestamp();
     render_cache.update(
         &model,
         terminal_metrics,
         damage,
     ) catch return false;
+    cache_trace.recordSince(cache_start);
     const rendered = active_renderer.paint(
         dc,
         paint_state.rcPaint,
@@ -845,8 +859,116 @@ fn logDebugCounters() void {
             renderer_counts.gpu_recreation_count,
         },
     );
+    const trace_file = kernel32.CreateFileW(
+        trace_file_name,
+        file_system.FILE_GENERIC_WRITE,
+        .{},
+        null,
+        file_system.CREATE_ALWAYS,
+        file_system.FILE_ATTRIBUTE_NORMAL,
+        null,
+    );
+    if (trace_file != foundation.INVALID_HANDLE_VALUE) {
+        defer _ = kernel32.CloseHandle(trace_file);
+        writeTraceLine(
+            trace_file,
+            "performance counters: batches={d} chunks={d} refreshes={d} " ++
+                "dirty_rows={d} rebuilt_rows={d} layout_rebuilds={d} " ++
+                "frames_requested={d} frames_presented={d} " ++
+                "gpu_presents={d} device_recreations={d}",
+            .{
+                terminal_counts.output_batches,
+                terminal_counts.chunks_parsed,
+                terminal_counts.render_refreshes,
+                cache_counts.dirty_rows,
+                cache_counts.rebuilt_rows,
+                renderer_counts.layout_build_count,
+                renderer_counts.frames_requested,
+                renderer_counts.frames_presented,
+                renderer_counts.gpu_present_count,
+                renderer_counts.gpu_recreation_count,
+            },
+        );
+        writeFrameTrace(trace_file, "output", output_trace.snapshot());
+        writeFrameTrace(trace_file, "parse", terminal_counts.parse_trace);
+        writeFrameTrace(
+            trace_file,
+            "render_state",
+            terminal_counts.render_state_trace,
+        );
+        writeFrameTrace(trace_file, "damage", terminal_counts.damage_trace);
+        writeFrameTrace(trace_file, "paint", paint_trace.snapshot());
+        writeFrameTrace(trace_file, "cache", cache_trace.snapshot());
+        writeFrameTrace(trace_file, "gpu", renderer_counts.gpu_paint_trace);
+        writeFrameTrace(trace_file, "scene", renderer_counts.scene_trace);
+        writeFrameTrace(trace_file, "layout", renderer_counts.layout_trace);
+        writeFrameTrace(trace_file, "copy", renderer_counts.copy_trace);
+        writeFrameTrace(trace_file, "present", renderer_counts.present_trace);
+    }
+    logFrameTrace("output", output_trace.snapshot());
+    logFrameTrace("parse", terminal_counts.parse_trace);
+    logFrameTrace("render_state", terminal_counts.render_state_trace);
+    logFrameTrace("damage", terminal_counts.damage_trace);
+    logFrameTrace("paint", paint_trace.snapshot());
+    logFrameTrace("cache", cache_trace.snapshot());
+    logFrameTrace("gpu", renderer_counts.gpu_paint_trace);
+    logFrameTrace("scene", renderer_counts.scene_trace);
+    logFrameTrace("layout", renderer_counts.layout_trace);
+    logFrameTrace("copy", renderer_counts.copy_trace);
+    logFrameTrace("present", renderer_counts.present_trace);
 }
+
+fn logFrameTrace(name: []const u8, stats: frame_trace.Stats) void {
+    std.log.info(
+        "frame trace {s}: samples={d} total_us={d} avg_us={d} max_us={d}",
+        .{
+            name,
+            stats.samples,
+            frame_trace.ticksToMicroseconds(stats.total_ticks),
+            frame_trace.ticksToMicroseconds(stats.averageTicks()),
+            frame_trace.ticksToMicroseconds(stats.max_ticks),
+        },
+    );
+}
+
+fn writeFrameTrace(
+    file: foundation.HANDLE,
+    name: []const u8,
+    stats: frame_trace.Stats,
+) void {
+    writeTraceLine(
+        file,
+        "frame trace {s}: samples={d} total_us={d} avg_us={d} max_us={d}",
+        .{
+            name,
+            stats.samples,
+            frame_trace.ticksToMicroseconds(stats.total_ticks),
+            frame_trace.ticksToMicroseconds(stats.averageTicks()),
+            frame_trace.ticksToMicroseconds(stats.max_ticks),
+        },
+    );
+}
+
+fn writeTraceLine(
+    file: foundation.HANDLE,
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    var buffer: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, format ++ "\r\n", args) catch return;
+    var written: u32 = 0;
+    _ = kernel32.WriteFile(
+        file,
+        line.ptr,
+        @intCast(line.len),
+        &written,
+        null,
+    );
+}
+
 fn applyOutputBatch(window: foundation.HWND, chunks: []const []const u8) !void {
+    const trace_start = frame_trace.timestamp();
+    defer output_trace.recordSince(trace_start);
     try model.writeBatch(chunks);
     model.resetCursorBlink();
     applyTerminalEffects(window);
