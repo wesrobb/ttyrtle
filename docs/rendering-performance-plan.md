@@ -54,6 +54,8 @@ resources, and presentation.
 
 ## Phase 1: Batch ConPTY output into one model refresh
 
+**Status:** Complete (`d1fc296`). Phase 2 is the next implementation phase.
+
 ### Changes
 
 - Split `TerminalModel.write` into parsing and refresh operations, or add a
