@@ -844,6 +844,7 @@ fn logDebugCounters() void {
     std.log.info(
         "performance counters: batches={d} chunks={d} refreshes={d} " ++
             "dirty_rows={d} rebuilt_rows={d} layout_rebuilds={d} " ++
+            "rectangle_requests={d} rectangle_commands={d} " ++
             "frames_requested={d} frames_presented={d} " ++
             "gpu_presents={d} device_recreations={d}",
         .{
@@ -853,6 +854,8 @@ fn logDebugCounters() void {
             cache_counts.dirty_rows,
             cache_counts.rebuilt_rows,
             renderer_counts.layout_build_count,
+            cache_counts.rectangle_requests,
+            cache_counts.rectangle_commands,
             renderer_counts.frames_requested,
             renderer_counts.frames_presented,
             renderer_counts.gpu_present_count,
@@ -874,6 +877,7 @@ fn logDebugCounters() void {
             trace_file,
             "performance counters: batches={d} chunks={d} refreshes={d} " ++
                 "dirty_rows={d} rebuilt_rows={d} layout_rebuilds={d} " ++
+                "rectangle_requests={d} rectangle_commands={d} " ++
                 "frames_requested={d} frames_presented={d} " ++
                 "gpu_presents={d} device_recreations={d}",
             .{
@@ -883,6 +887,8 @@ fn logDebugCounters() void {
                 cache_counts.dirty_rows,
                 cache_counts.rebuilt_rows,
                 renderer_counts.layout_build_count,
+                cache_counts.rectangle_requests,
+                cache_counts.rectangle_commands,
                 renderer_counts.frames_requested,
                 renderer_counts.frames_presented,
                 renderer_counts.gpu_present_count,

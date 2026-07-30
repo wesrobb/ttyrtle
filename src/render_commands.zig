@@ -88,6 +88,8 @@ pub const RenderCache = struct {
     pub const Diagnostics = struct {
         dirty_rows: u64,
         rebuilt_rows: u64,
+        rectangle_requests: u64,
+        rectangle_commands: u64,
     };
     allocator: std.mem.Allocator,
     background: terminal.Rgb = .{ .red = 12, .green = 16, .blue = 20 },
@@ -96,12 +98,16 @@ pub const RenderCache = struct {
     metrics: ?geometry.Metrics = null,
     dirty_row_count: if (counters_enabled) u64 else void,
     rebuilt_row_count: if (counters_enabled) u64 else void,
+    rectangle_request_count: if (counters_enabled) u64 else void,
+    rectangle_merge_count: if (counters_enabled) u64 else void,
 
     pub fn init(allocator: std.mem.Allocator) RenderCache {
         return .{
             .allocator = allocator,
             .dirty_row_count = if (counters_enabled) 0 else {},
             .rebuilt_row_count = if (counters_enabled) 0 else {},
+            .rectangle_request_count = if (counters_enabled) 0 else {},
+            .rectangle_merge_count = if (counters_enabled) 0 else {},
         };
     }
 
@@ -154,10 +160,18 @@ pub const RenderCache = struct {
     }
 
     pub fn diagnostics(self: *const RenderCache) Diagnostics {
-        if (!counters_enabled) return .{ .dirty_rows = 0, .rebuilt_rows = 0 };
+        if (!counters_enabled) return .{
+            .dirty_rows = 0,
+            .rebuilt_rows = 0,
+            .rectangle_requests = 0,
+            .rectangle_commands = 0,
+        };
         return .{
             .dirty_rows = self.dirty_row_count,
             .rebuilt_rows = self.rebuilt_row_count,
+            .rectangle_requests = self.rectangle_request_count,
+            .rectangle_commands = self.rectangle_request_count -
+                self.rectangle_merge_count,
         };
     }
 
@@ -235,7 +249,7 @@ pub const RenderCache = struct {
             else
                 cell.foreground;
             if (!std.meta.eql(cell_background, self.background)) {
-                try row.rectangles.append(self.allocator, .{
+                try self.appendRectangle(row, .{
                     .left = x,
                     .top = y,
                     .right = x + @as(i32, @intCast(metrics.cell_width)),
@@ -246,8 +260,7 @@ pub const RenderCache = struct {
 
             const cursor_here = cursor.visible and
                 cursor.row == row_index and cursor.column == column;
-            if (cursor_here) try appendCursor(
-                self.allocator,
+            if (cursor_here) try self.appendCursor(
                 row,
                 cursor,
                 x,
@@ -255,7 +268,7 @@ pub const RenderCache = struct {
                 metrics,
             );
             if (cell.underline) {
-                try row.rectangles.append(self.allocator, .{
+                try self.appendRectangle(row, .{
                     .left = x,
                     .top = y + @as(i32, @intCast(metrics.underline_top)),
                     .right = x + @as(i32, @intCast(metrics.cell_width)),
@@ -322,50 +335,72 @@ pub const RenderCache = struct {
         row.generation +%= 1;
         if (counters_enabled) self.rebuilt_row_count +|= 1;
     }
-};
 
-fn appendCursor(
-    allocator: std.mem.Allocator,
-    row: *CachedRow,
-    cursor: terminal.Cursor,
-    x: i32,
-    y: i32,
-    metrics: geometry.Metrics,
-) !void {
-    const width: i32 = @intCast(metrics.cell_width);
-    const height: i32 = @intCast(metrics.cell_height);
-    try row.rectangles.append(allocator, switch (cursor.style) {
-        .block => .{
-            .left = x,
-            .top = y,
-            .right = x + width,
-            .bottom = y + height,
-            .color = cursor.color,
-        },
-        .block_hollow => .{
-            .left = x,
-            .top = y,
-            .right = x + width,
-            .bottom = y + height,
-            .color = cursor.color,
-            .outline = true,
-        },
-        .bar => .{
-            .left = x,
-            .top = y,
-            .right = x + @max(1, @divTrunc(width, 6)),
-            .bottom = y + height,
-            .color = cursor.color,
-        },
-        .underline => .{
-            .left = x,
-            .top = y + height - @max(1, @divTrunc(height, 8)),
-            .right = x + width,
-            .bottom = y + height,
-            .color = cursor.color,
-        },
-    });
-}
+    fn appendRectangle(
+        self: *RenderCache,
+        row: *CachedRow,
+        rectangle: Rectangle,
+    ) !void {
+        if (counters_enabled) self.rectangle_request_count +|= 1;
+        if (!rectangle.outline and row.rectangles.items.len != 0) {
+            const previous = &row.rectangles.items[row.rectangles.items.len - 1];
+            if (!previous.outline and
+                previous.right == rectangle.left and
+                previous.top == rectangle.top and
+                previous.bottom == rectangle.bottom and
+                std.meta.eql(previous.color, rectangle.color))
+            {
+                previous.right = rectangle.right;
+                if (counters_enabled) self.rectangle_merge_count +|= 1;
+                return;
+            }
+        }
+        try row.rectangles.append(self.allocator, rectangle);
+    }
+
+    fn appendCursor(
+        self: *RenderCache,
+        row: *CachedRow,
+        cursor: terminal.Cursor,
+        x: i32,
+        y: i32,
+        metrics: geometry.Metrics,
+    ) !void {
+        const width: i32 = @intCast(metrics.cell_width);
+        const height: i32 = @intCast(metrics.cell_height);
+        try self.appendRectangle(row, switch (cursor.style) {
+            .block => .{
+                .left = x,
+                .top = y,
+                .right = x + width,
+                .bottom = y + height,
+                .color = cursor.color,
+            },
+            .block_hollow => .{
+                .left = x,
+                .top = y,
+                .right = x + width,
+                .bottom = y + height,
+                .color = cursor.color,
+                .outline = true,
+            },
+            .bar => .{
+                .left = x,
+                .top = y,
+                .right = x + @max(1, @divTrunc(width, 6)),
+                .bottom = y + height,
+                .color = cursor.color,
+            },
+            .underline => .{
+                .left = x,
+                .top = y + height - @max(1, @divTrunc(height, 8)),
+                .right = x + width,
+                .bottom = y + height,
+                .color = cursor.color,
+            },
+        });
+    }
+};
 
 fn appendUtf16(
     allocator: std.mem.Allocator,
@@ -466,7 +501,7 @@ test "cache preserves wide selection inverse underline and cursor metadata" {
     var found_underline = false;
     var found_cursor = false;
     for (row.rectangles.items) |rectangle| {
-        if (rectangle.left == inverse_x and
+        if (rectangle.left <= inverse_x and rectangle.right > inverse_x and
             std.meta.eql(rectangle.color, inverse.background))
             found_inverse_background = true;
         if (rectangle.left == inverse_x and
@@ -634,4 +669,59 @@ test "uniform ASCII grid excludes wide and combining graphemes" {
     try model.write("\x1b[1;1He\xcc\x81");
     try cache.update(&model, .forDpi(96), model.damage());
     try std.testing.expect(!cache.rows.items[0].hasUniformAsciiGrid());
+}
+
+test "adjacent matching cell backgrounds share one rectangle command" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 1, 8);
+    defer model.deinit();
+    try model.write("\x1b[?25l\x1b[48;2;1;2;3mABC");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+
+    try cache.update(&model, metrics, model.damage());
+
+    const row = &cache.rows.items[0];
+    try std.testing.expectEqual(@as(usize, 1), row.rectangles.items.len);
+    try std.testing.expectEqual(
+        @as(i32, @intCast(metrics.margin_x)),
+        row.rectangles.items[0].left,
+    );
+    try std.testing.expectEqual(
+        @as(i32, @intCast(metrics.margin_x + 3 * metrics.cell_width)),
+        row.rectangles.items[0].right,
+    );
+    const counts = cache.diagnostics();
+    try std.testing.expectEqual(@as(u64, 3), counts.rectangle_requests);
+    try std.testing.expectEqual(@as(u64, 1), counts.rectangle_commands);
+}
+
+test "outline rectangles remain independent commands" {
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var row: CachedRow = .{};
+    defer row.deinit(std.testing.allocator);
+    const color: terminal.Rgb = .{ .red = 1, .green = 2, .blue = 3 };
+
+    try cache.appendRectangle(&row, .{
+        .left = 0,
+        .top = 0,
+        .right = 8,
+        .bottom = 16,
+        .color = color,
+        .outline = true,
+    });
+    try cache.appendRectangle(&row, .{
+        .left = 8,
+        .top = 0,
+        .right = 16,
+        .bottom = 16,
+        .color = color,
+        .outline = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), row.rectangles.items.len);
+    const counts = cache.diagnostics();
+    try std.testing.expectEqual(counts.rectangle_requests, counts.rectangle_commands);
 }
