@@ -204,9 +204,12 @@ backend is developed and establishes explicit resource ownership.
 (with WARP fallback), caps DXGI frame latency, creates a two-buffer flip-model
 swap chain, and owns Direct2D device/context and DirectWrite factory resources.
 Resize and DPI changes recreate a swap-chain target bitmap and a separate
-persistent scene bitmap, feeding full damage back into the retained cache. GDI
-remains the active paint fallback while retained-row Direct2D drawing and
-presentation are implemented.
+persistent scene bitmap, feeding full damage back into the retained cache.
+Direct2D now redraws only damaged retained rows into that scene, composites it
+onto the swap-chain target, and presents once per paint. A bounded brush cache
+and DPI-keyed text format retain drawing resources. Device loss recreates the
+GPU stack and forces a full scene redraw; GDI remains the fallback if creation,
+drawing, recovery, or presentation fails.
 
 ### Resource model
 

@@ -4,6 +4,14 @@ test "hidden Win32 window initializes, paints, and closes cleanly" {
     try app.run(.smoke);
 }
 
+test "hidden GPU renderer presents repeatedly across clean lifecycles" {
+    for (0..3) |_| try app.run(.smoke);
+}
+
+test "hidden window retains the GDI fallback path" {
+    try app.run(.smoke_gdi);
+}
+
 test "finite ConPTY child output reaches the terminal model" {
     try app.run(.integration);
 }

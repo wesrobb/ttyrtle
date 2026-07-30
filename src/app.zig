@@ -21,6 +21,7 @@ const window_title = std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle");
 pub const Mode = enum {
     normal,
     smoke,
+    smoke_gdi,
     integration,
     integration_input,
     integration_resize,
@@ -92,7 +93,7 @@ pub fn run(mode: Mode) !void {
         model.deinit();
         model_initialized = false;
     }
-    if (mode == .smoke)
+    if (isSmokeMode(mode))
         try model.write("\x1b[38;2;126;231;135mHello from libghostty.\x1b[0m");
 
     const instance = kernel32.GetModuleHandleW(null) orelse
@@ -134,7 +135,8 @@ pub fn run(mode: Mode) !void {
     defer if (user32.IsWindow(window) != 0) {
         _ = user32.DestroyWindow(window);
     };
-    active_renderer.initialize(window);
+    if (mode != .smoke_gdi)
+        active_renderer.initialize(window);
     const cursor_timer = user32.SetTimer(window, 1, 500, null);
     defer {
         if (cursor_timer != 0) _ = user32.KillTimer(window, cursor_timer);
@@ -174,7 +176,7 @@ pub fn run(mode: Mode) !void {
         integration_resize_command = try encodedPowerShellCommand(allocator, script);
     }
 
-    if (mode != .smoke) {
+    if (!isSmokeMode(mode)) {
         session = try conpty.Session.create(
             allocator,
             window,
@@ -203,8 +205,8 @@ pub fn run(mode: Mode) !void {
         window,
         if (mode == .normal) wm.SW_SHOWDEFAULT else wm.SW_HIDE,
     );
-    if (mode == .smoke) {
-        _ = user32.SendMessageW(window, wm.WM_PAINT, 0, 0);
+    if (isSmokeMode(mode)) {
+        for (0..3) |_| _ = user32.SendMessageW(window, wm.WM_PAINT, 0, 0);
     } else {
         _ = user32.UpdateWindow(window);
     }
@@ -220,7 +222,7 @@ pub fn run(mode: Mode) !void {
         _ = user32.DispatchMessageW(&message);
     }
 
-    if (mode == .smoke and !paint_completed) return error.SmokePaintFailed;
+    if (isSmokeMode(mode) and !paint_completed) return error.SmokePaintFailed;
     if (isIntegrationMode(mode) and !integration_succeeded)
         return error.ConptyIntegrationFailed;
 }
@@ -234,7 +236,7 @@ fn windowProc(
     switch (message) {
         wm.WM_PAINT => {
             paint_completed = paint(window);
-            if (active_mode == .smoke) {
+            if (isSmokeMode(active_mode)) {
                 _ = user32.PostMessageW(window, wm.WM_CLOSE, 0, 0);
             }
             return 0;
@@ -350,7 +352,7 @@ fn windowProc(
 }
 
 fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
-    if (active_mode == .smoke or session == null) return;
+    if (isSmokeMode(active_mode) or session == null) return;
 
     const is_down = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN;
     if (is_down and currentModifiers().ctrl and currentModifiers().shift) {
@@ -387,7 +389,7 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
 const MouseButton = input.MouseButton;
 
 fn queueFocus(event: input.FocusEvent) void {
-    if (active_mode == .smoke or session == null) return;
+    if (isSmokeMode(active_mode) or session == null) return;
     const encoded = input.encodeFocusAlloc(
         std.heap.smp_allocator,
         event,
@@ -612,7 +614,7 @@ fn copySelection(window: ?foundation.HWND) void {
 }
 
 fn handleCharacterMessage(code_unit: u16) void {
-    if (active_mode == .smoke or session == null) return;
+    if (isSmokeMode(active_mode) or session == null) return;
     const event = input_translator.characterEvent(
         code_unit,
         currentModifiers(),
@@ -824,6 +826,10 @@ fn applyTerminalEffects(window: foundation.HWND) void {
     }
 
     if (model.takeBellCount() > 0) _ = user32.MessageBeep(.{});
+}
+
+fn isSmokeMode(mode: Mode) bool {
+    return mode == .smoke or mode == .smoke_gdi;
 }
 
 fn isIntegrationMode(mode: Mode) bool {

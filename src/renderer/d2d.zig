@@ -1,4 +1,9 @@
+const std = @import("std");
 const win32 = @import("win32");
+const geometry = @import("../geometry.zig");
+const render_commands = @import("../render_commands.zig");
+const terminal = @import("../terminal.zig");
+const resource_cache = @import("resource_cache.zig");
 
 const foundation = win32.foundation;
 const d2d = win32.graphics.direct2d;
@@ -8,6 +13,14 @@ const dwrite = win32.graphics.direct_write;
 const dxgi = win32.graphics.dxgi;
 const d2d_common = d2d.common;
 const dxgi_common = dxgi.common;
+
+const terminal_font_name = std.unicode.utf8ToUtf16LeStringLiteral("Consolas");
+const locale_name = std.unicode.utf8ToUtf16LeStringLiteral("en-US");
+const max_brushes = 64;
+
+const BrushEntry = struct {
+    brush: *d2d.ID2D1SolidColorBrush,
+};
 
 pub const DeviceResources = struct {
     d3d_device: *d3d11.ID3D11Device,
@@ -24,6 +37,11 @@ pub const DeviceResources = struct {
     target_width: u32,
     target_height: u32,
     target_dpi: u32,
+    scene_valid: bool,
+    text_format: ?*dwrite.IDWriteTextFormat,
+    font_state: resource_cache.FontState,
+    brushes: [max_brushes]BrushEntry,
+    brush_slots: resource_cache.KeySlots(max_brushes),
     driver: Driver,
 
     pub const Driver = enum {
@@ -38,6 +56,10 @@ pub const DeviceResources = struct {
         resources.target_width = 0;
         resources.target_height = 0;
         resources.target_dpi = 0;
+        resources.scene_valid = false;
+        resources.text_format = null;
+        resources.font_state = .{};
+        resources.brush_slots = .{};
 
         resources.driver = .hardware;
         var result = win32.d3d11.D3D11CreateDevice(
@@ -179,11 +201,35 @@ pub const DeviceResources = struct {
         self.target_width = width;
         self.target_height = height;
         self.target_dpi = dpi;
+        self.scene_valid = false;
         return true;
+    }
+
+    pub fn paint(
+        self: *DeviceResources,
+        cache: *const render_commands.RenderCache,
+        damage: terminal.RenderDamage,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !void {
+        if (self.target_bitmap == null or self.scene_bitmap == null)
+            return error.TargetUnavailable;
+
+        _ = try self.ensureTextFormat(metrics, dpi);
+        if (!self.scene_valid) {
+            try self.drawScene(cache, .full, metrics, dpi);
+        } else switch (damage) {
+            .none => {},
+            else => try self.drawScene(cache, damage, metrics, dpi),
+        }
+        try self.presentScene();
     }
 
     pub fn deinit(self: *DeviceResources) void {
         self.releaseTargetResources();
+        self.releaseBrushes();
+        if (self.text_format) |format| release(format);
+        self.text_format = null;
         release(self.dwrite_factory);
         release(self.d2d_context);
         release(self.d2d_device);
@@ -249,7 +295,220 @@ pub const DeviceResources = struct {
 
         self.target_bitmap = target;
         self.scene_bitmap = scene;
+        self.scene_valid = false;
+    }
+
+    fn drawScene(
+        self: *DeviceResources,
+        cache: *const render_commands.RenderCache,
+        damage: terminal.RenderDamage,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !void {
+        const scene = self.scene_bitmap orelse return error.TargetUnavailable;
         self.d2d_context.SetTarget(@ptrCast(scene));
+        const target = &self.d2d_context.ID2D1RenderTarget;
+        target.BeginDraw();
+        var drawing = true;
+        errdefer {
+            if (drawing) _ = target.EndDraw(null, null);
+        }
+
+        switch (damage) {
+            .none => {},
+            .full => {
+                const background = toColor(cache.background);
+                target.Clear(&background);
+                for (cache.rows.items) |*row|
+                    try self.drawCachedRow(row, metrics, dpi);
+            },
+            .partial => |rows| for (rows) |row_index| {
+                if (row_index >= cache.rows.items.len) continue;
+                try self.clearRow(cache, metrics, dpi, row_index);
+                try self.drawCachedRow(
+                    &cache.rows.items[row_index],
+                    metrics,
+                    dpi,
+                );
+            },
+        }
+
+        const result = target.EndDraw(null, null);
+        drawing = false;
+        try checkDrawResult(result);
+        self.scene_valid = true;
+    }
+
+    fn clearRow(
+        self: *DeviceResources,
+        cache: *const render_commands.RenderCache,
+        metrics: geometry.Metrics,
+        dpi: u32,
+        row_index: u16,
+    ) !void {
+        const scale = dipScale(dpi);
+        const top_pixels = metrics.margin_y +
+            @as(u32, row_index) * metrics.cell_height;
+        const bounds: d2d_common.D2D_RECT_F = .{
+            .left = @as(f32, @floatFromInt(metrics.margin_x)) * scale,
+            .top = @as(f32, @floatFromInt(top_pixels)) * scale,
+            .right = @as(f32, @floatFromInt(
+                metrics.margin_x +
+                    @as(u32, cache.columns) * metrics.cell_width,
+            )) * scale,
+            .bottom = @as(f32, @floatFromInt(
+                top_pixels + metrics.cell_height,
+            )) * scale,
+        };
+        const brush = try self.getBrush(cache.background);
+        self.d2d_context.ID2D1RenderTarget.FillRectangle(
+            &bounds,
+            @ptrCast(brush),
+        );
+    }
+
+    fn drawCachedRow(
+        self: *DeviceResources,
+        row: *const render_commands.CachedRow,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !void {
+        const target = &self.d2d_context.ID2D1RenderTarget;
+        const scale = dipScale(dpi);
+        for (row.rectangles.items) |rectangle| {
+            const bounds: d2d_common.D2D_RECT_F = .{
+                .left = @as(f32, @floatFromInt(rectangle.left)) * scale,
+                .top = @as(f32, @floatFromInt(rectangle.top)) * scale,
+                .right = @as(f32, @floatFromInt(rectangle.right)) * scale,
+                .bottom = @as(f32, @floatFromInt(rectangle.bottom)) * scale,
+            };
+            const brush = try self.getBrush(rectangle.color);
+            if (rectangle.outline) {
+                target.DrawRectangle(
+                    &bounds,
+                    @ptrCast(brush),
+                    scale,
+                    null,
+                );
+            } else {
+                target.FillRectangle(&bounds, @ptrCast(brush));
+            }
+        }
+
+        const format = self.text_format orelse return error.TextFormatUnavailable;
+        for (row.text_runs.items) |text_run| {
+            if (text_run.text_len == 0) continue;
+            const layout: d2d_common.D2D_RECT_F = .{
+                .left = @as(f32, @floatFromInt(text_run.x)) * scale,
+                .top = @as(f32, @floatFromInt(text_run.y)) * scale,
+                .right = @as(f32, @floatFromInt(self.target_width)) * scale,
+                .bottom = @as(f32, @floatFromInt(
+                    text_run.y + @as(i32, @intCast(metrics.cell_height)),
+                )) * scale,
+            };
+            const brush = try self.getBrush(text_run.color);
+            target.DrawText(
+                @ptrCast(row.utf16.items[text_run.text_start..].ptr),
+                @intCast(text_run.text_len),
+                format,
+                &layout,
+                @ptrCast(brush),
+                .{ .CLIP = 1, .ENABLE_COLOR_FONT = 1 },
+                dwrite.DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+
+    fn presentScene(self: *DeviceResources) !void {
+        const target_bitmap = self.target_bitmap orelse
+            return error.TargetUnavailable;
+        const scene = self.scene_bitmap orelse return error.TargetUnavailable;
+        self.d2d_context.SetTarget(@ptrCast(target_bitmap));
+        const target = &self.d2d_context.ID2D1RenderTarget;
+        target.BeginDraw();
+        target.DrawBitmap(
+            @ptrCast(scene),
+            null,
+            1.0,
+            d2d.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            null,
+        );
+        try checkDrawResult(target.EndDraw(null, null));
+
+        const result = self.swap_chain.IDXGISwapChain.Present(1, 0);
+        if (!result.failed) return;
+        if (isDeviceLoss(result)) return error.DeviceLost;
+        return error.PresentFailed;
+    }
+
+    fn ensureTextFormat(
+        self: *DeviceResources,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !*dwrite.IDWriteTextFormat {
+        const key: resource_cache.FontKey = .{
+            .dpi = dpi,
+            .cell_width = metrics.cell_width,
+            .cell_height = metrics.cell_height,
+        };
+        if (self.text_format != null and self.font_state.matches(key))
+            return self.text_format.?;
+
+        var replacement: *dwrite.IDWriteTextFormat = undefined;
+        const font_size = @as(f32, @floatFromInt(metrics.cell_height)) *
+            dipScale(dpi);
+        if (self.dwrite_factory.CreateTextFormat(
+            terminal_font_name,
+            null,
+            dwrite.DWRITE_FONT_WEIGHT_NORMAL,
+            dwrite.DWRITE_FONT_STYLE_NORMAL,
+            dwrite.DWRITE_FONT_STRETCH_NORMAL,
+            font_size,
+            locale_name,
+            &replacement,
+        ).failed) return error.CreateTextFormatFailed;
+        errdefer release(replacement);
+        if (replacement.SetWordWrapping(
+            dwrite.DWRITE_WORD_WRAPPING_NO_WRAP,
+        ).failed) return error.ConfigureTextFormatFailed;
+        if (replacement.SetParagraphAlignment(
+            dwrite.DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+        ).failed) return error.ConfigureTextFormatFailed;
+
+        if (self.text_format) |format| release(format);
+        self.text_format = replacement;
+        self.font_state.commit(key);
+        self.scene_valid = false;
+        return replacement;
+    }
+
+    fn getBrush(
+        self: *DeviceResources,
+        color: terminal.Rgb,
+    ) !*d2d.ID2D1SolidColorBrush {
+        const key = colorKey(color);
+        if (self.brush_slots.find(key)) |index|
+            return self.brushes[index].brush;
+
+        const value = toColor(color);
+        var replacement: *d2d.ID2D1SolidColorBrush = undefined;
+        if (self.d2d_context.ID2D1RenderTarget.CreateSolidColorBrush(
+            &value,
+            null,
+            &replacement,
+        ).failed) return error.CreateBrushFailed;
+        const insertion = self.brush_slots.insertion();
+        if (insertion.occupied)
+            release(self.brushes[insertion.index].brush);
+        self.brushes[insertion.index] = .{ .brush = replacement };
+        self.brush_slots.commit(insertion, key);
+        return replacement;
+    }
+
+    fn releaseBrushes(self: *DeviceResources) void {
+        for (self.brushes[0..self.brush_slots.count]) |entry|
+            release(entry.brush);
+        self.brush_slots = .{};
     }
 
     fn releaseTargetResources(self: *DeviceResources) void {
@@ -258,8 +517,41 @@ pub const DeviceResources = struct {
         self.scene_bitmap = null;
         if (self.target_bitmap) |bitmap| release(bitmap);
         self.target_bitmap = null;
+        self.scene_valid = false;
     }
 };
+
+fn dipScale(dpi: u32) f32 {
+    return 96.0 / @as(f32, @floatFromInt(@max(dpi, 1)));
+}
+
+fn toColor(color: terminal.Rgb) d2d_common.D2D_COLOR_F {
+    return .{
+        .r = @as(f32, @floatFromInt(color.red)) / 255.0,
+        .g = @as(f32, @floatFromInt(color.green)) / 255.0,
+        .b = @as(f32, @floatFromInt(color.blue)) / 255.0,
+        .a = 1.0,
+    };
+}
+
+fn colorKey(color: terminal.Rgb) u32 {
+    return @as(u32, color.red) << 16 |
+        @as(u32, color.green) << 8 |
+        color.blue;
+}
+
+fn checkDrawResult(result: win32.zig.HRESULT) !void {
+    if (!result.failed) return;
+    if (std.meta.eql(result, foundation.D2DERR_RECREATE_TARGET))
+        return error.RecreateTarget;
+    if (isDeviceLoss(result)) return error.DeviceLost;
+    return error.DrawFailed;
+}
+
+fn isDeviceLoss(result: win32.zig.HRESULT) bool {
+    return std.meta.eql(result, dxgi.DXGI_ERROR_DEVICE_REMOVED) or
+        std.meta.eql(result, dxgi.DXGI_ERROR_DEVICE_RESET);
+}
 
 fn setMaximumFrameLatency(device: *dxgi.IDXGIDevice) !void {
     const device1 = try queryInterface(

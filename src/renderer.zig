@@ -13,8 +13,10 @@ const graphics_gdi = win32.graphics.gdi;
 pub const Renderer = struct {
     fallback: gdi.Renderer = .{},
     gpu: ?d2d.DeviceResources = null,
+    window: ?foundation.HWND = null,
 
     pub fn initialize(self: *Renderer, window: foundation.HWND) void {
+        self.window = window;
         self.gpu = d2d.DeviceResources.create(window) catch |err| {
             // The GDI renderer remains usable when Direct3D is unavailable.
             std.log.warn("GPU renderer initialization failed: {s}", .{
@@ -27,6 +29,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         if (self.gpu) |*resources| resources.deinit();
         self.gpu = null;
+        self.window = null;
         self.fallback.deinit();
     }
 
@@ -41,8 +44,7 @@ pub const Renderer = struct {
             std.log.warn("GPU target recreation failed: {s}", .{
                 @errorName(err),
             });
-            resources.deinit();
-            self.gpu = null;
+            self.recreateGpu(width, height, dpi);
             return true;
         };
     }
@@ -57,6 +59,37 @@ pub const Renderer = struct {
         metrics: geometry.Metrics,
         dpi: u32,
     ) bool {
+        if (self.gpu) |*resources| {
+            resources.paint(cache, damage, metrics, dpi) catch |err| {
+                std.log.warn("GPU paint failed: {s}", .{@errorName(err)});
+                const width: u32 = @intCast(@max(
+                    client_rect.right - client_rect.left,
+                    0,
+                ));
+                const height: u32 = @intCast(@max(
+                    client_rect.bottom - client_rect.top,
+                    0,
+                ));
+                self.recreateGpu(width, height, dpi);
+                if (self.gpu) |*replacement| {
+                    replacement.paint(
+                        cache,
+                        .full,
+                        metrics,
+                        dpi,
+                    ) catch |retry_err| {
+                        std.log.warn("GPU recovery paint failed: {s}", .{
+                            @errorName(retry_err),
+                        });
+                        replacement.deinit();
+                        self.gpu = null;
+                    };
+                    if (self.gpu != null) return true;
+                }
+            };
+            if (self.gpu != null) return true;
+        }
+
         return self.fallback.paint(
             window_dc,
             paint_rect,
@@ -66,5 +99,30 @@ pub const Renderer = struct {
             metrics,
             dpi,
         );
+    }
+
+    fn recreateGpu(
+        self: *Renderer,
+        width: u32,
+        height: u32,
+        dpi: u32,
+    ) void {
+        if (self.gpu) |*resources| resources.deinit();
+        self.gpu = null;
+        const window = self.window orelse return;
+        var replacement = d2d.DeviceResources.create(window) catch |err| {
+            std.log.warn("GPU device recreation failed: {s}", .{
+                @errorName(err),
+            });
+            return;
+        };
+        _ = replacement.resizeTarget(width, height, dpi) catch |err| {
+            std.log.warn("GPU target recovery failed: {s}", .{
+                @errorName(err),
+            });
+            replacement.deinit();
+            return;
+        };
+        self.gpu = replacement;
     }
 };
