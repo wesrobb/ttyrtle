@@ -30,6 +30,23 @@ pub const Renderer = struct {
         self.fallback.deinit();
     }
 
+    pub fn resize(
+        self: *Renderer,
+        width: u32,
+        height: u32,
+        dpi: u32,
+    ) bool {
+        const resources = &(self.gpu orelse return false);
+        return resources.resizeTarget(width, height, dpi) catch |err| {
+            std.log.warn("GPU target recreation failed: {s}", .{
+                @errorName(err),
+            });
+            resources.deinit();
+            self.gpu = null;
+            return true;
+        };
+    }
+
     pub fn paint(
         self: *Renderer,
         window_dc: graphics_gdi.HDC,

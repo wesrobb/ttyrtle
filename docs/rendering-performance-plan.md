@@ -203,8 +203,10 @@ backend is developed and establishes explicit resource ownership.
 **Status:** In progress. The renderer now bootstraps a hardware D3D11 device
 (with WARP fallback), caps DXGI frame latency, creates a two-buffer flip-model
 swap chain, and owns Direct2D device/context and DirectWrite factory resources.
-GDI remains the active paint fallback while swap-chain targets, the persistent
-scene bitmap, and retained-row drawing are implemented.
+Resize and DPI changes recreate a swap-chain target bitmap and a separate
+persistent scene bitmap, feeding full damage back into the retained cache. GDI
+remains the active paint fallback while retained-row Direct2D drawing and
+presentation are implemented.
 
 ### Resource model
 

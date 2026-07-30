@@ -714,6 +714,11 @@ fn resizeForClient(window: foundation.HWND) !void {
     var client: foundation.RECT = undefined;
     if (user32.GetClientRect(window, &client) == 0)
         return error.GetClientRectFailed;
+    if (active_renderer.resize(
+        @intCast(@max(client.right - client.left, 0)),
+        @intCast(@max(client.bottom - client.top, 0)),
+        user32.GetDpiForWindow(window),
+    )) model.markFullDamage();
     const dimensions = terminal_metrics.dimensions(
         client.right - client.left,
         client.bottom - client.top,
