@@ -203,9 +203,16 @@ pub const TerminalModel = struct {
     pub fn cursor(self: *const TerminalModel) Cursor {
         const raw_color = self.render_state.colors.cursor orelse
             self.render_state.colors.foreground;
+        const viewport = self.render_state.cursor.viewport;
         return .{
-            .row = self.render_state.cursor.active.y,
-            .column = self.render_state.cursor.active.x,
+            .row = if (viewport) |position|
+                position.y
+            else
+                self.render_state.cursor.active.y,
+            .column = if (viewport) |position|
+                position.x
+            else
+                self.render_state.cursor.active.x,
             .style = switch (self.render_state.cursor.visual_style) {
                 .bar => .bar,
                 .block => .block,
@@ -214,7 +221,7 @@ pub const TerminalModel = struct {
             },
             .color = rgb(raw_color),
             .visible = self.render_state.cursor.visible and
-                self.render_state.cursor.viewport != null and
+                viewport != null and
                 (!self.render_state.cursor.blinking or self.cursor_blink_visible),
             .blinking = self.render_state.cursor.blinking,
         };
@@ -443,6 +450,23 @@ test "VT output updates text, truecolor, and cursor state" {
     const cursor = model.cursor();
     try std.testing.expectEqual(@as(u32, 0), cursor.row);
     try std.testing.expectEqual(@as(u32, 5), cursor.column);
+}
+
+test "cursor position uses viewport coordinates" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+
+    model.render_state.cursor.active = .{ .x = 17, .y = 9 };
+    model.render_state.cursor.viewport = .{
+        .x = 3,
+        .y = 2,
+        .wide_tail = false,
+    };
+
+    const cursor = model.cursor();
+    try std.testing.expectEqual(@as(u32, 2), cursor.row);
+    try std.testing.expectEqual(@as(u32, 3), cursor.column);
 }
 
 test "UTF-8 terminal text can be read back without loss" {

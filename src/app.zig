@@ -17,6 +17,7 @@ const user32 = win32.user32;
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("Ttyrtle");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle");
+const terminal_font_name = std.unicode.utf8ToUtf16LeStringLiteral("Consolas");
 
 pub const Mode = enum {
     normal,
@@ -634,6 +635,25 @@ fn paint(window: foundation.HWND) bool {
     const background = gdi32.CreateSolidBrush(toColorRef(frame.background)) orelse
         return false;
     defer _ = gdi32.DeleteObject(background);
+    const font = gdi32.CreateFontW(
+        @intCast(terminal_metrics.cell_height),
+        @intCast(terminal_metrics.cell_width),
+        0,
+        0,
+        @intFromEnum(gdi.FW_NORMAL),
+        0,
+        0,
+        0,
+        @intFromEnum(gdi.DEFAULT_CHARSET),
+        @intFromEnum(gdi.OUT_DEFAULT_PRECIS),
+        @as(u8, @bitCast(gdi.CLIP_DEFAULT_PRECIS)),
+        @intFromEnum(gdi.CLEARTYPE_QUALITY),
+        @intFromEnum(gdi.FIXED_PITCH) | @intFromEnum(gdi.FF_MODERN),
+        terminal_font_name,
+    ) orelse return false;
+    defer _ = gdi32.DeleteObject(font);
+    const previous_font = gdi32.SelectObject(dc, font) orelse return false;
+    defer _ = gdi32.SelectObject(dc, previous_font);
 
     _ = user32.FillRect(dc, &paint_state.rcPaint, background);
     _ = gdi32.SetBkMode(dc, gdi.TRANSPARENT);
