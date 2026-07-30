@@ -22,25 +22,20 @@ const BrushEntry = struct {
     brush: *d2d.ID2D1SolidColorBrush,
 };
 
-const TextLayoutEntry = struct {
-    layout: *dwrite.IDWriteTextLayout,
-};
-
 const RowLayouts = struct {
     row_generation: u64 = 0,
     font_generation: u64 = 0,
-    entries: std.ArrayListUnmanaged(TextLayoutEntry) = .empty,
+    layout: ?*dwrite.IDWriteTextLayout = null,
 
     fn clear(self: *RowLayouts) void {
-        for (self.entries.items) |entry| release(entry.layout);
-        self.entries.clearRetainingCapacity();
+        if (self.layout) |layout| release(layout);
+        self.layout = null;
         self.row_generation = 0;
         self.font_generation = 0;
     }
 
     fn deinit(self: *RowLayouts) void {
         self.clear();
-        self.entries.deinit(std.heap.smp_allocator);
         self.* = undefined;
     }
 };
@@ -55,6 +50,9 @@ pub const DeviceResources = struct {
     d2d_device: *d2d.ID2D1Device,
     d2d_context: *d2d.ID2D1DeviceContext,
     dwrite_factory: *dwrite.IDWriteFactory,
+    dwrite_factory2: *dwrite.IDWriteFactory2,
+    font_fallback: *dwrite.IDWriteFontFallback,
+    typography: *dwrite.IDWriteTypography,
     target_bitmap: ?*d2d.ID2D1Bitmap1,
     scene_bitmap: ?*d2d.ID2D1Bitmap1,
     target_width: u32,
@@ -199,6 +197,32 @@ pub const DeviceResources = struct {
             &dwrite_raw,
         ).failed) return error.CreateDWriteFactoryFailed;
         resources.dwrite_factory = @ptrCast(@alignCast(dwrite_raw));
+        errdefer release(resources.dwrite_factory);
+        resources.dwrite_factory2 = try queryInterface(
+            dwrite.IDWriteFactory2,
+            resources.dwrite_factory,
+            dwrite.IID_IDWriteFactory2,
+        );
+        errdefer release(resources.dwrite_factory2);
+        if (resources.dwrite_factory2.GetSystemFontFallback(
+            &resources.font_fallback,
+        ).failed) return error.GetSystemFontFallbackFailed;
+        errdefer release(resources.font_fallback);
+        if (resources.dwrite_factory.CreateTypography(
+            &resources.typography,
+        ).failed) return error.CreateTypographyFailed;
+        errdefer release(resources.typography);
+        for ([_]dwrite.DWRITE_FONT_FEATURE_TAG{
+            .STANDARD_LIGATURES,
+            .CONTEXTUAL_LIGATURES,
+            .DISCRETIONARY_LIGATURES,
+            .HISTORICAL_LIGATURES,
+        }) |tag| {
+            if (resources.typography.AddFontFeature(.{
+                .nameTag = tag,
+                .parameter = 0,
+            }).failed) return error.ConfigureTypographyFailed;
+        }
 
         return resources;
     }
@@ -236,6 +260,59 @@ pub const DeviceResources = struct {
         return true;
     }
 
+    pub fn metricsForDpi(self: *DeviceResources, dpi: u32) !geometry.Metrics {
+        var collection: *dwrite.IDWriteFontCollection = undefined;
+        if (self.dwrite_factory.GetSystemFontCollection(
+            &collection,
+            0,
+        ).failed) return error.GetSystemFontCollectionFailed;
+        defer release(collection);
+        var family_index: u32 = 0;
+        var family_exists: i32 = 0;
+        if (collection.FindFamilyName(
+            terminal_font_name,
+            &family_index,
+            &family_exists,
+        ).failed or family_exists == 0) return error.PrimaryFontUnavailable;
+        var family: *dwrite.IDWriteFontFamily = undefined;
+        if (collection.GetFontFamily(family_index, &family).failed)
+            return error.GetFontFamilyFailed;
+        defer release(family);
+        var font: *dwrite.IDWriteFont = undefined;
+        if (family.GetFirstMatchingFont(
+            .NORMAL,
+            .NORMAL,
+            .NORMAL,
+            &font,
+        ).failed) return error.GetFontFailed;
+        defer release(font);
+        var face: *dwrite.IDWriteFontFace = undefined;
+        if (font.CreateFontFace(&face).failed) return error.CreateFontFaceFailed;
+        defer release(face);
+        var font_metrics: dwrite.DWRITE_FONT_METRICS = undefined;
+        face.GetMetrics(&font_metrics);
+        const code_points = [_]u32{'0'};
+        var glyph_indices: [1:0]u16 = undefined;
+        if (face.GetGlyphIndices(&code_points, 1, &glyph_indices).failed)
+            return error.GetGlyphIndicesFailed;
+        var glyph_metrics: [1]dwrite.DWRITE_GLYPH_METRICS = undefined;
+        if (face.GetDesignGlyphMetrics(
+            &glyph_indices,
+            1,
+            &glyph_metrics,
+            0,
+        ).failed) return error.GetGlyphMetricsFailed;
+        return .fromDirectWrite(
+            dpi,
+            font_metrics.designUnitsPerEm,
+            glyph_metrics[0].advanceWidth,
+            font_metrics.ascent,
+            font_metrics.descent,
+            font_metrics.lineGap,
+            font_metrics.underlinePosition,
+            font_metrics.underlineThickness,
+        );
+    }
     pub fn paint(
         self: *DeviceResources,
         cache: *const render_commands.RenderCache,
@@ -267,6 +344,9 @@ pub const DeviceResources = struct {
         self.releaseBrushes();
         if (self.text_format) |format| release(format);
         self.text_format = null;
+        release(self.typography);
+        release(self.font_fallback);
+        release(self.dwrite_factory2);
         release(self.dwrite_factory);
         release(self.d2d_context);
         release(self.d2d_device);
@@ -443,18 +523,24 @@ pub const DeviceResources = struct {
         }
 
         const layouts = try self.ensureRowLayouts(row_index, row, metrics, dpi);
-        for (row.text_runs.items, layouts.entries.items) |text_run, entry| {
-            const brush = try self.getBrush(text_run.color);
-            target.DrawTextLayout(
-                .{
-                    .x = @as(f32, @floatFromInt(text_run.x)) * scale,
-                    .y = @as(f32, @floatFromInt(text_run.y)) * scale,
-                },
-                entry.layout,
-                @ptrCast(brush),
-                .{ .CLIP = 1, .ENABLE_COLOR_FONT = 1 },
-            );
-        }
+        const layout = layouts.layout orelse return;
+        const default_brush = try self.getBrush(.{
+            .red = 255,
+            .green = 255,
+            .blue = 255,
+        });
+        target.DrawTextLayout(
+            .{
+                .x = @as(f32, @floatFromInt(metrics.margin_x)) * scale,
+                .y = @as(f32, @floatFromInt(
+                    metrics.margin_y +
+                        @as(u32, @intCast(row_index)) * metrics.cell_height,
+                )) * scale,
+            },
+            layout,
+            @ptrCast(default_brush),
+            .{ .CLIP = 1, .ENABLE_COLOR_FONT = 1 },
+        );
     }
 
     fn resizeRowLayouts(self: *DeviceResources, row_count: usize) !void {
@@ -484,28 +570,70 @@ pub const DeviceResources = struct {
         errdefer layouts.clear();
         const format = self.text_format orelse return error.TextFormatUnavailable;
         const scale = dipScale(dpi);
-        for (row.text_runs.items) |text_run| {
-            if (text_run.text_len == 0) continue;
-            var layout: *dwrite.IDWriteTextLayout = undefined;
-            if (self.dwrite_factory.CreateTextLayout(
-                @ptrCast(row.utf16.items[text_run.text_start..].ptr),
-                @intCast(text_run.text_len),
-                format,
-                @max(
-                    1.0,
-                    (@as(f32, @floatFromInt(self.target_width)) -
-                        @as(f32, @floatFromInt(text_run.x))) * scale,
-                ),
-                @as(f32, @floatFromInt(metrics.cell_height)) * scale,
-                &layout,
-            ).failed) return error.CreateTextLayoutFailed;
-            errdefer release(layout);
-            try layouts.entries.append(
-                std.heap.smp_allocator,
-                .{ .layout = layout },
-            );
-            self.layout_build_count +%= 1;
+        var layout: *dwrite.IDWriteTextLayout = undefined;
+        if (self.dwrite_factory.CreateTextLayout(
+            @ptrCast(row.utf16.items.ptr),
+            @intCast(row.utf16.items.len),
+            format,
+            @max(1.0, @as(f32, @floatFromInt(metrics.cell_width *
+                @as(u32, @intCast(row.cells.items.len)))) * scale),
+            @as(f32, @floatFromInt(metrics.cell_height)) * scale,
+            &layout,
+        ).failed) return error.CreateTextLayoutFailed;
+        errdefer release(layout);
+        const full_range: dwrite.DWRITE_TEXT_RANGE = .{
+            .startPosition = 0,
+            .length = @intCast(row.utf16.items.len),
+        };
+        if (layout.SetTypography(self.typography, full_range).failed)
+            return error.ConfigureTextLayoutFailed;
+        const layout1 = try queryInterface(
+            dwrite.IDWriteTextLayout1,
+            layout,
+            dwrite.IID_IDWriteTextLayout1,
+        );
+        defer release(layout1);
+        if (layout1.SetPairKerning(0, full_range).failed)
+            return error.ConfigureTextLayoutFailed;
+        for (row.graphemes.items) |grapheme| {
+            const range: dwrite.DWRITE_TEXT_RANGE = .{
+                .startPosition = @intCast(grapheme.text_start),
+                .length = @intCast(grapheme.text_len),
+            };
+            var hit_metrics: [16]dwrite.DWRITE_HIT_TEST_METRICS = undefined;
+            var hit_count: u32 = 0;
+            if (layout.HitTestTextRange(
+                range.startPosition,
+                range.length,
+                0,
+                0,
+                &hit_metrics,
+                hit_metrics.len,
+                &hit_count,
+            ).failed or hit_count == 0 or hit_count > hit_metrics.len)
+                return error.MeasureTextClusterFailed;
+            var shaped_advance: f32 = 0;
+            for (hit_metrics[0..hit_count]) |hit| shaped_advance += hit.width;
+            const grid_advance = @as(f32, @floatFromInt(
+                @as(u32, grapheme.cell_count) * metrics.cell_width,
+            )) * scale;
+            const trailing = (grid_advance - shaped_advance) /
+                @as(f32, @floatFromInt(hit_count));
+            if (layout1.SetCharacterSpacing(0, trailing, 0, range).failed)
+                return error.ConfigureTextLayoutFailed;
         }
+        for (row.text_runs.items) |text_run| {
+            const brush = try self.getBrush(text_run.color);
+            if (layout.SetDrawingEffect(
+                @ptrCast(&brush.IUnknown),
+                .{
+                    .startPosition = @intCast(text_run.text_start),
+                    .length = @intCast(text_run.text_len),
+                },
+            ).failed) return error.ConfigureTextLayoutFailed;
+        }
+        layouts.layout = layout;
+        self.layout_build_count +%= 1;
         layouts.row_generation = row.generation;
         layouts.font_generation = self.font_generation;
         return layouts;
@@ -547,8 +675,7 @@ pub const DeviceResources = struct {
             return self.text_format.?;
 
         var replacement: *dwrite.IDWriteTextFormat = undefined;
-        const font_size = @as(f32, @floatFromInt(metrics.cell_height)) *
-            dipScale(dpi);
+        const font_size: f32 = 16.0;
         if (self.dwrite_factory.CreateTextFormat(
             terminal_font_name,
             null,
@@ -566,6 +693,14 @@ pub const DeviceResources = struct {
         if (replacement.SetParagraphAlignment(
             dwrite.DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
         ).failed) return error.ConfigureTextFormatFailed;
+        const replacement1 = try queryInterface(
+            dwrite.IDWriteTextFormat1,
+            replacement,
+            dwrite.IID_IDWriteTextFormat1,
+        );
+        defer release(replacement1);
+        if (replacement1.SetFontFallback(self.font_fallback).failed)
+            return error.ConfigureTextFormatFailed;
 
         if (self.text_format) |format| release(format);
         self.text_format = replacement;

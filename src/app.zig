@@ -143,7 +143,7 @@ pub fn run(mode: Mode) !void {
         if (cursor_timer != 0) _ = user32.KillTimer(window, cursor_timer);
     }
 
-    terminal_metrics = .forDpi(user32.GetDpiForWindow(window));
+    terminal_metrics = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
     try resizeForClient(window);
 
     var integration_resize_command: ?[]u8 = null;
@@ -253,7 +253,7 @@ fn windowProc(
             return 0;
         },
         wm.WM_DPICHANGED => {
-            terminal_metrics = .forDpi(@as(u16, @truncate(wparam)));
+            terminal_metrics = active_renderer.metricsForDpi(@as(u16, @truncate(wparam)));
             model.markFullDamage();
             const suggested: *const foundation.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
             _ = user32.SetWindowPos(
@@ -851,9 +851,11 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         clean.layout_build_count != initial.layout_build_count)
         return error.CleanPaintRebuiltLayouts;
 
+    const clean_row_generation = active_renderer.layoutGenerationForTesting(2) orelse
+        return error.RowLayoutGenerationUnavailable;
     const chunks = [_][]const u8{
         "\x1b[2;1Hphase-",
-        "five-batch",
+        "six-batch",
     };
     try applyOutputBatch(window, &chunks);
     const before_batch = active_renderer.diagnostics();
@@ -861,8 +863,10 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     const after_batch = active_renderer.diagnostics();
     if (after_batch.gpu_present_count != before_batch.gpu_present_count + 1)
         return error.OutputBatchPresentedMoreThanOnce;
-    if (after_batch.layout_build_count <= before_batch.layout_build_count)
-        return error.DirtyRowLayoutWasNotRebuilt;
+    if (after_batch.layout_build_count != before_batch.layout_build_count + 2)
+        return error.DirtyRowLayoutRebuildWasNotProportional;
+    if (active_renderer.layoutGenerationForTesting(2) != clean_row_generation)
+        return error.CleanRowLayoutGenerationChanged;
 
     for (0..3) |iteration| {
         _ = user32.SendMessageW(window, wm.WM_SIZE, wm.SIZE_MINIMIZED, 0);

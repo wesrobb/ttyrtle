@@ -27,6 +27,14 @@ pub const CellMetadata = struct {
     cursor: bool,
 };
 
+/// One complete terminal grapheme in the row shaping buffer.
+pub const GraphemeSpan = struct {
+    text_start: usize,
+    text_len: usize,
+    cell_start: u16,
+    cell_count: u8,
+};
+
 pub const CachedRow = struct {
     generation: u64 = 0,
     utf16: std.ArrayListUnmanaged(u16) = .empty,
@@ -34,6 +42,7 @@ pub const CachedRow = struct {
     cells: std.ArrayListUnmanaged(CellMetadata) = .empty,
     rectangles: std.ArrayListUnmanaged(Rectangle) = .empty,
     text_runs: std.ArrayListUnmanaged(TextRun) = .empty,
+    graphemes: std.ArrayListUnmanaged(GraphemeSpan) = .empty,
 
     fn deinit(self: *CachedRow, allocator: std.mem.Allocator) void {
         self.utf16.deinit(allocator);
@@ -41,6 +50,7 @@ pub const CachedRow = struct {
         self.cells.deinit(allocator);
         self.rectangles.deinit(allocator);
         self.text_runs.deinit(allocator);
+        self.graphemes.deinit(allocator);
         self.* = undefined;
     }
 
@@ -50,6 +60,7 @@ pub const CachedRow = struct {
         self.cells.clearRetainingCapacity();
         self.rectangles.clearRetainingCapacity();
         self.text_runs.clearRetainingCapacity();
+        self.graphemes.clearRetainingCapacity();
     }
 };
 
@@ -138,9 +149,17 @@ pub const RenderCache = struct {
         for (0..model.columns()) |column| {
             const cell = model.cell(row_index, column) orelse {
                 active_run = null;
+                const text_start = row.utf16.items.len;
+                try appendUtf16(self.allocator, row, @intCast(column), ' ');
+                try row.graphemes.append(self.allocator, .{
+                    .text_start = text_start,
+                    .text_len = 1,
+                    .cell_start = @intCast(column),
+                    .cell_count = 1,
+                });
                 try row.cells.append(self.allocator, .{
-                    .utf16_start = row.utf16.items.len,
-                    .utf16_len = 0,
+                    .utf16_start = text_start,
+                    .utf16_len = 1,
                     .spacer = false,
                     .selected = false,
                     .cursor = false,
@@ -186,9 +205,12 @@ pub const RenderCache = struct {
             if (cell.underline) {
                 try row.rectangles.append(self.allocator, .{
                     .left = x,
-                    .top = y + @as(i32, @intCast(metrics.cell_height)) - 2,
+                    .top = y + @as(i32, @intCast(metrics.underline_top)),
                     .right = x + @as(i32, @intCast(metrics.cell_width)),
-                    .bottom = y + @as(i32, @intCast(metrics.cell_height)),
+                    .bottom = y + @as(i32, @intCast(@min(
+                        metrics.cell_height,
+                        metrics.underline_top + metrics.underline_thickness,
+                    ))),
                     .color = cell.foreground,
                 });
             }
@@ -221,6 +243,20 @@ pub const RenderCache = struct {
                     row.text_runs.items[active_run.?].text_start;
             } else {
                 active_run = null;
+                try appendUtf16(self.allocator, row, @intCast(column), ' ');
+            }
+            if (!cell.spacer) {
+                const next_is_spacer = column + 1 < model.columns() and
+                    if (model.cell(row_index, column + 1)) |next|
+                        next.spacer
+                    else
+                        false;
+                try row.graphemes.append(self.allocator, .{
+                    .text_start = text_start,
+                    .text_len = row.utf16.items.len - text_start,
+                    .cell_start = @intCast(column),
+                    .cell_count = if (next_is_spacer) 2 else 1,
+                });
             }
 
             try row.cells.append(self.allocator, .{
@@ -336,9 +372,14 @@ test "cache retains UTF-16 cell mapping and combining graphemes" {
     try std.testing.expectEqualSlices(
         u16,
         std.unicode.utf8ToUtf16LeStringLiteral("é👻"),
-        row.utf16.items,
+        row.utf16.items[0..4],
     );
-    try std.testing.expectEqualSlices(u16, &.{ 0, 0, 1, 1 }, row.utf16_to_cell.items);
+    try std.testing.expectEqualSlices(
+        u16,
+        &.{ 0, 0, 1, 1, 3, 4, 5, 6, 7, 8, 9 },
+        row.utf16_to_cell.items,
+    );
+    try std.testing.expectEqual(@as(u8, 2), row.graphemes.items[1].cell_count);
     try std.testing.expectEqual(@as(usize, 2), row.cells.items[0].utf16_len);
     try std.testing.expectEqual(@as(usize, 2), row.cells.items[1].utf16_len);
 }
@@ -372,7 +413,7 @@ test "cache preserves wide selection inverse underline and cursor metadata" {
             std.meta.eql(rectangle.color, inverse.background))
             found_inverse_background = true;
         if (rectangle.left == inverse_x and
-            rectangle.bottom - rectangle.top == 2)
+            rectangle.bottom - rectangle.top == metrics.underline_thickness)
             found_underline = true;
         if (rectangle.left ==
             @as(i32, @intCast(metrics.margin_x + 4 * metrics.cell_width)) and
@@ -405,6 +446,89 @@ test "cache resize drops stale rows and initializes new rows" {
         try std.testing.expectEqual(@as(usize, 12), row.cells.items.len);
 }
 
+fn expectGridMappedGraphemes(row: *const CachedRow) !void {
+    for (row.graphemes.items) |grapheme| {
+        try std.testing.expect(grapheme.cell_count == 1 or grapheme.cell_count == 2);
+        for (row.utf16_to_cell.items[grapheme.text_start .. grapheme.text_start + grapheme.text_len]) |cell| try std.testing.expectEqual(grapheme.cell_start, cell);
+    }
+}
+
+test "ASCII PowerShell prompts box drawing block elements and colored runs retain cells" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 2, 48);
+    defer model.deinit();
+    try model.write("\x1b[38;2;10;20;30mPS C:\\src>\x1b[0m ┌─┐ █▓▒░");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.update(&model, .forDpi(96), model.damage());
+    const row = &cache.rows.items[0];
+    try expectGridMappedGraphemes(row);
+    try std.testing.expect(row.text_runs.items.len >= 2);
+    try std.testing.expect(std.mem.indexOf(
+        u16,
+        row.utf16.items,
+        std.unicode.utf8ToUtf16LeStringLiteral("PS C:\\src>"),
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u16,
+        row.utf16.items,
+        std.unicode.utf8ToUtf16LeStringLiteral("┌─┐ █▓▒░"),
+    ) != null);
+}
+
+test "combining precomposed CJK surrogate emoji ZWJ and mixed-script fallback retain grid advances" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 2, 64);
+    defer model.deinit();
+    try model.write("é é 界 𝄞 ☺️ 👩‍💻 Ελληνικά العربية हिन्दी");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.update(&model, .forDpi(96), model.damage());
+    const row = &cache.rows.items[0];
+    try expectGridMappedGraphemes(row);
+    try std.testing.expect(std.mem.indexOf(
+        u16,
+        row.utf16.items,
+        std.unicode.utf8ToUtf16LeStringLiteral("é"),
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u16,
+        row.utf16.items,
+        std.unicode.utf8ToUtf16LeStringLiteral("é"),
+    ) != null);
+    var saw_wide = false;
+    var saw_surrogate = false;
+    for (row.graphemes.items) |grapheme| {
+        saw_wide = saw_wide or grapheme.cell_count == 2;
+        saw_surrogate = saw_surrogate or grapheme.text_len >= 2 and
+            row.utf16.items[grapheme.text_start] >= 0xd800 and
+            row.utf16.items[grapheme.text_start] <= 0xdbff;
+    }
+    try std.testing.expect(saw_wide);
+    try std.testing.expect(saw_surrogate);
+    try std.testing.expect(std.mem.indexOf(
+        u16,
+        row.utf16.items,
+        std.unicode.utf8ToUtf16LeStringLiteral("👩‍💻"),
+    ) != null);
+}
+
+test "missing glyph candidate keeps a stable terminal-cell advance" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 1, 8);
+    defer model.deinit();
+    try model.write("A\xf4\x8f\xbf\xbfB");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.update(&model, .forDpi(96), model.damage());
+    const row = &cache.rows.items[0];
+    try expectGridMappedGraphemes(row);
+    try std.testing.expectEqual(@as(u16, 1), row.graphemes.items[1].cell_start);
+    try std.testing.expect(row.graphemes.items[1].cell_count == 1 or
+        row.graphemes.items[1].cell_count == 2);
+    try std.testing.expect(row.graphemes.items[2].cell_start >
+        row.graphemes.items[1].cell_start);
+}
 test "steady-state row rebuild reuses retained storage" {
     var model: terminal.TerminalModel = undefined;
     try model.init(std.testing.allocator, 2, 10);
@@ -421,6 +545,7 @@ test "steady-state row rebuild reuses retained storage" {
         row.cells.capacity,
         row.rectangles.capacity,
         row.text_runs.capacity,
+        row.graphemes.capacity,
     };
 
     model.markFullDamage();
@@ -431,4 +556,5 @@ test "steady-state row rebuild reuses retained storage" {
     try std.testing.expectEqual(capacities[2], row.cells.capacity);
     try std.testing.expectEqual(capacities[3], row.rectangles.capacity);
     try std.testing.expectEqual(capacities[4], row.text_runs.capacity);
+    try std.testing.expectEqual(capacities[5], row.graphemes.capacity);
 }

@@ -4,6 +4,10 @@ pub const FontKey = struct {
     dpi: u32,
     cell_width: u32,
     cell_height: u32,
+    family_generation: u32 = 1,
+    size_generation: u32 = 1,
+    fallback_generation: u32 = 1,
+    typography_generation: u32 = 1,
 };
 
 pub const FontState = struct {
@@ -68,6 +72,18 @@ test "font state reuses a matching key and changes once for DPI" {
     try std.testing.expect(state.matches(scaled));
 }
 
+test "font state invalidates every shaping policy input" {
+    const initial: FontKey = .{ .dpi = 96, .cell_width = 8, .cell_height = 16 };
+    var state: FontState = .{};
+    state.commit(initial);
+    inline for (.{
+        FontKey{ .dpi = 144, .cell_width = 8, .cell_height = 16 },
+        FontKey{ .dpi = 96, .cell_width = 8, .cell_height = 16, .family_generation = 2 },
+        FontKey{ .dpi = 96, .cell_width = 8, .cell_height = 16, .size_generation = 2 },
+        FontKey{ .dpi = 96, .cell_width = 8, .cell_height = 16, .fallback_generation = 2 },
+        FontKey{ .dpi = 96, .cell_width = 8, .cell_height = 16, .typography_generation = 2 },
+    }) |changed| try std.testing.expect(!state.matches(changed));
+}
 test "key slots reuse hits and evict within their bound" {
     var slots: KeySlots(2) = .{};
     const first = slots.insertion();

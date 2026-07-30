@@ -95,9 +95,17 @@ Windows character path, but pre-edit composition and candidate positioning are
 not rendered yet. Selection is viewport-local and does not yet scroll beyond
 the visible grid.
 
-The Direct2D renderer supports terminal foreground/background colors, inverse
-and faint text, underline, cursor shapes and blinking, wide-cell spacing, and
-combining marks. It does not yet provide complete grapheme shaping, system font
-fallback, ligature policy, configurable fonts, or perfect grapheme placement.
-Configuration, tabs, profiles, accessibility, shell integration, and session
-persistence remain separate future work.
+The Direct2D renderer shapes one complete UTF-16 row at a time with persistent
+system font fallback. Ghostty graphemes retain exact one- or two-cell advances,
+including combining marks, CJK, supplementary characters, emoji sequences, and
+missing glyphs. Text colors are ranges within the row layout; backgrounds,
+inverse video, underline, selection, and cursor drawing remain aligned to cell
+rectangles. DirectWrite color fonts are enabled with its monochrome fallback.
+The default terminal-safe typography disables standard, contextual,
+discretionary, and historical ligatures plus pair kerning. Cell width, line
+metrics, baseline, and underline geometry come from the configured DirectWrite
+font face at the active DPI.
+
+Font selection and size are not configurable yet. Configuration, tabs,
+profiles, accessibility, shell integration, and session persistence remain
+separate future work.

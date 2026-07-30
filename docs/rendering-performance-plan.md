@@ -203,8 +203,8 @@ backend is developed and establishes explicit resource ownership.
 **Status:** Complete. Direct2D/DirectWrite is the primary renderer, with a
 hardware D3D11 device and WARP fallback, a frame-latency-capped two-buffer
 flip-model swap chain, retained scene bitmap, bounded brush cache, and
-DPI-keyed text format. Retained DirectWrite layouts are cached per row and text
-run, keyed by retained-row and font generations, and released on row removal,
+DPI-keyed text format. Retained DirectWrite layouts are cached per row, keyed
+by retained-row and font generations, and released on row removal,
 font changes, device recreation, and shutdown. Resize and DPI changes recreate
 target resources and force full scene redraw; device loss rebuilds the GPU stack
 and retries once before falling back to GDI.
@@ -215,7 +215,7 @@ output batch, repeated minimize/restore and resize lifecycles, full scene
 invalidation, DPI layout invalidation, injected device-loss recovery, and 180
 sequential Debug scrolling updates with exact presentation accounting and a
 12-second responsiveness ceiling. The full required verification suite passed
-on 2026-07-30. Phase 6 is the next implementation phase.
+on 2026-07-30. Phase 6 subsequently replaced per-run layouts with complete-row`nshaping while preserving these lifecycle invariants.
 ### Resource model
 
 Create a focused module such as `src/renderer/d2d.zig` which owns:
@@ -276,6 +276,37 @@ the window procedure and terminal model.
   paint path, and full-screen scrolling remains responsive in a Debug build.
 
 ## Phase 6: Font fallback, shaping, and terminal-cell correctness
+
+**Status:** Complete. The GPU backend now creates one DirectWrite layout for each
+complete retained row, preserving the row's UTF-16-to-cell mapping and explicit
+grapheme spans. System font fallback is attached persistently to the primary
+Consolas text format. Each shaped cluster is measured and receives positive or
+negative trailing spacing so its total advance is exactly the one- or two-cell
+advance supplied by Ghostty; combining sequences remain in their base cluster,
+and fallback or missing glyphs cannot move later columns.
+
+The default typography policy is terminal-safe: standard, contextual,
+discretionary, and historical ligatures are disabled, as is pair kerning. Text
+colors are DirectWrite drawing-effect ranges on the single row layout, while
+backgrounds, inverse video, underline, selection, and cursor geometry remain
+cell-aligned Direct2D commands. Color-font drawing is requested on every row;
+DirectWrite retains its normal monochrome glyph path where color layers are not
+available.
+
+Cell width, height, baseline, ascent, descent, underline position, and underline
+thickness are calculated from the selected DirectWrite font face and its `0`
+glyph metrics at the active DPI. GDI-style fixed metrics are used only when the
+GPU/DirectWrite backend is unavailable. Font cache keys include family, size,
+fallback, typography, cell geometry, and DPI generations, and any change clears
+all row layouts.
+
+The Phase 6 corpus covers ASCII and PowerShell prompts, decomposed and
+precomposed Latin, CJK, supplementary-plane surrogate pairs, emoji variation
+selectors and ZWJ sequences, mixed scripts, box drawing, block elements,
+colored/inverse/underlined cells, stable missing-glyph advances, and clean-row
+layout-generation retention across partial updates. The full required
+verification suite passed on 2026-07-30. Phase 7 is the next implementation
+phase; its additional performance counters remain out of scope.
 
 ### Changes
 

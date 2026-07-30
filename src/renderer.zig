@@ -41,6 +41,15 @@ pub const Renderer = struct {
         self.fallback.deinit();
     }
 
+    pub fn metricsForDpi(self: *Renderer, dpi: u32) geometry.Metrics {
+        const resources = &(self.gpu orelse return .forDpi(dpi));
+        return resources.metricsForDpi(dpi) catch |err| {
+            std.log.warn("DirectWrite font metrics unavailable: {s}", .{
+                @errorName(err),
+            });
+            return .forDpi(dpi);
+        };
+    }
     pub fn resize(
         self: *Renderer,
         width: u32,
@@ -126,6 +135,11 @@ pub const Renderer = struct {
         };
     }
 
+    pub fn layoutGenerationForTesting(self: *const Renderer, row: usize) ?u64 {
+        const resources = &(self.gpu orelse return null);
+        if (row >= resources.row_layouts.items.len) return null;
+        return resources.row_layouts.items[row].row_generation;
+    }
     pub fn invalidateGpuSceneForTesting(self: *Renderer) bool {
         const resources = &(self.gpu orelse return false);
         resources.invalidateSceneForTesting();
