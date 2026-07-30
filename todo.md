@@ -17,9 +17,10 @@
 
 ## User-facing features
 
-- [ ] Add tabs: support creating, closing, switching, reordering, and naming
-  tabs, with each tab owning its terminal session and displaying useful process
-  or working-directory status.
+- [ ] Add tabs following the [tab architecture](docs/architecture/tabs.md):
+  support creating, closing, switching, reordering, and naming tabs, with each
+  tab owning its pane layout and displaying useful process or
+  working-directory status.
 - [ ] Add panes: support horizontal and vertical splits, focus movement,
   resizing, closing, and a clear ownership model for the terminal sessions in
   each pane. Define how pane layouts interact with tabs.
