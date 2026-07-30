@@ -15,20 +15,27 @@ const gdi = win32.graphics.gdi;
 const memory = win32.system.memory;
 const ole = win32.system.ole;
 const file_system = win32.storage.file_system;
+const controls = win32.ui.controls;
 const wm = win32.ui.windows_and_messaging;
+const comctl32 = win32.comctl32;
 const kernel32 = win32.kernel32;
 const user32 = win32.user32;
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("Ttyrtle");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle");
+const tab_control_class =
+    std.unicode.utf8ToUtf16LeStringLiteral("SysTabControl32");
 const trace_file_name =
     std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle-frame-trace.log");
+const tab_control_id = 100;
+const tcn_selchange: u32 = @bitCast(@as(i32, -551));
 
 pub const Mode = enum {
     normal,
     smoke,
     smoke_gdi,
     smoke_phase5,
+    smoke_tabs,
     integration,
     integration_input,
     integration_resize,
@@ -39,6 +46,7 @@ var workspace_ids: workspace.IdSource = .{};
 var workspace_state: workspace.Workspace = undefined;
 var model: *terminal.TerminalModel = undefined;
 var model_initialized = false;
+var tab_control: ?foundation.HWND = null;
 var active_mode: Mode = .normal;
 var paint_completed = false;
 var integration_succeeded = false;
@@ -82,6 +90,7 @@ pub fn run(mode: Mode) !void {
     integration_resize_requested = false;
     integration_resize_target = .{ .columns = 1, .rows = 1 };
     output_finished = false;
+    tab_control = null;
     input_translator = .{};
     terminal_metrics = .forDpi(geometry.base_dpi);
     selection_dragging = false;
@@ -103,6 +112,7 @@ pub fn run(mode: Mode) !void {
     workspace_ids = .{};
     workspace_state = .init(allocator, &workspace_ids);
     _ = try workspace_state.createTab(24, 80);
+    if (mode == .smoke_tabs) _ = try workspace_state.createTab(24, 80);
     model = &workspace_state.activeSession().?.model;
     model_initialized = true;
     defer {
@@ -115,6 +125,12 @@ pub fn run(mode: Mode) !void {
 
     const instance = kernel32.GetModuleHandleW(null) orelse
         return error.GetModuleHandleFailed;
+    const common_controls: controls.INITCOMMONCONTROLSEX = .{
+        .dwSize = @sizeOf(controls.INITCOMMONCONTROLSEX),
+        .dwICC = controls.ICC_TAB_CLASSES,
+    };
+    if (comctl32.InitCommonControlsEx(&common_controls) == 0)
+        return error.InitCommonControlsFailed;
 
     const window_class: wm.WNDCLASSEXW = .{
         .cbSize = @sizeOf(wm.WNDCLASSEXW),
@@ -135,11 +151,13 @@ pub fn run(mode: Mode) !void {
         return error.RegisterClassFailed;
     defer _ = user32.UnregisterClassW(class_name, instance);
 
+    var main_window_style = wm.WS_OVERLAPPEDWINDOW;
+    main_window_style.CLIPCHILDREN = 1;
     const window = user32.CreateWindowExW(
         .{},
         class_name,
         window_title,
-        wm.WS_OVERLAPPEDWINDOW,
+        main_window_style,
         wm.CW_USEDEFAULT,
         wm.CW_USEDEFAULT,
         900,
@@ -152,6 +170,9 @@ pub fn run(mode: Mode) !void {
     defer if (user32.IsWindow(window) != 0) {
         _ = user32.DestroyWindow(window);
     };
+    tab_control = try createTabControl(instance, window);
+    defer tab_control = null;
+    try syncNativeTabs();
     if (mode != .smoke_gdi)
         active_renderer.initialize(window);
     const cursor_timer = user32.SetTimer(window, 1, 500, null);
@@ -161,6 +182,7 @@ pub fn run(mode: Mode) !void {
 
     terminal_metrics = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
     try resizeForClient(window);
+    if (mode == .smoke_tabs) try verifyNativeTabControl(window);
 
     var integration_resize_command: ?[]u8 = null;
     defer if (integration_resize_command) |command| allocator.free(command);
@@ -248,6 +270,199 @@ pub fn run(mode: Mode) !void {
         return error.ConptyIntegrationFailed;
 }
 
+fn createTabControl(
+    instance: foundation.HINSTANCE,
+    window: foundation.HWND,
+) !foundation.HWND {
+    return user32.CreateWindowExW(
+        .{},
+        tab_control_class,
+        null,
+        .{
+            .CHILD = 1,
+            .VISIBLE = 1,
+            .CLIPSIBLINGS = 1,
+            .TABSTOP = 1,
+        },
+        0,
+        0,
+        0,
+        0,
+        window,
+        @ptrFromInt(tab_control_id),
+        instance,
+        null,
+    ) orelse error.CreateTabControlFailed;
+}
+
+fn syncNativeTabs() !void {
+    const control = tab_control orelse return error.TabControlUnavailable;
+    _ = user32.SendMessageW(control, controls.TCM_DELETEALLITEMS, 0, 0);
+
+    for (workspace_state.tabs.items, 0..) |tab, index| {
+        const label = tab.title_override orelse "Terminal";
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(
+            std.heap.smp_allocator,
+            label,
+        );
+        defer std.heap.smp_allocator.free(wide);
+        var item: controls.TCITEMW = .{
+            .mask = .{ .TEXT = 1, .PARAM = 1 },
+            .dwState = controls.TCIS_BUTTONPRESSED,
+            .dwStateMask = controls.TCIS_BUTTONPRESSED,
+            .pszText = wide.ptr,
+            .cchTextMax = @intCast(wide.len),
+            .iImage = -1,
+            .lParam = @intCast(@intFromEnum(tab.id)),
+        };
+        const inserted = user32.SendMessageW(
+            control,
+            controls.TCM_INSERTITEMW,
+            index,
+            @bitCast(@intFromPtr(&item)),
+        );
+        if (inserted < 0) return error.InsertTabItemFailed;
+    }
+
+    const active_id = workspace_state.active_tab_id orelse return;
+    const active_index = nativeIndexForTab(active_id) orelse
+        return error.ActiveTabNotSynchronized;
+    _ = user32.SendMessageW(
+        control,
+        controls.TCM_SETCURSEL,
+        active_index,
+        0,
+    );
+}
+
+fn nativeIndexForTab(id: workspace.TabId) ?usize {
+    const control = tab_control orelse return null;
+    const count = user32.SendMessageW(control, controls.TCM_GETITEMCOUNT, 0, 0);
+    if (count <= 0) return null;
+    for (0..@as(usize, @intCast(count))) |index| {
+        if (nativeTabIdAt(index) == id) return index;
+    }
+    return null;
+}
+
+fn nativeTabIdAt(index: usize) ?workspace.TabId {
+    const control = tab_control orelse return null;
+    var item: controls.TCITEMW = .{
+        .mask = .{ .PARAM = 1 },
+        .dwState = controls.TCIS_BUTTONPRESSED,
+        .dwStateMask = controls.TCIS_BUTTONPRESSED,
+        .pszText = null,
+        .cchTextMax = 0,
+        .iImage = -1,
+        .lParam = 0,
+    };
+    if (user32.SendMessageW(
+        control,
+        controls.TCM_GETITEMW,
+        index,
+        @bitCast(@intFromPtr(&item)),
+    ) == 0) return null;
+    if (item.lParam < 0) return null;
+    return @enumFromInt(@as(u64, @intCast(item.lParam)));
+}
+
+fn handleTabNotification(window: foundation.HWND, lparam: isize) bool {
+    if (lparam == 0) return false;
+    const header: *const controls.NMHDR =
+        @ptrFromInt(@as(usize, @bitCast(lparam)));
+    if (header.hwndFrom != tab_control or header.code != tcn_selchange)
+        return false;
+
+    const control = tab_control orelse return false;
+    const selected = user32.SendMessageW(control, controls.TCM_GETCURSEL, 0, 0);
+    if (selected < 0) return true;
+    const id = nativeTabIdAt(@intCast(selected)) orelse return true;
+    activateTab(window, id) catch {
+        std.log.err("failed to activate selected terminal tab", .{});
+    };
+    return true;
+}
+
+fn activateTab(window: foundation.HWND, id: workspace.TabId) !void {
+    if (workspace_state.active_tab_id == id) return;
+    if (!workspace_state.setActive(id)) return error.UnknownTab;
+    model = &workspace_state.activeSession().?.model;
+    input_translator = .{};
+    selection_dragging = false;
+    selection_anchor = null;
+    selection_head = null;
+    pressed_mouse_button = null;
+    render_cache.deinit();
+    render_cache = .init(std.heap.smp_allocator);
+    model.markFullDamage();
+    try resizeForClient(window);
+    invalidateRenderDamage(window);
+}
+
+fn layoutTabControl(window: foundation.HWND) !void {
+    const control = tab_control orelse return;
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(window, &client) == 0)
+        return error.GetClientRectFailed;
+    if (user32.SetWindowPos(
+        control,
+        null,
+        0,
+        0,
+        @max(client.right - client.left, 0),
+        @intCast(terminal_metrics.margin_y),
+        .{ .NOZORDER = 1, .NOACTIVATE = 1 },
+    ) == 0) return error.LayoutTabControlFailed;
+}
+
+fn verifyNativeTabControl(window: foundation.HWND) !void {
+    const control = tab_control orelse return error.TabControlUnavailable;
+    if (user32.GetDlgItem(window, tab_control_id) != control)
+        return error.TabControlIdMismatch;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMCOUNT, 0, 0) !=
+        @as(isize, @intCast(workspace_state.tabs.items.len)))
+        return error.TabControlItemCountMismatch;
+    if (user32.SendMessageW(control, controls.TCM_GETCURSEL, 0, 0) != 0)
+        return error.TabControlSelectionMismatch;
+    for (workspace_state.tabs.items, 0..) |tab, index| {
+        if (nativeTabIdAt(index) != tab.id)
+            return error.TabControlIdentityMismatch;
+    }
+
+    var bounds: foundation.RECT = undefined;
+    if (user32.GetWindowRect(control, &bounds) == 0)
+        return error.GetTabControlRectFailed;
+    if (bounds.bottom - bounds.top != @as(i32, @intCast(terminal_metrics.margin_y)))
+        return error.TabControlHeightMismatch;
+
+    const first_id = workspace_state.tabs.items[0].id;
+    const second_id = workspace_state.tabs.items[1].id;
+    var notification: controls.NMHDR = .{
+        .hwndFrom = control,
+        .idFrom = tab_control_id,
+        .code = tcn_selchange,
+    };
+    _ = user32.SendMessageW(control, controls.TCM_SETCURSEL, 1, 0);
+    _ = user32.SendMessageW(
+        window,
+        wm.WM_NOTIFY,
+        tab_control_id,
+        @bitCast(@intFromPtr(&notification)),
+    );
+    if (workspace_state.active_tab_id != second_id)
+        return error.NativeTabSelectionDidNotActivateWorkspaceTab;
+
+    _ = user32.SendMessageW(control, controls.TCM_SETCURSEL, 0, 0);
+    _ = user32.SendMessageW(
+        window,
+        wm.WM_NOTIFY,
+        tab_control_id,
+        @bitCast(@intFromPtr(&notification)),
+    );
+    if (workspace_state.active_tab_id != first_id)
+        return error.NativeTabSelectionDidNotRestoreWorkspaceTab;
+}
+
 fn windowProc(
     window: foundation.HWND,
     message: u32,
@@ -269,6 +484,10 @@ fn windowProc(
                 };
             }
             return 0;
+        },
+        wm.WM_NOTIFY => {
+            if (handleTabNotification(window, lparam)) return 0;
+            return user32.DefWindowProcW(window, message, wparam, lparam);
         },
         wm.WM_DPICHANGED => {
             terminal_metrics = active_renderer.metricsForDpi(@as(u16, @truncate(wparam)));
@@ -753,6 +972,7 @@ fn resizeForClient(window: foundation.HWND) !void {
     var client: foundation.RECT = undefined;
     if (user32.GetClientRect(window, &client) == 0)
         return error.GetClientRectFailed;
+    try layoutTabControl(window);
     if (active_renderer.resize(
         @intCast(@max(client.right - client.left, 0)),
         @intCast(@max(client.bottom - client.top, 0)),
@@ -1139,7 +1359,10 @@ fn paintForTesting(window: foundation.HWND) !void {
 }
 
 fn isSmokeMode(mode: Mode) bool {
-    return mode == .smoke or mode == .smoke_gdi or mode == .smoke_phase5;
+    return mode == .smoke or
+        mode == .smoke_gdi or
+        mode == .smoke_phase5 or
+        mode == .smoke_tabs;
 }
 
 fn isIntegrationMode(mode: Mode) bool {

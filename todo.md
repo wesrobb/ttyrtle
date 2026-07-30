@@ -14,6 +14,8 @@
   terminal sessions.
   - [x] Introduce stable tab/session IDs and explicit workspace, tab, pane-root,
     terminal-model, and ConPTY ownership while retaining one window and one tab.
+  - [x] Add a native Win32 tab control synchronized from stable workspace tab
+    identities and reserve its strip within the terminal's existing top margin.
 - [ ] Support multiple top-level windows and moving tabs between windows,
   preserving their pane layouts and running terminal sessions.
 
