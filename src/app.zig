@@ -8,6 +8,7 @@ const input = @import("input.zig");
 const render_commands = @import("render_commands.zig");
 const renderer = @import("renderer.zig");
 const terminal = @import("terminal.zig");
+const workspace = @import("workspace.zig");
 
 const foundation = win32.foundation;
 const gdi = win32.graphics.gdi;
@@ -34,7 +35,9 @@ pub const Mode = enum {
     integration_host_close,
 };
 
-var model: terminal.TerminalModel = undefined;
+var workspace_ids: workspace.IdSource = .{};
+var workspace_state: workspace.Workspace = undefined;
+var model: *terminal.TerminalModel = undefined;
 var model_initialized = false;
 var active_mode: Mode = .normal;
 var paint_completed = false;
@@ -42,7 +45,6 @@ var integration_succeeded = false;
 var integration_resize_requested = false;
 var integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 };
 var output_finished = false;
-var session: ?*conpty.Session = null;
 var input_translator: input.Translator = .{};
 var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
 var selection_dragging = false;
@@ -80,7 +82,6 @@ pub fn run(mode: Mode) !void {
     integration_resize_requested = false;
     integration_resize_target = .{ .columns = 1, .rows = 1 };
     output_finished = false;
-    session = null;
     input_translator = .{};
     terminal_metrics = .forDpi(geometry.base_dpi);
     selection_dragging = false;
@@ -99,11 +100,14 @@ pub fn run(mode: Mode) !void {
         render_cache_initialized = false;
     }
 
-    try model.init(allocator, 24, 80);
+    workspace_ids = .{};
+    workspace_state = .init(allocator, &workspace_ids);
+    _ = try workspace_state.createTab(24, 80);
+    model = &workspace_state.activeSession().?.model;
     model_initialized = true;
     defer {
-        model.deinit();
         model_initialized = false;
+        workspace_state.deinit();
     }
     defer logDebugCounters();
     if (isSmokeMode(mode))
@@ -190,7 +194,7 @@ pub fn run(mode: Mode) !void {
     }
 
     if (!isSmokeMode(mode)) {
-        session = try conpty.Session.create(
+        const process = try conpty.Session.create(
             allocator,
             window,
             .{ .columns = model.columns(), .rows = model.rows() },
@@ -202,17 +206,19 @@ pub fn run(mode: Mode) !void {
                 else => null,
             },
         );
+        workspace_state.activeSession().?.attachProcess(.{
+            .context = process,
+            .destroy = destroyConptyProcess,
+        }) catch |err| {
+            process.destroy();
+            return err;
+        };
         model.setReplySink(.{
-            .context = session.?,
+            .context = process,
             .write = queueTerminalReply,
         });
         if (mode == .integration_input) try queueIntegrationInput();
     }
-    defer if (session) |active_session| {
-        model.setReplySink(null);
-        active_session.destroy();
-        session = null;
-    };
 
     _ = user32.ShowWindow(
         window,
@@ -295,7 +301,7 @@ fn windowProc(
             return 0;
         },
         conpty.child_exit_message => {
-            if (session) |active_session| {
+            if (activeProcess()) |active_session| {
                 _ = active_session.beginClosing();
                 if (active_session.childExitCode()) |code|
                     std.log.info("ConPTY child exited with code {d}", .{code});
@@ -304,7 +310,7 @@ fn windowProc(
             return 0;
         },
         conpty.input_failure_message => {
-            if (session) |active_session| {
+            if (activeProcess()) |active_session| {
                 if (active_session.inputFailureCode()) |code|
                     std.log.err(
                         "WriteFile for ConPTY input failed with Win32 error {d}",
@@ -350,11 +356,7 @@ fn windowProc(
             return 0;
         },
         wm.WM_CLOSE => {
-            if (session) |active_session| {
-                model.setReplySink(null);
-                active_session.destroy();
-                session = null;
-            }
+            if (model_initialized) workspace_state.activeSession().?.closeProcess();
             _ = user32.DestroyWindow(window);
             return 0;
         },
@@ -367,7 +369,7 @@ fn windowProc(
 }
 
 fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
-    if (isSmokeMode(active_mode) or session == null) return;
+    if (isSmokeMode(active_mode) or activeProcess() == null) return;
 
     const is_down = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN;
     if (is_down and currentModifiers().ctrl and currentModifiers().shift) {
@@ -404,7 +406,7 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
 const MouseButton = input.MouseButton;
 
 fn queueFocus(event: input.FocusEvent) void {
-    if (isSmokeMode(active_mode) or session == null) return;
+    if (isSmokeMode(active_mode) or activeProcess() == null) return;
     const encoded = input.encodeFocusAlloc(
         std.heap.smp_allocator,
         event,
@@ -418,7 +420,7 @@ fn queueOwnedInput(encoded: []u8) void {
         std.heap.smp_allocator.free(encoded);
         return;
     }
-    const active_session = session orelse {
+    const active_session = activeProcess() orelse {
         std.heap.smp_allocator.free(encoded);
         return;
     };
@@ -583,7 +585,7 @@ fn invalidateRenderDamage(window: foundation.HWND) void {
 }
 
 fn pasteClipboard(window: ?foundation.HWND) void {
-    if (session == null or user32.OpenClipboard(window) == 0) return;
+    if (activeProcess() == null or user32.OpenClipboard(window) == 0) return;
     defer _ = user32.CloseClipboard();
     const handle = user32.GetClipboardData(@intFromEnum(ole.CF_UNICODETEXT)) orelse
         return;
@@ -634,7 +636,7 @@ fn copySelection(window: ?foundation.HWND) void {
 }
 
 fn handleCharacterMessage(code_unit: u16) void {
-    if (isSmokeMode(active_mode) or session == null) return;
+    if (isSmokeMode(active_mode) or activeProcess() == null) return;
     const event = input_translator.characterEvent(
         code_unit,
         currentModifiers(),
@@ -661,7 +663,7 @@ fn encodeAndQueueInput(event: input.NormalizedKey) void {
 }
 
 fn queueEncodedInput(event: input.NormalizedKey) !void {
-    const active_session = session orelse return;
+    const active_session = activeProcess() orelse return;
     const encoded = input.encodeAlloc(
         std.heap.smp_allocator,
         event,
@@ -680,6 +682,17 @@ fn queueTerminalReply(context: *anyopaque, bytes: []const u8) !void {
     const owned = try std.heap.smp_allocator.dupe(u8, bytes);
     errdefer std.heap.smp_allocator.free(owned);
     try active_session.queueInputOwned(owned);
+}
+
+fn destroyConptyProcess(context: *anyopaque) void {
+    const process: *conpty.Session = @ptrCast(@alignCast(context));
+    process.destroy();
+}
+
+fn activeProcess() ?*conpty.Session {
+    if (!model_initialized) return null;
+    const active_session = workspace_state.activeSession() orelse return null;
+    return active_session.processAs(conpty.Session);
 }
 
 fn currentModifiers() input.Mods {
@@ -716,7 +729,7 @@ fn paint(window: foundation.HWND) bool {
     const damage = model.damage();
     const cache_start = frame_trace.timestamp();
     render_cache.update(
-        &model,
+        model,
         terminal_metrics,
         damage,
     ) catch return false;
@@ -769,12 +782,12 @@ fn resizeForClient(window: foundation.HWND) !void {
         terminal_metrics.cell_height,
     ) catch {};
 
-    if (session) |active_session| _ = try active_session.resize(dimensions);
+    if (activeProcess()) |active_session| _ = try active_session.resize(dimensions);
     invalidateRenderDamage(window);
 }
 
 fn handleConptyOutput(window: foundation.HWND) void {
-    const active_session = session orelse return;
+    const active_session = activeProcess() orelse return;
     var batch = active_session.drainOutput();
     defer batch.deinit();
 

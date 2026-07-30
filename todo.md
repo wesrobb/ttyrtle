@@ -12,6 +12,8 @@
 - [ ] Refactor the single-session application into a multi-session workspace
   model with clear ownership between windows, tabs, pane layout trees, and
   terminal sessions.
+  - [x] Introduce stable tab/session IDs and explicit workspace, tab, pane-root,
+    terminal-model, and ConPTY ownership while retaining one window and one tab.
 - [ ] Support multiple top-level windows and moving tabs between windows,
   preserving their pane layouts and running terminal sessions.
 

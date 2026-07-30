@@ -9,6 +9,7 @@ A deliberately small native Windows terminal prototype:
 - asynchronous, UI-thread-safe terminal output delivery
 - queued, mode-aware keyboard input via Ghostty's encoder
 - non-blocking terminal query replies, title changes, and bells
+- a workspace model with stable tab and terminal-session identities
 - cursor, cell-background, inverse-video, and combining-mark rendering
 - bracketed paste, selection, clipboard copy, focus, and mouse reporting
 - direct, minimal rendering inspired by Nvy's native approach
@@ -110,6 +111,8 @@ discretionary, and historical ligatures plus pair kerning. Cell width, line
 metrics, baseline, and underline geometry come from the configured DirectWrite
 font face at the active DPI.
 
-Font selection and size are not configurable yet. Configuration, tabs,
-profiles, accessibility, shell integration, and session persistence remain
-separate future work.
+Font selection and size are not configurable yet. The internal workspace owns
+the initial tab, pane root, terminal model, and ConPTY process, but native tab
+UI and runtime tab commands are not implemented yet. Configuration, profiles,
+accessibility, shell integration, and session persistence remain separate
+future work.
