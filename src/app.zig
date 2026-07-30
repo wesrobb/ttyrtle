@@ -4,6 +4,7 @@ const conpty = @import("conpty.zig");
 const geometry = @import("geometry.zig");
 const input = @import("input.zig");
 const render_commands = @import("render_commands.zig");
+const renderer = @import("renderer.zig");
 const terminal = @import("terminal.zig");
 
 const foundation = win32.foundation;
@@ -11,13 +12,11 @@ const gdi = win32.graphics.gdi;
 const memory = win32.system.memory;
 const ole = win32.system.ole;
 const wm = win32.ui.windows_and_messaging;
-const gdi32 = win32.gdi32;
 const kernel32 = win32.kernel32;
 const user32 = win32.user32;
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("Ttyrtle");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle");
-const terminal_font_name = std.unicode.utf8ToUtf16LeStringLiteral("Consolas");
 
 pub const Mode = enum {
     normal,
@@ -43,24 +42,9 @@ var selection_dragging = false;
 var selection_anchor: ?terminal.Cursor = null;
 var selection_head: ?terminal.Cursor = null;
 var pressed_mouse_button: ?input.MouseButton = null;
-var back_buffer: ?BackBuffer = null;
+var active_renderer: renderer.Renderer = .{};
 var render_cache: render_commands.RenderCache = undefined;
 var render_cache_initialized = false;
-
-const BackBuffer = struct {
-    dc: gdi.CreatedHDC,
-    bitmap: gdi.HBITMAP,
-    previous_bitmap: gdi.HGDIOBJ,
-    width: i32,
-    height: i32,
-
-    fn deinit(self: *BackBuffer) void {
-        _ = gdi32.SelectObject(self.dc, self.previous_bitmap);
-        _ = gdi32.DeleteObject(self.bitmap);
-        _ = gdi32.DeleteDC(self.dc);
-        self.* = undefined;
-    }
-};
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
@@ -93,8 +77,8 @@ pub fn run(mode: Mode) !void {
     selection_anchor = null;
     selection_head = null;
     pressed_mouse_button = null;
-    back_buffer = null;
-    defer deinitBackBuffer();
+    active_renderer = .{};
+    defer active_renderer.deinit();
     render_cache = .init(allocator);
     render_cache_initialized = true;
     defer {
@@ -703,151 +687,24 @@ fn paint(window: foundation.HWND) bool {
 
     var client: foundation.RECT = undefined;
     if (user32.GetClientRect(window, &client) == 0) return false;
-    const buffer = ensureBackBuffer(
-        dc,
-        client.right - client.left,
-        client.bottom - client.top,
-    ) orelse return false;
-    const target_dc = buffer.dc;
-    const saved_dc = gdi32.SaveDC(target_dc);
-    if (saved_dc == 0) return false;
-    defer _ = gdi32.RestoreDC(target_dc, saved_dc);
-    _ = gdi32.IntersectClipRect(
-        target_dc,
-        paint_state.rcPaint.left,
-        paint_state.rcPaint.top,
-        paint_state.rcPaint.right,
-        paint_state.rcPaint.bottom,
-    );
 
+    const damage = model.damage();
     render_cache.update(
         &model,
         terminal_metrics,
-        model.damage(),
+        damage,
     ) catch return false;
-    model.acknowledgeDamage();
-    const background = gdi32.CreateSolidBrush(toColorRef(render_cache.background)) orelse
-        return false;
-    defer _ = gdi32.DeleteObject(background);
-    const font = gdi32.CreateFontW(
-        @intCast(terminal_metrics.cell_height),
-        @intCast(terminal_metrics.cell_width),
-        0,
-        0,
-        @intFromEnum(gdi.FW_NORMAL),
-        0,
-        0,
-        0,
-        @intFromEnum(gdi.DEFAULT_CHARSET),
-        @intFromEnum(gdi.OUT_DEFAULT_PRECIS),
-        @as(u8, @bitCast(gdi.CLIP_DEFAULT_PRECIS)),
-        @intFromEnum(gdi.CLEARTYPE_QUALITY),
-        @intFromEnum(gdi.FIXED_PITCH) | @intFromEnum(gdi.FF_MODERN),
-        terminal_font_name,
-    ) orelse return false;
-    defer _ = gdi32.DeleteObject(font);
-    const previous_font = gdi32.SelectObject(target_dc, font) orelse return false;
-    defer _ = gdi32.SelectObject(target_dc, previous_font);
-
-    _ = user32.FillRect(target_dc, &paint_state.rcPaint, background);
-    _ = gdi32.SetBkMode(target_dc, gdi.TRANSPARENT);
-
-    const first_row = paintFirstRow(paint_state.rcPaint);
-    const last_row = paintLastRow(paint_state.rcPaint);
-    if (first_row < render_cache.rows.items.len) {
-        for (render_cache.rows.items[first_row..@min(
-            last_row +| 1,
-            render_cache.rows.items.len,
-        )]) |*row| {
-            for (row.rectangles.items) |rectangle| {
-                const brush = gdi32.CreateSolidBrush(toColorRef(rectangle.color)) orelse
-                    return false;
-                defer _ = gdi32.DeleteObject(brush);
-                const bounds: foundation.RECT = .{
-                    .left = rectangle.left,
-                    .top = rectangle.top,
-                    .right = rectangle.right,
-                    .bottom = rectangle.bottom,
-                };
-                _ = if (rectangle.outline)
-                    user32.FrameRect(target_dc, &bounds, brush)
-                else
-                    user32.FillRect(target_dc, &bounds, brush);
-            }
-
-            for (row.text_runs.items) |text_run| {
-                _ = gdi32.SetTextColor(target_dc, toColorRef(text_run.color));
-                if (gdi32.TextOutW(
-                    target_dc,
-                    text_run.x,
-                    text_run.y,
-                    @ptrCast(row.utf16.items[text_run.text_start..].ptr),
-                    @intCast(text_run.text_len),
-                ) == 0) return false;
-            }
-        }
-    }
-
-    const width = paint_state.rcPaint.right - paint_state.rcPaint.left;
-    const height = paint_state.rcPaint.bottom - paint_state.rcPaint.top;
-    const copied = gdi32.BitBlt(
+    const rendered = active_renderer.paint(
         dc,
-        paint_state.rcPaint.left,
-        paint_state.rcPaint.top,
-        width,
-        height,
-        target_dc,
-        paint_state.rcPaint.left,
-        paint_state.rcPaint.top,
-        gdi.SRCCOPY,
-    ) != 0;
-    return copied;
-}
-
-fn paintFirstRow(rect: foundation.RECT) usize {
-    const margin_y: i32 = @intCast(terminal_metrics.margin_y);
-    const cell_height: i32 = @intCast(terminal_metrics.cell_height);
-    return @intCast(@divTrunc(@max(rect.top - margin_y, 0), cell_height));
-}
-
-fn paintLastRow(rect: foundation.RECT) usize {
-    const margin_y: i32 = @intCast(terminal_metrics.margin_y);
-    const cell_height: i32 = @intCast(terminal_metrics.cell_height);
-    return @intCast(@divTrunc(@max(rect.bottom - 1 - margin_y, 0), cell_height));
-}
-
-fn ensureBackBuffer(dc: gdi.HDC, width: i32, height: i32) ?*BackBuffer {
-    if (width <= 0 or height <= 0) return null;
-    if (back_buffer) |*buffer| {
-        if (buffer.width >= width and buffer.height >= height) return buffer;
-        buffer.deinit();
-        back_buffer = null;
-    }
-
-    const memory_dc = gdi32.CreateCompatibleDC(dc);
-    if (@intFromPtr(memory_dc) == 0) return null;
-    const bitmap = gdi32.CreateCompatibleBitmap(dc, width, height) orelse {
-        _ = gdi32.DeleteDC(memory_dc);
-        return null;
-    };
-    const previous_bitmap = gdi32.SelectObject(memory_dc, bitmap) orelse {
-        _ = gdi32.DeleteObject(bitmap);
-        _ = gdi32.DeleteDC(memory_dc);
-        return null;
-    };
-    back_buffer = .{
-        .dc = memory_dc,
-        .bitmap = bitmap,
-        .previous_bitmap = previous_bitmap,
-        .width = width,
-        .height = height,
-    };
-    return &back_buffer.?;
-}
-
-fn deinitBackBuffer() void {
-    if (back_buffer) |*buffer| buffer.deinit();
-    back_buffer = null;
+        paint_state.rcPaint,
+        client,
+        &render_cache,
+        damage,
+        terminal_metrics,
+        user32.GetDpiForWindow(window),
+    );
+    model.acknowledgeDamage();
+    return rendered;
 }
 
 fn resizeForClient(window: foundation.HWND) !void {
@@ -882,10 +739,6 @@ fn resizeForClient(window: foundation.HWND) !void {
 
     if (session) |active_session| _ = try active_session.resize(dimensions);
     invalidateRenderDamage(window);
-}
-
-fn toColorRef(color: terminal.Rgb) win32.zig.COLORREF {
-    return .rgb(color.red, color.green, color.blue);
 }
 
 fn handleConptyOutput(window: foundation.HWND) void {

@@ -6,4 +6,5 @@ test {
     _ = @import("input.zig");
     _ = @import("geometry.zig");
     _ = @import("session_lifecycle.zig");
+    _ = @import("renderer/resource_cache.zig");
 }

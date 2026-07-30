@@ -161,6 +161,14 @@ next implementation phase.
 
 ## Phase 4: Cache resources in the GDI bridge
 
+**Status:** Complete. GDI rendering now lives behind a renderer interface which
+owns a retained compatible DC and grow-only bitmap, a font keyed by DPI and
+cell metrics, and a bounded 64-entry RGB brush cache. Terminal damage redraws
+only named row bands, while new buffers, full damage, and expose paints retain
+full-redraw paths. Resource-key policy tests cover font reuse and bounded brush
+eviction, and the hidden-window lifecycle suites exercise renderer teardown.
+Phase 5 is the next implementation phase.
+
 This is an interim step that keeps the application responsive while the GPU
 backend is developed and establishes explicit resource ownership.
 
