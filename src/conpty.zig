@@ -489,13 +489,7 @@ fn closePseudoConsoleValue(pseudo_console: console.HPCON) void {
 }
 
 fn defaultShellCommandLine(allocator: std.mem.Allocator) ![]u8 {
-    const environment: std.process.Environ = .{ .block = .global };
-    const shell = environment.getAlloc(allocator, "COMSPEC") catch |err| switch (err) {
-        error.EnvironmentVariableMissing => return allocator.dupe(u8, "cmd.exe"),
-        else => return err,
-    };
-    defer allocator.free(shell);
-    return std.fmt.allocPrint(allocator, "\"{s}\"", .{shell});
+    return allocator.dupe(u8, "pwsh.exe");
 }
 
 fn closeHandle(handle: *?foundation.HANDLE) void {

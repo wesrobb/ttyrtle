@@ -13,12 +13,12 @@ A deliberately small native Windows terminal prototype:
 - bracketed paste, selection, clipboard copy, focus, and mouse reporting
 - direct, minimal rendering inspired by Nvy's native approach
 
-Normal mode launches `%COMSPEC%` (falling back to `cmd.exe`), feeds its
-UTF-8/VT output through the Ghostty terminal model, and paints all 80 by 24
-cells with GDI. The UI remains responsive while the output reader blocks on an
-idle shell. Keyboard input is encoded on the UI thread from the active Ghostty
-terminal modes, then written to ConPTY by a dedicated worker so a blocked child
-cannot stall painting or output.
+Normal mode launches `pwsh.exe`, feeds its UTF-8/VT output through the Ghostty
+terminal model, and paints all 80 by 24 cells with GDI. The UI remains
+responsive while the output reader blocks on an idle shell. Keyboard input is
+encoded on the UI thread from the active Ghostty terminal modes, then written
+to ConPTY by a dedicated worker so a blocked child cannot stall painting or
+output.
 
 Ghostty-generated replies use the same ordered ConPTY input queue as keyboard
 input. Device attributes, cursor and mode reports, terminal size reports, and
