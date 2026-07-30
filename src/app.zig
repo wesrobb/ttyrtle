@@ -134,6 +134,7 @@ pub fn run(mode: Mode) !void {
     defer if (user32.IsWindow(window) != 0) {
         _ = user32.DestroyWindow(window);
     };
+    active_renderer.initialize(window);
     const cursor_timer = user32.SetTimer(window, 1, 500, null);
     defer {
         if (cursor_timer != 0) _ = user32.KillTimer(window, cursor_timer);

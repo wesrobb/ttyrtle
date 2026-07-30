@@ -200,6 +200,12 @@ backend is developed and establishes explicit resource ownership.
 
 ## Phase 5: Add the Direct2D/DirectWrite/DXGI backend
 
+**Status:** In progress. The renderer now bootstraps a hardware D3D11 device
+(with WARP fallback), caps DXGI frame latency, creates a two-buffer flip-model
+swap chain, and owns Direct2D device/context and DirectWrite factory resources.
+GDI remains the active paint fallback while swap-chain targets, the persistent
+scene bitmap, and retained-row drawing are implemented.
+
 ### Resource model
 
 Create a focused module such as `src/renderer/d2d.zig` which owns:
