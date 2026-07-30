@@ -14,6 +14,15 @@ pub const Renderer = struct {
     fallback: gdi.Renderer = .{},
     gpu: ?d2d.DeviceResources = null,
     window: ?foundation.HWND = null,
+    gpu_present_count: u64 = 0,
+    gpu_recreation_count: u64 = 0,
+    retired_layout_build_count: u64 = 0,
+
+    pub const Diagnostics = struct {
+        gpu_present_count: u64,
+        gpu_recreation_count: u64,
+        layout_build_count: u64,
+    };
 
     pub fn initialize(self: *Renderer, window: foundation.HWND) void {
         self.window = window;
@@ -27,8 +36,7 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
-        if (self.gpu) |*resources| resources.deinit();
-        self.gpu = null;
+        self.releaseGpu();
         self.window = null;
         self.fallback.deinit();
     }
@@ -81,13 +89,21 @@ pub const Renderer = struct {
                         std.log.warn("GPU recovery paint failed: {s}", .{
                             @errorName(retry_err),
                         });
+                        self.retired_layout_build_count +%=
+                            replacement.layout_build_count;
                         replacement.deinit();
                         self.gpu = null;
                     };
-                    if (self.gpu != null) return true;
+                    if (self.gpu != null) {
+                        self.gpu_present_count +%= 1;
+                        return true;
+                    }
                 }
             };
-            if (self.gpu != null) return true;
+            if (self.gpu != null) {
+                self.gpu_present_count +%= 1;
+                return true;
+            }
         }
 
         return self.fallback.paint(
@@ -101,14 +117,34 @@ pub const Renderer = struct {
         );
     }
 
+    pub fn diagnostics(self: *const Renderer) Diagnostics {
+        return .{
+            .gpu_present_count = self.gpu_present_count,
+            .gpu_recreation_count = self.gpu_recreation_count,
+            .layout_build_count = self.retired_layout_build_count +
+                if (self.gpu) |resources| resources.layout_build_count else 0,
+        };
+    }
+
+    pub fn invalidateGpuSceneForTesting(self: *Renderer) bool {
+        const resources = &(self.gpu orelse return false);
+        resources.invalidateSceneForTesting();
+        return true;
+    }
+
+    pub fn simulateDeviceLossForTesting(self: *Renderer) bool {
+        const resources = &(self.gpu orelse return false);
+        resources.simulateDeviceLossForTesting();
+        return true;
+    }
+
     fn recreateGpu(
         self: *Renderer,
         width: u32,
         height: u32,
         dpi: u32,
     ) void {
-        if (self.gpu) |*resources| resources.deinit();
-        self.gpu = null;
+        self.releaseGpu();
         const window = self.window orelse return;
         var replacement = d2d.DeviceResources.create(window) catch |err| {
             std.log.warn("GPU device recreation failed: {s}", .{
@@ -124,5 +160,14 @@ pub const Renderer = struct {
             return;
         };
         self.gpu = replacement;
+        self.gpu_recreation_count +%= 1;
+    }
+
+    fn releaseGpu(self: *Renderer) void {
+        if (self.gpu) |*resources| {
+            self.retired_layout_build_count +%= resources.layout_build_count;
+            resources.deinit();
+        }
+        self.gpu = null;
     }
 };

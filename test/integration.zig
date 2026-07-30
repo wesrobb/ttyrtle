@@ -8,6 +8,10 @@ test "hidden GPU renderer presents repeatedly across clean lifecycles" {
     for (0..3) |_| try app.run(.smoke);
 }
 
+test "GPU renderer caches layouts and recovers across Phase 5 lifecycles" {
+    try app.run(.smoke_phase5);
+}
+
 test "hidden window retains the GDI fallback path" {
     try app.run(.smoke_gdi);
 }

@@ -22,6 +22,7 @@ pub const Mode = enum {
     normal,
     smoke,
     smoke_gdi,
+    smoke_phase5,
     integration,
     integration_input,
     integration_resize,
@@ -205,7 +206,9 @@ pub fn run(mode: Mode) !void {
         window,
         if (mode == .normal) wm.SW_SHOWDEFAULT else wm.SW_HIDE,
     );
-    if (isSmokeMode(mode)) {
+    if (mode == .smoke_phase5) {
+        try runPhase5Smoke(window);
+    } else if (isSmokeMode(mode)) {
         for (0..3) |_| _ = user32.SendMessageW(window, wm.WM_PAINT, 0, 0);
     } else {
         _ = user32.UpdateWindow(window);
@@ -250,7 +253,7 @@ fn windowProc(
             return 0;
         },
         wm.WM_DPICHANGED => {
-            terminal_metrics = .forDpi(@truncate(wparam));
+            terminal_metrics = .forDpi(@as(u16, @truncate(wparam)));
             model.markFullDamage();
             const suggested: *const foundation.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
             _ = user32.SetWindowPos(
@@ -756,16 +759,14 @@ fn handleConptyOutput(window: foundation.HWND) void {
 
     const changed = batch.chunks.items.len != 0;
     if (changed) {
-        model.writeBatch(batch.chunks.items) catch {
+        applyOutputBatch(window, batch.chunks.items) catch {
             std.log.err("failed to apply ConPTY output to the terminal model", .{});
             if (isIntegrationMode(active_mode)) _ = user32.DestroyWindow(window);
             return;
         };
-        model.resetCursorBlink();
+    } else {
+        applyTerminalEffects(window);
     }
-
-    applyTerminalEffects(window);
-    if (changed) invalidateRenderDamage(window);
 
     if (active_mode == .integration_resize and
         !integration_resize_requested and
@@ -812,6 +813,13 @@ fn handleConptyOutput(window: foundation.HWND) void {
     }
 }
 
+fn applyOutputBatch(window: foundation.HWND, chunks: []const []const u8) !void {
+    try model.writeBatch(chunks);
+    model.resetCursorBlink();
+    applyTerminalEffects(window);
+    invalidateRenderDamage(window);
+}
+
 fn applyTerminalEffects(window: foundation.HWND) void {
     if (model.takeTitleChanged()) {
         const title = model.core.getTitle() orelse "";
@@ -828,8 +836,127 @@ fn applyTerminalEffects(window: foundation.HWND) void {
     if (model.takeBellCount() > 0) _ = user32.MessageBeep(.{});
 }
 
+fn runPhase5Smoke(window: foundation.HWND) !void {
+    if (!active_renderer.invalidateGpuSceneForTesting())
+        return error.GpuRendererUnavailable;
+
+    try paintForTesting(window);
+    const initial = active_renderer.diagnostics();
+    if (initial.gpu_present_count != 1 or initial.layout_build_count == 0)
+        return error.InitialGpuPaintDiagnosticsMismatch;
+
+    try paintForTesting(window);
+    const clean = active_renderer.diagnostics();
+    if (clean.gpu_present_count != initial.gpu_present_count + 1 or
+        clean.layout_build_count != initial.layout_build_count)
+        return error.CleanPaintRebuiltLayouts;
+
+    const chunks = [_][]const u8{
+        "\x1b[2;1Hphase-",
+        "five-batch",
+    };
+    try applyOutputBatch(window, &chunks);
+    const before_batch = active_renderer.diagnostics();
+    try paintForTesting(window);
+    const after_batch = active_renderer.diagnostics();
+    if (after_batch.gpu_present_count != before_batch.gpu_present_count + 1)
+        return error.OutputBatchPresentedMoreThanOnce;
+    if (after_batch.layout_build_count <= before_batch.layout_build_count)
+        return error.DirtyRowLayoutWasNotRebuilt;
+
+    for (0..3) |iteration| {
+        _ = user32.SendMessageW(window, wm.WM_SIZE, wm.SIZE_MINIMIZED, 0);
+        var outer: foundation.RECT = undefined;
+        if (user32.GetWindowRect(window, &outer) == 0)
+            return error.GetWindowRectFailed;
+        if (user32.SetWindowPos(
+            window,
+            null,
+            0,
+            0,
+            outer.right - outer.left + @as(i32, @intCast(8 + iteration)),
+            outer.bottom - outer.top + @as(i32, @intCast(5 + iteration)),
+            .{ .NOMOVE = 1, .NOZORDER = 1, .NOACTIVATE = 1 },
+        ) == 0) return error.ResizeLifecycleFailed;
+        _ = user32.SendMessageW(window, wm.WM_SIZE, wm.SIZE_RESTORED, 0);
+        try paintForTesting(window);
+    }
+
+    const before_invalidation = active_renderer.diagnostics();
+    if (!active_renderer.invalidateGpuSceneForTesting())
+        return error.GpuRendererUnavailable;
+    try paintForTesting(window);
+    const after_invalidation = active_renderer.diagnostics();
+    if (after_invalidation.gpu_present_count !=
+        before_invalidation.gpu_present_count + 1 or
+        after_invalidation.layout_build_count !=
+            before_invalidation.layout_build_count)
+        return error.FullInvalidationDiagnosticsMismatch;
+
+    var suggested: foundation.RECT = undefined;
+    if (user32.GetWindowRect(window, &suggested) == 0)
+        return error.GetWindowRectFailed;
+    const test_dpi: u32 = geometry.base_dpi + 24;
+    const dpi_wparam = @as(usize, test_dpi) |
+        (@as(usize, test_dpi) << 16);
+    _ = user32.SendMessageW(
+        window,
+        wm.WM_DPICHANGED,
+        dpi_wparam,
+        @bitCast(@intFromPtr(&suggested)),
+    );
+    const before_dpi_paint = active_renderer.diagnostics();
+    try paintForTesting(window);
+    const after_dpi_paint = active_renderer.diagnostics();
+    if (after_dpi_paint.layout_build_count <=
+        before_dpi_paint.layout_build_count)
+        return error.DpiChangeDidNotRebuildLayouts;
+
+    var frequency: foundation.LARGE_INTEGER = undefined;
+    var scroll_start: foundation.LARGE_INTEGER = undefined;
+    var scroll_end: foundation.LARGE_INTEGER = undefined;
+    if (kernel32.QueryPerformanceFrequency(&frequency) == 0 or
+        kernel32.QueryPerformanceCounter(&scroll_start) == 0)
+        return error.PerformanceCounterUnavailable;
+    const scroll_iterations = 180;
+    const before_scroll = active_renderer.diagnostics();
+    const scroll_chunk = [_][]const u8{"\r\nphase-five-debug-scroll"};
+    for (0..scroll_iterations) |_| {
+        try applyOutputBatch(window, &scroll_chunk);
+        try paintForTesting(window);
+    }
+    if (kernel32.QueryPerformanceCounter(&scroll_end) == 0)
+        return error.PerformanceCounterUnavailable;
+    const after_scroll = active_renderer.diagnostics();
+    if (after_scroll.gpu_present_count !=
+        before_scroll.gpu_present_count + scroll_iterations)
+        return error.ScrollingPresentationCountMismatch;
+    const scroll_milliseconds = @divTrunc(
+        (scroll_end.QuadPart - scroll_start.QuadPart) * 1000,
+        frequency.QuadPart,
+    );
+    if (scroll_milliseconds > 12_000)
+        return error.DebugScrollingNotResponsive;
+
+    const before_loss = active_renderer.diagnostics();
+    if (!active_renderer.simulateDeviceLossForTesting())
+        return error.GpuRendererUnavailable;
+    try paintForTesting(window);
+    const after_loss = active_renderer.diagnostics();
+    if (after_loss.gpu_recreation_count != before_loss.gpu_recreation_count + 1 or
+        after_loss.gpu_present_count != before_loss.gpu_present_count + 1)
+        return error.DeviceLossRecoveryDiagnosticsMismatch;
+}
+
+fn paintForTesting(window: foundation.HWND) !void {
+    paint_completed = false;
+    _ = user32.InvalidateRect(window, null, 0);
+    _ = user32.SendMessageW(window, wm.WM_PAINT, 0, 0);
+    if (!paint_completed) return error.TestPaintFailed;
+}
+
 fn isSmokeMode(mode: Mode) bool {
-    return mode == .smoke or mode == .smoke_gdi;
+    return mode == .smoke or mode == .smoke_gdi or mode == .smoke_phase5;
 }
 
 fn isIntegrationMode(mode: Mode) bool {

@@ -22,6 +22,29 @@ const BrushEntry = struct {
     brush: *d2d.ID2D1SolidColorBrush,
 };
 
+const TextLayoutEntry = struct {
+    layout: *dwrite.IDWriteTextLayout,
+};
+
+const RowLayouts = struct {
+    row_generation: u64 = 0,
+    font_generation: u64 = 0,
+    entries: std.ArrayListUnmanaged(TextLayoutEntry) = .empty,
+
+    fn clear(self: *RowLayouts) void {
+        for (self.entries.items) |entry| release(entry.layout);
+        self.entries.clearRetainingCapacity();
+        self.row_generation = 0;
+        self.font_generation = 0;
+    }
+
+    fn deinit(self: *RowLayouts) void {
+        self.clear();
+        self.entries.deinit(std.heap.smp_allocator);
+        self.* = undefined;
+    }
+};
+
 pub const DeviceResources = struct {
     d3d_device: *d3d11.ID3D11Device,
     d3d_context: *d3d11.ID3D11DeviceContext,
@@ -40,8 +63,12 @@ pub const DeviceResources = struct {
     scene_valid: bool,
     text_format: ?*dwrite.IDWriteTextFormat,
     font_state: resource_cache.FontState,
+    font_generation: u64,
+    row_layouts: std.ArrayListUnmanaged(RowLayouts),
+    layout_build_count: u64,
     brushes: [max_brushes]BrushEntry,
     brush_slots: resource_cache.KeySlots(max_brushes),
+    simulate_device_loss: bool,
     driver: Driver,
 
     pub const Driver = enum {
@@ -59,7 +86,11 @@ pub const DeviceResources = struct {
         resources.scene_valid = false;
         resources.text_format = null;
         resources.font_state = .{};
+        resources.font_generation = 0;
+        resources.row_layouts = .empty;
+        resources.layout_build_count = 0;
         resources.brush_slots = .{};
+        resources.simulate_device_loss = false;
 
         resources.driver = .hardware;
         var result = win32.d3d11.D3D11CreateDevice(
@@ -212,10 +243,15 @@ pub const DeviceResources = struct {
         metrics: geometry.Metrics,
         dpi: u32,
     ) !void {
+        if (self.simulate_device_loss) {
+            self.simulate_device_loss = false;
+            return error.DeviceLost;
+        }
         if (self.target_bitmap == null or self.scene_bitmap == null)
             return error.TargetUnavailable;
 
         _ = try self.ensureTextFormat(metrics, dpi);
+        try self.resizeRowLayouts(cache.rows.items.len);
         if (!self.scene_valid) {
             try self.drawScene(cache, .full, metrics, dpi);
         } else switch (damage) {
@@ -227,6 +263,7 @@ pub const DeviceResources = struct {
 
     pub fn deinit(self: *DeviceResources) void {
         self.releaseTargetResources();
+        self.releaseRowLayouts();
         self.releaseBrushes();
         if (self.text_format) |format| release(format);
         self.text_format = null;
@@ -240,6 +277,14 @@ pub const DeviceResources = struct {
         release(self.d3d_context);
         release(self.d3d_device);
         self.* = undefined;
+    }
+
+    pub fn invalidateSceneForTesting(self: *DeviceResources) void {
+        self.scene_valid = false;
+    }
+
+    pub fn simulateDeviceLossForTesting(self: *DeviceResources) void {
+        self.simulate_device_loss = true;
     }
 
     fn createTargetResources(
@@ -319,13 +364,14 @@ pub const DeviceResources = struct {
             .full => {
                 const background = toColor(cache.background);
                 target.Clear(&background);
-                for (cache.rows.items) |*row|
-                    try self.drawCachedRow(row, metrics, dpi);
+                for (cache.rows.items, 0..) |*row, row_index|
+                    try self.drawCachedRow(row_index, row, metrics, dpi);
             },
             .partial => |rows| for (rows) |row_index| {
                 if (row_index >= cache.rows.items.len) continue;
                 try self.clearRow(cache, metrics, dpi, row_index);
                 try self.drawCachedRow(
+                    row_index,
                     &cache.rows.items[row_index],
                     metrics,
                     dpi,
@@ -369,6 +415,7 @@ pub const DeviceResources = struct {
 
     fn drawCachedRow(
         self: *DeviceResources,
+        row_index: usize,
         row: *const render_commands.CachedRow,
         metrics: geometry.Metrics,
         dpi: u32,
@@ -395,28 +442,73 @@ pub const DeviceResources = struct {
             }
         }
 
+        const layouts = try self.ensureRowLayouts(row_index, row, metrics, dpi);
+        for (row.text_runs.items, layouts.entries.items) |text_run, entry| {
+            const brush = try self.getBrush(text_run.color);
+            target.DrawTextLayout(
+                .{
+                    .x = @as(f32, @floatFromInt(text_run.x)) * scale,
+                    .y = @as(f32, @floatFromInt(text_run.y)) * scale,
+                },
+                entry.layout,
+                @ptrCast(brush),
+                .{ .CLIP = 1, .ENABLE_COLOR_FONT = 1 },
+            );
+        }
+    }
+
+    fn resizeRowLayouts(self: *DeviceResources, row_count: usize) !void {
+        const old_length = self.row_layouts.items.len;
+        if (row_count < old_length) {
+            for (self.row_layouts.items[row_count..]) |*layouts| layouts.deinit();
+            self.row_layouts.shrinkRetainingCapacity(row_count);
+        } else if (row_count > old_length) {
+            try self.row_layouts.resize(std.heap.smp_allocator, row_count);
+            for (self.row_layouts.items[old_length..]) |*layouts| layouts.* = .{};
+        }
+    }
+
+    fn ensureRowLayouts(
+        self: *DeviceResources,
+        row_index: usize,
+        row: *const render_commands.CachedRow,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !*RowLayouts {
+        const layouts = &self.row_layouts.items[row_index];
+        if (layouts.row_generation == row.generation and
+            layouts.font_generation == self.font_generation)
+            return layouts;
+
+        layouts.clear();
+        errdefer layouts.clear();
         const format = self.text_format orelse return error.TextFormatUnavailable;
+        const scale = dipScale(dpi);
         for (row.text_runs.items) |text_run| {
             if (text_run.text_len == 0) continue;
-            const layout: d2d_common.D2D_RECT_F = .{
-                .left = @as(f32, @floatFromInt(text_run.x)) * scale,
-                .top = @as(f32, @floatFromInt(text_run.y)) * scale,
-                .right = @as(f32, @floatFromInt(self.target_width)) * scale,
-                .bottom = @as(f32, @floatFromInt(
-                    text_run.y + @as(i32, @intCast(metrics.cell_height)),
-                )) * scale,
-            };
-            const brush = try self.getBrush(text_run.color);
-            target.DrawText(
+            var layout: *dwrite.IDWriteTextLayout = undefined;
+            if (self.dwrite_factory.CreateTextLayout(
                 @ptrCast(row.utf16.items[text_run.text_start..].ptr),
                 @intCast(text_run.text_len),
                 format,
+                @max(
+                    1.0,
+                    (@as(f32, @floatFromInt(self.target_width)) -
+                        @as(f32, @floatFromInt(text_run.x))) * scale,
+                ),
+                @as(f32, @floatFromInt(metrics.cell_height)) * scale,
                 &layout,
-                @ptrCast(brush),
-                .{ .CLIP = 1, .ENABLE_COLOR_FONT = 1 },
-                dwrite.DWRITE_MEASURING_MODE_NATURAL,
+            ).failed) return error.CreateTextLayoutFailed;
+            errdefer release(layout);
+            try layouts.entries.append(
+                std.heap.smp_allocator,
+                .{ .layout = layout },
             );
+            self.layout_build_count +%= 1;
         }
+        layouts.row_generation = row.generation;
+        layouts.font_generation = self.font_generation;
+        return layouts;
     }
 
     fn presentScene(self: *DeviceResources) !void {
@@ -478,6 +570,9 @@ pub const DeviceResources = struct {
         if (self.text_format) |format| release(format);
         self.text_format = replacement;
         self.font_state.commit(key);
+        self.font_generation +%= 1;
+        if (self.font_generation == 0) self.font_generation = 1;
+        self.clearRowLayouts();
         self.scene_valid = false;
         return replacement;
     }
@@ -509,6 +604,16 @@ pub const DeviceResources = struct {
         for (self.brushes[0..self.brush_slots.count]) |entry|
             release(entry.brush);
         self.brush_slots = .{};
+    }
+
+    fn clearRowLayouts(self: *DeviceResources) void {
+        for (self.row_layouts.items) |*layouts| layouts.clear();
+    }
+
+    fn releaseRowLayouts(self: *DeviceResources) void {
+        for (self.row_layouts.items) |*layouts| layouts.deinit();
+        self.row_layouts.deinit(std.heap.smp_allocator);
+        self.row_layouts = .empty;
     }
 
     fn releaseTargetResources(self: *DeviceResources) void {

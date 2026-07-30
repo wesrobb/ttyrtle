@@ -200,17 +200,22 @@ backend is developed and establishes explicit resource ownership.
 
 ## Phase 5: Add the Direct2D/DirectWrite/DXGI backend
 
-**Status:** In progress. The renderer now bootstraps a hardware D3D11 device
-(with WARP fallback), caps DXGI frame latency, creates a two-buffer flip-model
-swap chain, and owns Direct2D device/context and DirectWrite factory resources.
-Resize and DPI changes recreate a swap-chain target bitmap and a separate
-persistent scene bitmap, feeding full damage back into the retained cache.
-Direct2D now redraws only damaged retained rows into that scene, composites it
-onto the swap-chain target, and presents once per paint. A bounded brush cache
-and DPI-keyed text format retain drawing resources. Device loss recreates the
-GPU stack and forces a full scene redraw; GDI remains the fallback if creation,
-drawing, recovery, or presentation fails.
+**Status:** Complete. Direct2D/DirectWrite is the primary renderer, with a
+hardware D3D11 device and WARP fallback, a frame-latency-capped two-buffer
+flip-model swap chain, retained scene bitmap, bounded brush cache, and
+DPI-keyed text format. Retained DirectWrite layouts are cached per row and text
+run, keyed by retained-row and font generations, and released on row removal,
+font changes, device recreation, and shutdown. Resize and DPI changes recreate
+target resources and force full scene redraw; device loss rebuilds the GPU stack
+and retries once before falling back to GDI.
 
+The hidden Phase 5 integration scenario verifies clean-paint layout reuse,
+dirty-row layout rebuilding, exactly one successful `Present` for a multi-chunk
+output batch, repeated minimize/restore and resize lifecycles, full scene
+invalidation, DPI layout invalidation, injected device-loss recovery, and 180
+sequential Debug scrolling updates with exact presentation accounting and a
+12-second responsiveness ceiling. The full required verification suite passed
+on 2026-07-30. Phase 6 is the next implementation phase.
 ### Resource model
 
 Create a focused module such as `src/renderer/d2d.zig` which owns:

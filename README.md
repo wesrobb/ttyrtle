@@ -14,7 +14,9 @@ A deliberately small native Windows terminal prototype:
 - direct, minimal rendering inspired by Nvy's native approach
 
 Normal mode launches `pwsh.exe`, feeds its UTF-8/VT output through the Ghostty
-terminal model, and paints all 80 by 24 cells with GDI. The UI remains
+terminal model, and paints retained dirty rows with Direct2D/DirectWrite on a
+DXGI swap chain. Hardware D3D11 is preferred, WARP is the software GPU fallback,
+and GDI remains available if GPU creation or recovery fails. The UI remains
 responsive while the output reader blocks on an idle shell. Keyboard input is
 encoded on the UI thread from the active Ghostty terminal modes, then written
 to ConPTY by a dedicated worker so a blocked child cannot stall painting or
@@ -93,9 +95,9 @@ Windows character path, but pre-edit composition and candidate positioning are
 not rendered yet. Selection is viewport-local and does not yet scroll beyond
 the visible grid.
 
-The GDI renderer supports terminal foreground/background colors, inverse and
-faint text, underline, cursor shapes and blinking, wide-cell spacing, and
-combining marks. It does not provide font shaping, ligatures, configurable
-fonts, GPU rendering, or perfect grapheme placement. Advanced DPI behavior,
-configuration, tabs, profiles, accessibility, shell integration, and session
+The Direct2D renderer supports terminal foreground/background colors, inverse
+and faint text, underline, cursor shapes and blinking, wide-cell spacing, and
+combining marks. It does not yet provide complete grapheme shaping, system font
+fallback, ligature policy, configurable fonts, or perfect grapheme placement.
+Configuration, tabs, profiles, accessibility, shell integration, and session
 persistence remain separate future work.
