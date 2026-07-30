@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const win32 = @import("win32");
 const conpty = @import("conpty.zig");
 const geometry = @import("geometry.zig");
@@ -94,6 +95,7 @@ pub fn run(mode: Mode) !void {
         model.deinit();
         model_initialized = false;
     }
+    defer logDebugCounters();
     if (isSmokeMode(mode))
         try model.write("\x1b[38;2;126;231;135mHello from libghostty.\x1b[0m");
 
@@ -545,7 +547,12 @@ fn sameCell(left: terminal.Cursor, right: terminal.Cursor) bool {
 }
 
 fn invalidateRenderDamage(window: foundation.HWND) void {
-    switch (model.damage()) {
+    const damage = model.damage();
+    switch (damage) {
+        .none => return,
+        else => active_renderer.requestFrame(),
+    }
+    switch (damage) {
         .none => {},
         .full => _ = user32.InvalidateRect(window, null, 0),
         .partial => |rows| for (rows) |row| {
@@ -813,6 +820,32 @@ fn handleConptyOutput(window: foundation.HWND) void {
     }
 }
 
+fn logDebugCounters() void {
+    if (builtin.mode != .Debug or active_mode != .normal or
+        !model_initialized or !render_cache_initialized)
+        return;
+    const terminal_counts = model.diagnostics();
+    const cache_counts = render_cache.diagnostics();
+    const renderer_counts = active_renderer.diagnostics();
+    std.log.info(
+        "performance counters: batches={d} chunks={d} refreshes={d} " ++
+            "dirty_rows={d} rebuilt_rows={d} layout_rebuilds={d} " ++
+            "frames_requested={d} frames_presented={d} " ++
+            "gpu_presents={d} device_recreations={d}",
+        .{
+            terminal_counts.output_batches,
+            terminal_counts.chunks_parsed,
+            terminal_counts.render_refreshes,
+            cache_counts.dirty_rows,
+            cache_counts.rebuilt_rows,
+            renderer_counts.layout_build_count,
+            renderer_counts.frames_requested,
+            renderer_counts.frames_presented,
+            renderer_counts.gpu_present_count,
+            renderer_counts.gpu_recreation_count,
+        },
+    );
+}
 fn applyOutputBatch(window: foundation.HWND, chunks: []const []const u8) !void {
     try model.writeBatch(chunks);
     model.resetCursorBlink();
@@ -840,9 +873,13 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     if (!active_renderer.invalidateGpuSceneForTesting())
         return error.GpuRendererUnavailable;
 
+    const before_initial = active_renderer.diagnostics();
     try paintForTesting(window);
     const initial = active_renderer.diagnostics();
-    if (initial.gpu_present_count != 1 or initial.layout_build_count == 0)
+    if (initial.frames_requested != before_initial.frames_requested + 1 or
+        initial.frames_presented != before_initial.frames_presented + 1 or
+        initial.gpu_present_count != before_initial.gpu_present_count + 1 or
+        initial.layout_build_count == 0)
         return error.InitialGpuPaintDiagnosticsMismatch;
 
     try paintForTesting(window);
@@ -954,6 +991,7 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
 
 fn paintForTesting(window: foundation.HWND) !void {
     paint_completed = false;
+    active_renderer.requestFrame();
     _ = user32.InvalidateRect(window, null, 0);
     _ = user32.SendMessageW(window, wm.WM_PAINT, 0, 0);
     if (!paint_completed) return error.TestPaintFailed;

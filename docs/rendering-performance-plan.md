@@ -305,8 +305,8 @@ precomposed Latin, CJK, supplementary-plane surrogate pairs, emoji variation
 selectors and ZWJ sequences, mixed scripts, box drawing, block elements,
 colored/inverse/underlined cells, stable missing-glyph advances, and clean-row
 layout-generation retention across partial updates. The full required
-verification suite passed on 2026-07-30. Phase 7 is the next implementation
-phase; its additional performance counters remain out of scope.
+verification suite passed on 2026-07-30. Phase 7 subsequently added the
+Debug-only counters; its manual performance measurements remain outstanding.
 
 ### Changes
 
@@ -347,6 +347,15 @@ phase; its additional performance counters remain out of scope.
   intact, and every glyph stays aligned to Ghostty's cell grid.
 
 ## Phase 7: Remove the prototype path and measure
+
+**Status:** In progress. The obsolete transient frame path is already gone and
+the retained-renderer architecture is documented. Lightweight counters now
+track output batches and chunks, Ghostty refreshes, accepted dirty rows, rebuilt
+rows, row-layout rebuilds, logical frame requests, successful GPU/GDI
+presentations, GPU presentations, and successful device recreations. Counter
+fields and increments are compile-time-elided outside Debug and tests. A normal
+Debug session writes one aggregated counter line to diagnostics during clean
+shutdown. The manual performance acceptance checks remain outstanding.
 
 ### Changes
 

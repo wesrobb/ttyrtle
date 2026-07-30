@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const win32 = @import("win32");
 const geometry = @import("../geometry.zig");
 const render_commands = @import("../render_commands.zig");
@@ -17,6 +18,7 @@ const dxgi_common = dxgi.common;
 const terminal_font_name = std.unicode.utf8ToUtf16LeStringLiteral("Consolas");
 const locale_name = std.unicode.utf8ToUtf16LeStringLiteral("en-US");
 const max_brushes = 64;
+const counters_enabled = builtin.mode == .Debug or builtin.is_test;
 
 const BrushEntry = struct {
     brush: *d2d.ID2D1SolidColorBrush,
@@ -63,7 +65,7 @@ pub const DeviceResources = struct {
     font_state: resource_cache.FontState,
     font_generation: u64,
     row_layouts: std.ArrayListUnmanaged(RowLayouts),
-    layout_build_count: u64,
+    layout_build_count: if (counters_enabled) u64 else void,
     brushes: [max_brushes]BrushEntry,
     brush_slots: resource_cache.KeySlots(max_brushes),
     simulate_device_loss: bool,
@@ -86,7 +88,7 @@ pub const DeviceResources = struct {
         resources.font_state = .{};
         resources.font_generation = 0;
         resources.row_layouts = .empty;
-        resources.layout_build_count = 0;
+        resources.layout_build_count = if (counters_enabled) 0 else {};
         resources.brush_slots = .{};
         resources.simulate_device_loss = false;
 
@@ -633,7 +635,7 @@ pub const DeviceResources = struct {
             ).failed) return error.ConfigureTextLayoutFailed;
         }
         layouts.layout = layout;
-        self.layout_build_count +%= 1;
+        if (counters_enabled) self.layout_build_count +|= 1;
         layouts.row_generation = row.generation;
         layouts.font_generation = self.font_generation;
         return layouts;

@@ -47,7 +47,14 @@ pub const RenderDamage = union(enum) {
     full,
 };
 
+const counters_enabled = builtin.mode == .Debug or builtin.is_test;
+
 pub const TerminalModel = struct {
+    pub const Diagnostics = struct {
+        output_batches: u64,
+        chunks_parsed: u64,
+        render_refreshes: u64,
+    };
     allocator: std.mem.Allocator,
     core: ghostty.Terminal,
     stream: ghostty.TerminalStream,
@@ -63,7 +70,9 @@ pub const TerminalModel = struct {
     cursor_blink_visible: bool,
     damage_full: bool,
     damage_rows: std.ArrayListUnmanaged(u16),
-    render_refresh_count: if (builtin.is_test) usize else void,
+    output_batch_count: if (counters_enabled) u64 else void,
+    chunks_parsed_count: if (counters_enabled) u64 else void,
+    render_refresh_count: if (counters_enabled) u64 else void,
 
     pub fn init(
         self: *TerminalModel,
@@ -91,7 +100,9 @@ pub const TerminalModel = struct {
             .cursor_blink_visible = true,
             .damage_full = false,
             .damage_rows = .empty,
-            .render_refresh_count = if (builtin.is_test) 0 else {},
+            .output_batch_count = if (counters_enabled) 0 else {},
+            .chunks_parsed_count = if (counters_enabled) 0 else {},
+            .render_refresh_count = if (counters_enabled) 0 else {},
         };
         errdefer self.core.deinit(allocator);
 
@@ -126,6 +137,10 @@ pub const TerminalModel = struct {
         self: *TerminalModel,
         chunks: []const []const u8,
     ) !void {
+        if (counters_enabled) {
+            self.output_batch_count +|= 1;
+            self.chunks_parsed_count +|= chunks.len;
+        }
         for (chunks) |bytes| self.stream.nextSlice(bytes);
         if (self.reply_failed) {
             self.reply_failed = false;
@@ -213,10 +228,22 @@ pub const TerminalModel = struct {
     pub fn refresh(self: *TerminalModel) !void {
         const old_cursor_row = renderCursorRow(&self.render_state);
         try self.render_state.update(self.allocator, &self.core);
-        if (builtin.is_test) self.render_refresh_count +|= 1;
+        if (counters_enabled) self.render_refresh_count +|= 1;
         try self.collectRenderDamage(old_cursor_row);
     }
 
+    pub fn diagnostics(self: *const TerminalModel) Diagnostics {
+        if (!counters_enabled) return .{
+            .output_batches = 0,
+            .chunks_parsed = 0,
+            .render_refreshes = 0,
+        };
+        return .{
+            .output_batches = self.output_batch_count,
+            .chunks_parsed = self.chunks_parsed_count,
+            .render_refreshes = self.render_refresh_count,
+        };
+    }
     pub fn damage(self: *const TerminalModel) RenderDamage {
         if (self.damage_full) return .full;
         if (self.damage_rows.items.len == 0) return .none;
@@ -676,14 +703,14 @@ test "multi-chunk write refreshes render state once" {
     var model: TerminalModel = undefined;
     try model.init(std.testing.allocator, 4, 20);
     defer model.deinit();
-    const refresh_count = model.render_refresh_count;
+    const before = model.diagnostics();
 
     try model.writeBatch(&chunks);
 
-    try std.testing.expectEqual(
-        refresh_count + 1,
-        model.render_refresh_count,
-    );
+    const after = model.diagnostics();
+    try std.testing.expectEqual(before.output_batches + 1, after.output_batches);
+    try std.testing.expectEqual(before.chunks_parsed + chunks.len, after.chunks_parsed);
+    try std.testing.expectEqual(before.render_refreshes + 1, after.render_refreshes);
 }
 
 test "one-line terminal update reports only that row" {

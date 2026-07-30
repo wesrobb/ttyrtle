@@ -76,7 +76,11 @@ zig build verify            # Formatting plus every check above
 
 The smoke path requests a paint synchronously and then exits through the normal
 `WM_CLOSE`/`WM_DESTROY` message flow, so it does not depend on sleeps or manual
-interaction. The integration path launches finite ConPTY children, verifies
+interaction. On normal Debug-session shutdown, diagnostics report aggregated
+output batches/chunks, Ghostty refreshes, dirty and rebuilt rows, DirectWrite
+layout rebuilds, requested and presented frames, GPU presents, and device
+recreations. The counter storage and increments are omitted from optimized
+builds. The integration path launches finite ConPTY children, verifies
 known truecolor VT output and queued Unicode input in the Ghostty model,
 confirms reader teardown, and requires a hosted process to observe an exact
 window-driven terminal resize.

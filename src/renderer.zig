@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const win32 = @import("win32");
 const geometry = @import("geometry.zig");
 const render_commands = @import("render_commands.zig");
@@ -9,16 +10,21 @@ const gdi = @import("renderer/gdi.zig");
 
 const foundation = win32.foundation;
 const graphics_gdi = win32.graphics.gdi;
+const counters_enabled = builtin.mode == .Debug or builtin.is_test;
 
 pub const Renderer = struct {
     fallback: gdi.Renderer = .{},
     gpu: ?d2d.DeviceResources = null,
     window: ?foundation.HWND = null,
-    gpu_present_count: u64 = 0,
-    gpu_recreation_count: u64 = 0,
-    retired_layout_build_count: u64 = 0,
+    frame_request_count: if (counters_enabled) u64 else void = if (counters_enabled) 0 else {},
+    frame_presented_count: if (counters_enabled) u64 else void = if (counters_enabled) 0 else {},
+    gpu_present_count: if (counters_enabled) u64 else void = if (counters_enabled) 0 else {},
+    gpu_recreation_count: if (counters_enabled) u64 else void = if (counters_enabled) 0 else {},
+    retired_layout_build_count: if (counters_enabled) u64 else void = if (counters_enabled) 0 else {},
 
     pub const Diagnostics = struct {
+        frames_requested: u64,
+        frames_presented: u64,
         gpu_present_count: u64,
         gpu_recreation_count: u64,
         layout_build_count: u64,
@@ -98,24 +104,30 @@ pub const Renderer = struct {
                         std.log.warn("GPU recovery paint failed: {s}", .{
                             @errorName(retry_err),
                         });
-                        self.retired_layout_build_count +%=
+                        if (counters_enabled) self.retired_layout_build_count +|=
                             replacement.layout_build_count;
                         replacement.deinit();
                         self.gpu = null;
                     };
                     if (self.gpu != null) {
-                        self.gpu_present_count +%= 1;
+                        if (counters_enabled) {
+                            self.gpu_present_count +|= 1;
+                            self.frame_presented_count +|= 1;
+                        }
                         return true;
                     }
                 }
             };
             if (self.gpu != null) {
-                self.gpu_present_count +%= 1;
+                if (counters_enabled) {
+                    self.gpu_present_count +|= 1;
+                    self.frame_presented_count +|= 1;
+                }
                 return true;
             }
         }
 
-        return self.fallback.paint(
+        const presented = self.fallback.paint(
             window_dc,
             paint_rect,
             client_rect,
@@ -124,10 +136,25 @@ pub const Renderer = struct {
             metrics,
             dpi,
         );
+        if (counters_enabled and presented) self.frame_presented_count +|= 1;
+        return presented;
+    }
+
+    pub fn requestFrame(self: *Renderer) void {
+        if (counters_enabled) self.frame_request_count +|= 1;
     }
 
     pub fn diagnostics(self: *const Renderer) Diagnostics {
+        if (!counters_enabled) return .{
+            .frames_requested = 0,
+            .frames_presented = 0,
+            .gpu_present_count = 0,
+            .gpu_recreation_count = 0,
+            .layout_build_count = 0,
+        };
         return .{
+            .frames_requested = self.frame_request_count,
+            .frames_presented = self.frame_presented_count,
             .gpu_present_count = self.gpu_present_count,
             .gpu_recreation_count = self.gpu_recreation_count,
             .layout_build_count = self.retired_layout_build_count +
@@ -174,12 +201,12 @@ pub const Renderer = struct {
             return;
         };
         self.gpu = replacement;
-        self.gpu_recreation_count +%= 1;
+        if (counters_enabled) self.gpu_recreation_count +|= 1;
     }
 
     fn releaseGpu(self: *Renderer) void {
         if (self.gpu) |*resources| {
-            self.retired_layout_build_count +%= resources.layout_build_count;
+            if (counters_enabled) self.retired_layout_build_count +|= resources.layout_build_count;
             resources.deinit();
         }
         self.gpu = null;

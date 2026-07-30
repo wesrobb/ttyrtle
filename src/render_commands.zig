@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const geometry = @import("geometry.zig");
 const terminal = @import("terminal.zig");
 
@@ -64,15 +65,27 @@ pub const CachedRow = struct {
     }
 };
 
+const counters_enabled = builtin.mode == .Debug or builtin.is_test;
+
 pub const RenderCache = struct {
+    pub const Diagnostics = struct {
+        dirty_rows: u64,
+        rebuilt_rows: u64,
+    };
     allocator: std.mem.Allocator,
     background: terminal.Rgb = .{ .red = 12, .green = 16, .blue = 20 },
     rows: std.ArrayListUnmanaged(CachedRow) = .empty,
     columns: u16 = 0,
     metrics: ?geometry.Metrics = null,
+    dirty_row_count: if (counters_enabled) u64 else void,
+    rebuilt_row_count: if (counters_enabled) u64 else void,
 
     pub fn init(allocator: std.mem.Allocator) RenderCache {
-        return .{ .allocator = allocator };
+        return .{
+            .allocator = allocator,
+            .dirty_row_count = if (counters_enabled) 0 else {},
+            .rebuilt_row_count = if (counters_enabled) 0 else {},
+        };
     }
 
     pub fn deinit(self: *RenderCache) void {
@@ -100,17 +113,39 @@ pub const RenderCache = struct {
 
         if (dimensions_changed or metrics_changed) {
             try self.rebuildAll(model, metrics);
+            self.recordDirtyRows(self.rows.items.len);
             return;
         }
 
         switch (damage) {
             .none => {},
-            .full => try self.rebuildAll(model, metrics),
-            .partial => |dirty_rows| for (dirty_rows) |row| {
-                if (row < self.rows.items.len)
-                    try self.rebuildRow(model, metrics, row);
+            .full => {
+                try self.rebuildAll(model, metrics);
+                self.recordDirtyRows(self.rows.items.len);
+            },
+            .partial => |dirty_rows| {
+                var accepted: usize = 0;
+                for (dirty_rows) |row| {
+                    if (row < self.rows.items.len) {
+                        try self.rebuildRow(model, metrics, row);
+                        accepted += 1;
+                    }
+                }
+                self.recordDirtyRows(accepted);
             },
         }
+    }
+
+    pub fn diagnostics(self: *const RenderCache) Diagnostics {
+        if (!counters_enabled) return .{ .dirty_rows = 0, .rebuilt_rows = 0 };
+        return .{
+            .dirty_rows = self.dirty_row_count,
+            .rebuilt_rows = self.rebuilt_row_count,
+        };
+    }
+
+    fn recordDirtyRows(self: *RenderCache, count: usize) void {
+        if (counters_enabled) self.dirty_row_count +|= @intCast(count);
     }
 
     fn resize(self: *RenderCache, row_count: u16, column_count: u16) !void {
@@ -268,6 +303,7 @@ pub const RenderCache = struct {
             });
         }
         row.generation +%= 1;
+        if (counters_enabled) self.rebuilt_row_count +|= 1;
     }
 };
 
@@ -349,6 +385,7 @@ test "cache rebuilds only dirty rows" {
         cache.rows.items[2].generation,
         cache.rows.items[3].generation,
     };
+    const before = cache.diagnostics();
 
     try model.write("\x1b[3;1Hchanged\x1b[1;1H");
     try cache.update(&model, metrics, model.damage());
@@ -356,6 +393,9 @@ test "cache rebuilds only dirty rows" {
     try std.testing.expectEqual(generations[1], cache.rows.items[1].generation);
     try std.testing.expect(cache.rows.items[2].generation > generations[2]);
     try std.testing.expectEqual(generations[3], cache.rows.items[3].generation);
+    const after = cache.diagnostics();
+    try std.testing.expectEqual(before.dirty_rows + 2, after.dirty_rows);
+    try std.testing.expectEqual(before.rebuilt_rows + 2, after.rebuilt_rows);
 }
 
 test "cache retains UTF-16 cell mapping and combining graphemes" {
