@@ -1,5 +1,20 @@
 # Repository Guidelines
 
+## Product Direction
+
+Build ttyrtle as a great lightweight terminal for Windows: fast, focused,
+native, and polished in the same spirit as Notepad++, while presenting a more
+modern and attractive interface. It should feel at home to Windows users rather
+than like an application transplanted from another platform.
+
+Prefer established Windows interaction conventions wherever they fit. Standard
+window behavior, shortcuts, hotkeys, focus movement, context menus, keyboard
+navigation, accessibility, DPI handling, and high-contrast behavior should work
+as a Windows user would naturally expect. Where a Windows convention conflicts
+with terminal input or established terminal conventions, make the tradeoff
+deliberately, preserve a way to send the underlying input, and keep the default
+predictable and discoverable.
+
 ## Project Structure & Module Organization
 
 This repository is intentionally small:
