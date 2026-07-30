@@ -873,15 +873,14 @@ fn handleConptyOutput(window: foundation.HWND) void {
     var batch = active_session.drainOutput();
     defer batch.deinit();
 
-    var changed = false;
-    for (batch.chunks.items) |chunk| {
-        model.write(chunk) catch {
+    const changed = batch.chunks.items.len != 0;
+    if (changed) {
+        model.writeBatch(batch.chunks.items) catch {
             std.log.err("failed to apply ConPTY output to the terminal model", .{});
             if (isIntegrationMode(active_mode)) _ = user32.DestroyWindow(window);
             return;
         };
         model.resetCursorBlink();
-        changed = true;
     }
 
     applyTerminalEffects(window);

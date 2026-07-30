@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ghostty = @import("ghostty-vt");
 
 pub const Rgb = struct {
@@ -54,6 +55,7 @@ pub const TerminalModel = struct {
     selection_anchor: ?Cursor,
     selection_head: ?Cursor,
     cursor_blink_visible: bool,
+    render_refresh_count: if (builtin.is_test) usize else void,
 
     pub fn init(
         self: *TerminalModel,
@@ -79,6 +81,7 @@ pub const TerminalModel = struct {
             .selection_anchor = null,
             .selection_head = null,
             .cursor_blink_visible = true,
+            .render_refresh_count = if (builtin.is_test) 0 else {},
         };
         errdefer self.core.deinit(allocator);
 
@@ -104,7 +107,15 @@ pub const TerminalModel = struct {
     }
 
     pub fn write(self: *TerminalModel, bytes: []const u8) !void {
-        self.stream.nextSlice(bytes);
+        const chunks = [_][]const u8{bytes};
+        try self.writeBatch(&chunks);
+    }
+
+    pub fn writeBatch(
+        self: *TerminalModel,
+        chunks: []const []const u8,
+    ) !void {
+        for (chunks) |bytes| self.stream.nextSlice(bytes);
         if (self.reply_failed) {
             self.reply_failed = false;
             return error.ReplyDeliveryFailed;
@@ -190,6 +201,7 @@ pub const TerminalModel = struct {
 
     pub fn refresh(self: *TerminalModel) !void {
         try self.render_state.update(self.allocator, &self.core);
+        if (builtin.is_test) self.render_refresh_count +|= 1;
     }
 
     pub fn rows(self: *const TerminalModel) u16 {
@@ -481,6 +493,82 @@ test "UTF-8 terminal text can be read back without loss" {
     try std.testing.expectEqualStrings("héllo", text[0..length]);
 }
 
+test "multiple output chunks match one combined terminal write" {
+    const chunks = [_][]const u8{
+        "first",
+        "\x1b[2;4H",
+        "\x1b[38;2;12;34;56msecond",
+        "\x1b]2;batched\x07",
+    };
+    const combined = "first\x1b[2;4H\x1b[38;2;12;34;56msecond" ++
+        "\x1b]2;batched\x07";
+
+    var batched: TerminalModel = undefined;
+    try batched.init(std.testing.allocator, 4, 20);
+    defer batched.deinit();
+    try batched.writeBatch(&chunks);
+
+    var contiguous: TerminalModel = undefined;
+    try contiguous.init(std.testing.allocator, 4, 20);
+    defer contiguous.deinit();
+    try contiguous.write(combined);
+
+    var batched_text: [32]u8 = undefined;
+    const batched_length = try batched.rowTextUtf8(1, &batched_text);
+    var contiguous_text: [32]u8 = undefined;
+    const contiguous_length = try contiguous.rowTextUtf8(1, &contiguous_text);
+    try std.testing.expectEqualStrings(
+        contiguous_text[0..contiguous_length],
+        batched_text[0..batched_length],
+    );
+    try std.testing.expectEqual(contiguous.cursor(), batched.cursor());
+    try std.testing.expectEqual(
+        contiguous.cell(1, 3).?.foreground,
+        batched.cell(1, 3).?.foreground,
+    );
+    try std.testing.expectEqualStrings(
+        contiguous.core.getTitle().?,
+        batched.core.getTitle().?,
+    );
+}
+
+test "batch preserves UTF-8 CSI and OSC sequences split across chunks" {
+    const chunks = [_][]const u8{
+        "h\xc3",
+        "\xa9\x1b[3",
+        "1mR\x1b]2;spl",
+        "it title\x07",
+    };
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+
+    try model.writeBatch(&chunks);
+
+    var text: [32]u8 = undefined;
+    const length = try model.rowTextUtf8(0, &text);
+    try std.testing.expectEqualStrings("héR", text[0..length]);
+    const red = model.cell(0, 2).?.foreground;
+    try std.testing.expect(red.red > red.green);
+    try std.testing.expectEqual(red.green, red.blue);
+    try std.testing.expectEqualStrings("split title", model.core.getTitle().?);
+}
+
+test "multi-chunk write refreshes render state once" {
+    const chunks = [_][]const u8{ "one", " two", " three" };
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    const refresh_count = model.render_refresh_count;
+
+    try model.writeBatch(&chunks);
+
+    try std.testing.expectEqual(
+        refresh_count + 1,
+        model.render_refresh_count,
+    );
+}
+
 test "row text reports insufficient output space" {
     var model: TerminalModel = undefined;
     try model.init(std.testing.allocator, 2, 10);
@@ -533,6 +621,77 @@ test "terminal queries deliver owned replies through the configured sink" {
     try std.testing.expectEqual(@as(usize, 2), capture.replies.items.len);
     try std.testing.expectEqualStrings("\x1b[2;3R", capture.replies.items[0]);
     try std.testing.expect(std.mem.startsWith(u8, capture.replies.items[1], "\x1b[?"));
+}
+
+test "terminal replies preserve ordering with queued keyboard input" {
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        writes: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn append(self: *@This(), bytes: []const u8) !void {
+            try self.writes.append(
+                self.allocator,
+                try self.allocator.dupe(u8, bytes),
+            );
+        }
+
+        fn write(context: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try self.append(bytes);
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.writes.items) |bytes| self.allocator.free(bytes);
+            self.writes.deinit(self.allocator);
+        }
+    };
+
+    var capture: Capture = .{ .allocator = std.testing.allocator };
+    defer capture.deinit();
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    model.setReplySink(.{ .context = &capture, .write = Capture.write });
+    const output = [_][]const u8{ "\x1b[2;3H\x1b[", "6n" };
+
+    try capture.append("keyboard-before");
+    try model.writeBatch(&output);
+    try capture.append("keyboard-after");
+
+    try std.testing.expectEqual(@as(usize, 3), capture.writes.items.len);
+    try std.testing.expectEqualStrings(
+        "keyboard-before",
+        capture.writes.items[0],
+    );
+    try std.testing.expectEqualStrings("\x1b[2;3R", capture.writes.items[1]);
+    try std.testing.expectEqualStrings(
+        "keyboard-after",
+        capture.writes.items[2],
+    );
+}
+
+test "reply failure is reported after every chunk has been parsed" {
+    const FailingSink = struct {
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.WriteFailed;
+        }
+    };
+
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    model.setReplySink(.{ .context = &model, .write = FailingSink.write });
+    const output = [_][]const u8{ "\x1b[6n", "still parsed" };
+
+    try std.testing.expectError(
+        error.ReplyDeliveryFailed,
+        model.writeBatch(&output),
+    );
+    try model.refresh();
+
+    var text: [32]u8 = undefined;
+    const length = try model.rowTextUtf8(0, &text);
+    try std.testing.expectEqualStrings("still parsed", text[0..length]);
 }
 
 test "title and bell effects are retained until consumed" {
