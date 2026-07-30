@@ -40,7 +40,25 @@ var session: ?*conpty.Session = null;
 var input_translator: input.Translator = .{};
 var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
 var selection_dragging = false;
+var selection_anchor: ?terminal.Cursor = null;
+var selection_head: ?terminal.Cursor = null;
 var pressed_mouse_button: ?input.MouseButton = null;
+var back_buffer: ?BackBuffer = null;
+
+const BackBuffer = struct {
+    dc: gdi.CreatedHDC,
+    bitmap: gdi.HBITMAP,
+    previous_bitmap: gdi.HGDIOBJ,
+    width: i32,
+    height: i32,
+
+    fn deinit(self: *BackBuffer) void {
+        _ = gdi32.SelectObject(self.dc, self.previous_bitmap);
+        _ = gdi32.DeleteObject(self.bitmap);
+        _ = gdi32.DeleteDC(self.dc);
+        self.* = undefined;
+    }
+};
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
@@ -70,7 +88,11 @@ pub fn run(mode: Mode) !void {
     input_translator = .{};
     terminal_metrics = .forDpi(geometry.base_dpi);
     selection_dragging = false;
+    selection_anchor = null;
+    selection_head = null;
     pressed_mouse_button = null;
+    back_buffer = null;
+    defer deinitBackBuffer();
 
     try model.init(allocator, 24, 80);
     model_initialized = true;
@@ -409,20 +431,34 @@ fn handleMouseMessage(
     if (local_selection) {
         switch (message) {
             wm.WM_LBUTTONDOWN => {
-                model.startSelection(cell.row, cell.column);
+                const clamped_cell = clampSelectionCell(cell);
+                if (selection_anchor != null and selection_head != null)
+                    invalidateSelectionRange(window, selection_anchor.?, selection_head.?);
+                model.startSelection(clamped_cell.row, clamped_cell.column);
+                selection_anchor = clamped_cell;
+                selection_head = clamped_cell;
                 selection_dragging = true;
                 _ = user32.SetCapture(window);
-                _ = user32.InvalidateRect(window, null, 0);
+                invalidateSelectionRange(window, clamped_cell, clamped_cell);
             },
             wm.WM_MOUSEMOVE => if (selection_dragging) {
-                model.updateSelection(cell.row, cell.column);
-                _ = user32.InvalidateRect(window, null, 0);
+                const clamped_cell = clampSelectionCell(cell);
+                const previous = selection_head orelse clamped_cell;
+                if (sameCell(previous, clamped_cell)) return;
+                model.updateSelection(clamped_cell.row, clamped_cell.column);
+                selection_head = clamped_cell;
+                invalidateSelectionRange(window, previous, clamped_cell);
             },
             wm.WM_LBUTTONUP => if (selection_dragging) {
-                model.updateSelection(cell.row, cell.column);
+                const clamped_cell = clampSelectionCell(cell);
+                const previous = selection_head orelse clamped_cell;
+                if (!sameCell(previous, clamped_cell)) {
+                    model.updateSelection(clamped_cell.row, clamped_cell.column);
+                    selection_head = clamped_cell;
+                    invalidateSelectionRange(window, previous, clamped_cell);
+                }
                 selection_dragging = false;
                 _ = user32.ReleaseCapture();
-                _ = user32.InvalidateRect(window, null, 0);
             },
             else => {},
         }
@@ -497,6 +533,47 @@ fn pointToCell(point: foundation.POINT) terminal.Cursor {
         .visible = false,
         .blinking = false,
     };
+}
+
+fn clampSelectionCell(cell: terminal.Cursor) terminal.Cursor {
+    var clamped = cell;
+    clamped.row = @min(clamped.row, model.rows() -| 1);
+    clamped.column = @min(clamped.column, model.columns() -| 1);
+    return clamped;
+}
+
+fn sameCell(left: terminal.Cursor, right: terminal.Cursor) bool {
+    return left.row == right.row and left.column == right.column;
+}
+
+fn invalidateSelectionRange(
+    window: foundation.HWND,
+    first: terminal.Cursor,
+    second: terminal.Cursor,
+) void {
+    const start, const end = if (first.row < second.row or
+        (first.row == second.row and first.column <= second.column))
+        .{ first, second }
+    else
+        .{ second, first };
+    const cell_width: i32 = @intCast(terminal_metrics.cell_width);
+    const cell_height: i32 = @intCast(terminal_metrics.cell_height);
+    const margin_x: i32 = @intCast(terminal_metrics.margin_x);
+    const margin_y: i32 = @intCast(terminal_metrics.margin_y);
+    const last_column: u32 = model.columns() -| 1;
+
+    var row = start.row;
+    while (row <= end.row) : (row += 1) {
+        const first_column = if (row == start.row) start.column else 0;
+        const final_column = if (row == end.row) end.column else last_column;
+        const dirty: foundation.RECT = .{
+            .left = margin_x + @as(i32, @intCast(first_column)) * cell_width,
+            .top = margin_y + @as(i32, @intCast(row)) * cell_height,
+            .right = margin_x + @as(i32, @intCast(final_column + 1)) * cell_width,
+            .bottom = margin_y + @as(i32, @intCast(row + 1)) * cell_height,
+        };
+        _ = user32.InvalidateRect(window, &dirty, 0);
+    }
 }
 
 fn pasteClipboard(window: ?foundation.HWND) void {
@@ -625,6 +702,25 @@ fn paint(window: foundation.HWND) bool {
     const dc = user32.BeginPaint(window, &paint_state) orelse return false;
     defer _ = user32.EndPaint(window, &paint_state);
 
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(window, &client) == 0) return false;
+    const buffer = ensureBackBuffer(
+        dc,
+        client.right - client.left,
+        client.bottom - client.top,
+    ) orelse return false;
+    const target_dc = buffer.dc;
+    const saved_dc = gdi32.SaveDC(target_dc);
+    if (saved_dc == 0) return false;
+    defer _ = gdi32.RestoreDC(target_dc, saved_dc);
+    _ = gdi32.IntersectClipRect(
+        target_dc,
+        paint_state.rcPaint.left,
+        paint_state.rcPaint.top,
+        paint_state.rcPaint.right,
+        paint_state.rcPaint.bottom,
+    );
+
     var frame = render_commands.Frame.build(
         std.heap.smp_allocator,
         &model,
@@ -652,11 +748,11 @@ fn paint(window: foundation.HWND) bool {
         terminal_font_name,
     ) orelse return false;
     defer _ = gdi32.DeleteObject(font);
-    const previous_font = gdi32.SelectObject(dc, font) orelse return false;
-    defer _ = gdi32.SelectObject(dc, previous_font);
+    const previous_font = gdi32.SelectObject(target_dc, font) orelse return false;
+    defer _ = gdi32.SelectObject(target_dc, previous_font);
 
-    _ = user32.FillRect(dc, &paint_state.rcPaint, background);
-    _ = gdi32.SetBkMode(dc, gdi.TRANSPARENT);
+    _ = user32.FillRect(target_dc, &paint_state.rcPaint, background);
+    _ = gdi32.SetBkMode(target_dc, gdi.TRANSPARENT);
 
     for (frame.rectangles.items) |rectangle| {
         const brush = gdi32.CreateSolidBrush(toColorRef(rectangle.color)) orelse
@@ -669,15 +765,15 @@ fn paint(window: foundation.HWND) bool {
             .bottom = rectangle.bottom,
         };
         _ = if (rectangle.outline)
-            user32.FrameRect(dc, &bounds, brush)
+            user32.FrameRect(target_dc, &bounds, brush)
         else
-            user32.FillRect(dc, &bounds, brush);
+            user32.FillRect(target_dc, &bounds, brush);
     }
 
     for (frame.text_runs.items) |*text_run| {
-        _ = gdi32.SetTextColor(dc, toColorRef(text_run.color));
+        _ = gdi32.SetTextColor(target_dc, toColorRef(text_run.color));
         if (gdi32.TextOutW(
-            dc,
+            target_dc,
             text_run.x,
             text_run.y,
             @ptrCast(text_run.text.items.ptr),
@@ -685,7 +781,53 @@ fn paint(window: foundation.HWND) bool {
         ) == 0) return false;
     }
 
-    return true;
+    const width = paint_state.rcPaint.right - paint_state.rcPaint.left;
+    const height = paint_state.rcPaint.bottom - paint_state.rcPaint.top;
+    return gdi32.BitBlt(
+        dc,
+        paint_state.rcPaint.left,
+        paint_state.rcPaint.top,
+        width,
+        height,
+        target_dc,
+        paint_state.rcPaint.left,
+        paint_state.rcPaint.top,
+        gdi.SRCCOPY,
+    ) != 0;
+}
+
+fn ensureBackBuffer(dc: gdi.HDC, width: i32, height: i32) ?*BackBuffer {
+    if (width <= 0 or height <= 0) return null;
+    if (back_buffer) |*buffer| {
+        if (buffer.width >= width and buffer.height >= height) return buffer;
+        buffer.deinit();
+        back_buffer = null;
+    }
+
+    const memory_dc = gdi32.CreateCompatibleDC(dc);
+    if (@intFromPtr(memory_dc) == 0) return null;
+    const bitmap = gdi32.CreateCompatibleBitmap(dc, width, height) orelse {
+        _ = gdi32.DeleteDC(memory_dc);
+        return null;
+    };
+    const previous_bitmap = gdi32.SelectObject(memory_dc, bitmap) orelse {
+        _ = gdi32.DeleteObject(bitmap);
+        _ = gdi32.DeleteDC(memory_dc);
+        return null;
+    };
+    back_buffer = .{
+        .dc = memory_dc,
+        .bitmap = bitmap,
+        .previous_bitmap = previous_bitmap,
+        .width = width,
+        .height = height,
+    };
+    return &back_buffer.?;
+}
+
+fn deinitBackBuffer() void {
+    if (back_buffer) |*buffer| buffer.deinit();
+    back_buffer = null;
 }
 
 fn resizeForClient(window: foundation.HWND) !void {
