@@ -41,6 +41,12 @@ pub const ReplySink = struct {
     write: *const fn (*anyopaque, []const u8) anyerror!void,
 };
 
+pub const RenderDamage = union(enum) {
+    none,
+    partial: []const u16,
+    full,
+};
+
 pub const TerminalModel = struct {
     allocator: std.mem.Allocator,
     core: ghostty.Terminal,
@@ -55,6 +61,8 @@ pub const TerminalModel = struct {
     selection_anchor: ?Cursor,
     selection_head: ?Cursor,
     cursor_blink_visible: bool,
+    damage_full: bool,
+    damage_rows: std.ArrayListUnmanaged(u16),
     render_refresh_count: if (builtin.is_test) usize else void,
 
     pub fn init(
@@ -81,6 +89,8 @@ pub const TerminalModel = struct {
             .selection_anchor = null,
             .selection_head = null,
             .cursor_blink_visible = true,
+            .damage_full = false,
+            .damage_rows = .empty,
             .render_refresh_count = if (builtin.is_test) 0 else {},
         };
         errdefer self.core.deinit(allocator);
@@ -103,6 +113,7 @@ pub const TerminalModel = struct {
         self.stream.deinit();
         self.render_state.deinit(self.allocator);
         self.core.deinit(self.allocator);
+        self.damage_rows.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -200,8 +211,26 @@ pub const TerminalModel = struct {
     }
 
     pub fn refresh(self: *TerminalModel) !void {
+        const old_cursor_row = renderCursorRow(&self.render_state);
         try self.render_state.update(self.allocator, &self.core);
         if (builtin.is_test) self.render_refresh_count +|= 1;
+        try self.collectRenderDamage(old_cursor_row);
+    }
+
+    pub fn damage(self: *const TerminalModel) RenderDamage {
+        if (self.damage_full) return .full;
+        if (self.damage_rows.items.len == 0) return .none;
+        return .{ .partial = self.damage_rows.items };
+    }
+
+    pub fn acknowledgeDamage(self: *TerminalModel) void {
+        self.damage_full = false;
+        self.damage_rows.clearRetainingCapacity();
+    }
+
+    pub fn markFullDamage(self: *TerminalModel) void {
+        self.damage_full = true;
+        self.damage_rows.clearRetainingCapacity();
     }
 
     pub fn rows(self: *const TerminalModel) u16 {
@@ -241,10 +270,23 @@ pub const TerminalModel = struct {
 
     pub fn toggleCursorBlink(self: *TerminalModel) void {
         self.cursor_blink_visible = !self.cursor_blink_visible;
+        if (self.render_state.cursor.blinking and
+            self.render_state.cursor.visible)
+        {
+            if (renderCursorRow(&self.render_state)) |row|
+                self.mergeDamageRow(row) catch self.markFullDamage();
+        }
     }
 
     pub fn resetCursorBlink(self: *TerminalModel) void {
+        if (self.cursor_blink_visible) return;
         self.cursor_blink_visible = true;
+        if (self.render_state.cursor.blinking and
+            self.render_state.cursor.visible)
+        {
+            if (renderCursorRow(&self.render_state)) |row|
+                self.mergeDamageRow(row) catch self.markFullDamage();
+        }
     }
 
     pub fn background(self: *const TerminalModel) Rgb {
@@ -252,6 +294,7 @@ pub const TerminalModel = struct {
     }
 
     pub fn startSelection(self: *TerminalModel, row: u32, column: u32) void {
+        const old_bounds = self.selectionBounds();
         const point: Cursor = .{
             .row = @min(row, self.rows() -| 1),
             .column = @min(column, self.columns() -| 1),
@@ -262,10 +305,12 @@ pub const TerminalModel = struct {
         };
         self.selection_anchor = point;
         self.selection_head = point;
+        self.mergeSelectionDamage(old_bounds, self.selectionBounds());
     }
 
     pub fn updateSelection(self: *TerminalModel, row: u32, column: u32) void {
         if (self.selection_anchor == null) return;
+        const old_bounds = self.selectionBounds();
         self.selection_head = .{
             .row = @min(row, self.rows() -| 1),
             .column = @min(column, self.columns() -| 1),
@@ -274,11 +319,14 @@ pub const TerminalModel = struct {
             .visible = false,
             .blinking = false,
         };
+        self.mergeSelectionDamage(old_bounds, self.selectionBounds());
     }
 
     pub fn clearSelection(self: *TerminalModel) void {
+        const old_bounds = self.selectionBounds();
         self.selection_anchor = null;
         self.selection_head = null;
+        self.mergeSelectionDamage(old_bounds, null);
     }
 
     pub fn selectionTextAlloc(
@@ -399,6 +447,53 @@ pub const TerminalModel = struct {
         return true;
     }
 
+    fn collectRenderDamage(
+        self: *TerminalModel,
+        old_cursor_row: ?u16,
+    ) !void {
+        switch (self.render_state.dirty) {
+            .false => {},
+            .partial => {
+                const dirty_rows = self.render_state.row_data.items(.dirty);
+                for (dirty_rows, 0..) |dirty, row| {
+                    if (dirty) try self.mergeDamageRow(@intCast(row));
+                }
+            },
+            .full => self.markFullDamage(),
+        }
+
+        const new_cursor_row = renderCursorRow(&self.render_state);
+        if (old_cursor_row != new_cursor_row) {
+            if (old_cursor_row) |row| try self.mergeDamageRow(row);
+            if (new_cursor_row) |row| try self.mergeDamageRow(row);
+        }
+
+        self.render_state.dirty = .false;
+        @memset(self.render_state.row_data.items(.dirty), false);
+    }
+
+    fn mergeDamageRow(self: *TerminalModel, row: u16) !void {
+        if (self.damage_full or row >= self.rows()) return;
+        for (self.damage_rows.items) |existing| {
+            if (existing == row) return;
+        }
+        try self.damage_rows.append(self.allocator, row);
+        if (self.damage_rows.items.len == self.rows()) self.markFullDamage();
+    }
+
+    fn mergeSelectionDamage(
+        self: *TerminalModel,
+        old_bounds: ?SelectionBounds,
+        new_bounds: ?SelectionBounds,
+    ) void {
+        for (0..self.rows()) |row| {
+            const old_range = selectionRangeForRow(old_bounds, @intCast(row), self.columns());
+            const new_range = selectionRangeForRow(new_bounds, @intCast(row), self.columns());
+            if (!std.meta.eql(old_range, new_range))
+                self.mergeDamageRow(@intCast(row)) catch self.markFullDamage();
+        }
+    }
+
     pub fn rowTextUtf8(
         self: *const TerminalModel,
         row: usize,
@@ -419,6 +514,28 @@ pub const TerminalModel = struct {
         return written;
     }
 };
+
+fn renderCursorRow(state: *const ghostty.RenderState) ?u16 {
+    const viewport = state.cursor.viewport orelse return null;
+    if (!state.cursor.visible or viewport.y >= state.rows) return null;
+    return viewport.y;
+}
+
+fn selectionRangeForRow(
+    bounds: ?TerminalModel.SelectionBounds,
+    row: u32,
+    columns: u16,
+) ?[2]u32 {
+    const selected = bounds orelse return null;
+    if (row < selected.start.row or row > selected.end.row) return null;
+    return .{
+        if (row == selected.start.row) selected.start.column else 0,
+        if (row == selected.end.row)
+            selected.end.column
+        else
+            columns -| 1,
+    };
+}
 
 fn rgb(color: ghostty.color.RGB) Rgb {
     return .{ .red = color.r, .green = color.g, .blue = color.b };
@@ -567,6 +684,104 @@ test "multi-chunk write refreshes render state once" {
         refresh_count + 1,
         model.render_refresh_count,
     );
+}
+
+test "one-line terminal update reports only that row" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    model.acknowledgeDamage();
+
+    try model.write("hello");
+
+    const rows = switch (model.damage()) {
+        .partial => |rows| rows,
+        else => return error.ExpectedPartialDamage,
+    };
+    try std.testing.expectEqualSlices(u16, &.{0}, rows);
+}
+
+test "palette change reports full damage" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    model.acknowledgeDamage();
+
+    try model.write("\x1b]4;1;#010203\x07");
+
+    try std.testing.expect(model.damage() == .full);
+}
+
+test "cursor movement damages old and new rows" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    model.acknowledgeDamage();
+
+    try model.write("\x1b[2;1H");
+
+    const rows = switch (model.damage()) {
+        .partial => |rows| rows,
+        else => return error.ExpectedPartialDamage,
+    };
+    try std.testing.expectEqualSlices(u16, &.{ 0, 1 }, rows);
+}
+
+test "cursor blinking damages only the cursor row" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    model.acknowledgeDamage();
+    model.render_state.cursor.blinking = true;
+    model.render_state.cursor.viewport = .{
+        .x = 3,
+        .y = 2,
+        .wide_tail = false,
+    };
+
+    model.toggleCursorBlink();
+
+    const rows = switch (model.damage()) {
+        .partial => |rows| rows,
+        else => return error.ExpectedPartialDamage,
+    };
+    try std.testing.expectEqualSlices(u16, &.{2}, rows);
+}
+
+test "selection changes damage only affected rows" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 5, 20);
+    defer model.deinit();
+    model.acknowledgeDamage();
+
+    model.startSelection(1, 3);
+    var rows = switch (model.damage()) {
+        .partial => |rows| rows,
+        else => return error.ExpectedPartialDamage,
+    };
+    try std.testing.expectEqualSlices(u16, &.{1}, rows);
+    model.acknowledgeDamage();
+
+    model.updateSelection(2, 4);
+    rows = switch (model.damage()) {
+        .partial => |dirty_rows| dirty_rows,
+        else => return error.ExpectedPartialDamage,
+    };
+    try std.testing.expectEqualSlices(u16, &.{ 1, 2 }, rows);
+}
+
+test "damage remains pending until acknowledged" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    model.acknowledgeDamage();
+
+    try model.write("x");
+    try model.refresh();
+    try std.testing.expect(model.damage() == .partial);
+
+    model.acknowledgeDamage();
+    try std.testing.expect(model.damage() == .none);
 }
 
 test "row text reports insufficient output space" {

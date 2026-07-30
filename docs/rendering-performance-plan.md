@@ -86,6 +86,14 @@ resources, and presentation.
 
 ## Phase 2: Expose and consume Ghostty damage
 
+**Status:** In progress. Ghostty full/partial damage is now copied into an
+application-owned, coalescing row-damage queue. Cursor movement and blinking,
+selection changes, resize, DPI changes, and global terminal visual changes feed
+the same queue. The Win32 path invalidates damaged row bands and acknowledges
+damage only after a successful paint. The transient GDI frame builder still
+scans the complete grid during paint; removing that remaining whole-grid work
+requires Phase 3's retained row cache.
+
 ### Changes
 
 - Add a small application-facing damage type in `terminal.zig`:

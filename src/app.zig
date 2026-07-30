@@ -256,6 +256,7 @@ fn windowProc(
         },
         wm.WM_DPICHANGED => {
             terminal_metrics = .forDpi(@truncate(wparam));
+            model.markFullDamage();
             const suggested: *const foundation.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
             _ = user32.SetWindowPos(
                 window,
@@ -269,12 +270,13 @@ fn windowProc(
             resizeForClient(window) catch {
                 std.log.err("failed to resize terminal after DPI change", .{});
             };
+            invalidateRenderDamage(window);
             return 0;
         },
         wm.WM_TIMER => {
             if (wparam == 1) {
                 model.toggleCursorBlink();
-                _ = user32.InvalidateRect(window, null, 0);
+                invalidateRenderDamage(window);
             }
             return 0;
         },
@@ -432,14 +434,12 @@ fn handleMouseMessage(
         switch (message) {
             wm.WM_LBUTTONDOWN => {
                 const clamped_cell = clampSelectionCell(cell);
-                if (selection_anchor != null and selection_head != null)
-                    invalidateSelectionRange(window, selection_anchor.?, selection_head.?);
                 model.startSelection(clamped_cell.row, clamped_cell.column);
                 selection_anchor = clamped_cell;
                 selection_head = clamped_cell;
                 selection_dragging = true;
                 _ = user32.SetCapture(window);
-                invalidateSelectionRange(window, clamped_cell, clamped_cell);
+                invalidateRenderDamage(window);
             },
             wm.WM_MOUSEMOVE => if (selection_dragging) {
                 const clamped_cell = clampSelectionCell(cell);
@@ -447,7 +447,7 @@ fn handleMouseMessage(
                 if (sameCell(previous, clamped_cell)) return;
                 model.updateSelection(clamped_cell.row, clamped_cell.column);
                 selection_head = clamped_cell;
-                invalidateSelectionRange(window, previous, clamped_cell);
+                invalidateRenderDamage(window);
             },
             wm.WM_LBUTTONUP => if (selection_dragging) {
                 const clamped_cell = clampSelectionCell(cell);
@@ -455,7 +455,7 @@ fn handleMouseMessage(
                 if (!sameCell(previous, clamped_cell)) {
                     model.updateSelection(clamped_cell.row, clamped_cell.column);
                     selection_head = clamped_cell;
-                    invalidateSelectionRange(window, previous, clamped_cell);
+                    invalidateRenderDamage(window);
                 }
                 selection_dragging = false;
                 _ = user32.ReleaseCapture();
@@ -546,33 +546,24 @@ fn sameCell(left: terminal.Cursor, right: terminal.Cursor) bool {
     return left.row == right.row and left.column == right.column;
 }
 
-fn invalidateSelectionRange(
-    window: foundation.HWND,
-    first: terminal.Cursor,
-    second: terminal.Cursor,
-) void {
-    const start, const end = if (first.row < second.row or
-        (first.row == second.row and first.column <= second.column))
-        .{ first, second }
-    else
-        .{ second, first };
-    const cell_width: i32 = @intCast(terminal_metrics.cell_width);
-    const cell_height: i32 = @intCast(terminal_metrics.cell_height);
-    const margin_x: i32 = @intCast(terminal_metrics.margin_x);
-    const margin_y: i32 = @intCast(terminal_metrics.margin_y);
-    const last_column: u32 = model.columns() -| 1;
-
-    var row = start.row;
-    while (row <= end.row) : (row += 1) {
-        const first_column = if (row == start.row) start.column else 0;
-        const final_column = if (row == end.row) end.column else last_column;
-        const dirty: foundation.RECT = .{
-            .left = margin_x + @as(i32, @intCast(first_column)) * cell_width,
-            .top = margin_y + @as(i32, @intCast(row)) * cell_height,
-            .right = margin_x + @as(i32, @intCast(final_column + 1)) * cell_width,
-            .bottom = margin_y + @as(i32, @intCast(row + 1)) * cell_height,
-        };
-        _ = user32.InvalidateRect(window, &dirty, 0);
+fn invalidateRenderDamage(window: foundation.HWND) void {
+    switch (model.damage()) {
+        .none => {},
+        .full => _ = user32.InvalidateRect(window, null, 0),
+        .partial => |rows| for (rows) |row| {
+            const cell_width: i32 = @intCast(terminal_metrics.cell_width);
+            const cell_height: i32 = @intCast(terminal_metrics.cell_height);
+            const margin_x: i32 = @intCast(terminal_metrics.margin_x);
+            const margin_y: i32 = @intCast(terminal_metrics.margin_y);
+            const dirty: foundation.RECT = .{
+                .left = margin_x,
+                .top = margin_y + @as(i32, @intCast(row)) * cell_height,
+                .right = margin_x +
+                    @as(i32, @intCast(model.columns())) * cell_width,
+                .bottom = margin_y + @as(i32, @intCast(row + 1)) * cell_height,
+            };
+            _ = user32.InvalidateRect(window, &dirty, 0);
+        },
     }
 }
 
@@ -783,7 +774,7 @@ fn paint(window: foundation.HWND) bool {
 
     const width = paint_state.rcPaint.right - paint_state.rcPaint.left;
     const height = paint_state.rcPaint.bottom - paint_state.rcPaint.top;
-    return gdi32.BitBlt(
+    const copied = gdi32.BitBlt(
         dc,
         paint_state.rcPaint.left,
         paint_state.rcPaint.top,
@@ -794,6 +785,8 @@ fn paint(window: foundation.HWND) bool {
         paint_state.rcPaint.top,
         gdi.SRCCOPY,
     ) != 0;
+    if (copied) model.acknowledgeDamage();
+    return copied;
 }
 
 fn ensureBackBuffer(dc: gdi.HDC, width: i32, height: i32) ?*BackBuffer {
@@ -861,7 +854,7 @@ fn resizeForClient(window: foundation.HWND) !void {
     ) catch {};
 
     if (session) |active_session| _ = try active_session.resize(dimensions);
-    _ = user32.InvalidateRect(window, null, 0);
+    invalidateRenderDamage(window);
 }
 
 fn toColorRef(color: terminal.Rgb) win32.zig.COLORREF {
@@ -884,7 +877,7 @@ fn handleConptyOutput(window: foundation.HWND) void {
     }
 
     applyTerminalEffects(window);
-    if (changed) _ = user32.InvalidateRect(window, null, 0);
+    if (changed) invalidateRenderDamage(window);
 
     if (active_mode == .integration_resize and
         !integration_resize_requested and
