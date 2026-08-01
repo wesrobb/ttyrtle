@@ -79,9 +79,9 @@ same-window tab work.
 - [x] Implement wrapping `Ctrl+Tab` / `Ctrl+Shift+Tab` and `Alt+1`–`Alt+9`.
 - [x] Preserve ordinary `Ctrl+W` for the hosted terminal.
 - [x] Middle-click closes the hit-tested tab and restores terminal focus.
-- [ ] Consume both press/release messages for handled shortcuts and suppress
+- [x] Consume both press/release messages for handled shortcuts and suppress
   matching `WM_CHAR` messages so shortcut input cannot reach ConPTY.
-- [ ] Prevent held-key repeats for create/close while allowing repeat cycling.
+- [x] Prevent held-key repeats for create/close while allowing repeat cycling.
 - [ ] Right-click: select the hit tab and show a native `New Tab`, `Rename`,
   `Close` popup; support keyboard invocation anchored to the active tab.
 - [ ] Left-button drag: record a stable-ID candidate, begin after the system

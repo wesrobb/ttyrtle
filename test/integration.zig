@@ -20,6 +20,10 @@ test "native tab control mirrors the active workspace tab" {
     try app.run(.smoke_tabs);
 }
 
+test "tab shortcuts consume matching key release and character messages" {
+    try app.run(.smoke_shortcuts);
+}
+
 test "finite ConPTY child output reaches the terminal model" {
     try app.run(.integration);
 }

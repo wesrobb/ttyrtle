@@ -36,6 +36,7 @@ pub const Mode = enum {
     smoke_gdi,
     smoke_phase5,
     smoke_tabs,
+    smoke_shortcuts,
     integration,
     integration_input,
     integration_resize,
@@ -54,6 +55,8 @@ var integration_succeeded = false;
 var integration_resize_requested = false;
 var integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 };
 var input_translator: input.Translator = .{};
+var shortcut_state: ShortcutState = .{};
+var test_modifiers: ?input.Mods = null;
 var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
 var selection_dragging = false;
 var selection_anchor: ?terminal.Cursor = null;
@@ -91,6 +94,8 @@ pub fn run(mode: Mode) !void {
     integration_resize_target = .{ .columns = 1, .rows = 1 };
     tab_control = null;
     input_translator = .{};
+    shortcut_state = .{};
+    test_modifiers = null;
     terminal_metrics = .forDpi(geometry.base_dpi);
     selection_dragging = false;
     selection_anchor = null;
@@ -186,6 +191,7 @@ pub fn run(mode: Mode) !void {
     terminal_metrics = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
     try resizeForClient(window);
     if (mode == .smoke_tabs) try verifyNativeTabControl(window);
+    if (mode == .smoke_shortcuts) try verifyShortcutDispatch(window);
 
     var integration_resize_command: ?[]u8 = null;
     defer if (integration_resize_command) |command| allocator.free(command);
@@ -613,6 +619,40 @@ fn verifyNativeTabControl(window: foundation.HWND) !void {
         return error.RuntimeTabCloseDidNotRemoveWorkspaceTab;
 }
 
+fn verifyShortcutDispatch(window: foundation.HWND) !void {
+    const count_before = workspace_state.tabs.items.len;
+    test_modifiers = .{ .ctrl = true, .shift = true };
+    defer test_modifiers = null;
+
+    _ = user32.SendMessageW(window, wm.WM_KEYDOWN, 'T', 1);
+    _ = user32.SendMessageW(window, wm.WM_CHAR, 't', 1);
+    _ = user32.SendMessageW(window, wm.WM_KEYDOWN, 'T', (@as(isize, 1) << 30) | 1);
+    _ = user32.SendMessageW(window, wm.WM_CHAR, 't', 1);
+    _ = user32.SendMessageW(window, wm.WM_KEYUP, 'T', @as(isize, 1) << 31);
+    if (workspace_state.tabs.items.len != count_before + 1)
+        return error.ShortcutCreateRepeatWasNotSuppressed;
+    if (shortcut_state.pending_characters != 0)
+        return error.ShortcutCharacterWasNotSuppressed;
+
+    const first_id = workspace_state.tabs.items[0].id;
+    const created_id = workspace_state.active_tab_id orelse return error.ShortcutCreateDidNotActivateTab;
+    test_modifiers = .{ .ctrl = true };
+    _ = user32.SendMessageW(window, wm.WM_KEYDOWN, 0x09, 1);
+    if (workspace_state.active_tab_id != first_id)
+        return error.ShortcutCycleDidNotAdvance;
+    _ = user32.SendMessageW(window, wm.WM_KEYDOWN, 0x09, (@as(isize, 1) << 30) | 1);
+    if (workspace_state.active_tab_id != created_id)
+        return error.ShortcutCycleDidNotRepeat;
+    _ = user32.SendMessageW(window, wm.WM_KEYUP, 0x09, @as(isize, 1) << 31);
+
+    test_modifiers = .{ .ctrl = true, .shift = true };
+    _ = user32.SendMessageW(window, wm.WM_KEYDOWN, 'W', 1);
+    _ = user32.SendMessageW(window, wm.WM_CHAR, 'w', 1);
+    _ = user32.SendMessageW(window, wm.WM_KEYUP, 'W', @as(isize, 1) << 31);
+    if (workspace_state.tabs.items.len != count_before)
+        return error.ShortcutCloseDidNotSynchronizeTabs;
+}
+
 fn windowProc(
     window: foundation.HWND,
     message: u32,
@@ -691,11 +731,11 @@ fn windowProc(
             return 0;
         },
         wm.WM_KEYDOWN, wm.WM_SYSKEYDOWN, wm.WM_KEYUP, wm.WM_SYSKEYUP => {
-            handleKeyMessage(message, wparam, lparam);
+            _ = handleKeyMessage(message, wparam, lparam);
             return 0;
         },
         wm.WM_CHAR, wm.WM_SYSCHAR => {
-            handleCharacterMessage(@truncate(wparam));
+            if (!shortcut_state.consumeCharacter()) handleCharacterMessage(@truncate(wparam));
             return 0;
         },
         wm.WM_DEADCHAR, wm.WM_SYSDEADCHAR => {
@@ -741,65 +781,174 @@ fn windowProc(
     }
 }
 
-fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
+const Shortcut = enum {
+    suppress,
+    new_tab,
+    close_tab,
+    cycle_forward,
+    cycle_backward,
+    select_tab,
+    paste,
+    copy,
+};
+
+const ShortcutState = struct {
+    held: std.EnumSet(Shortcut) = .{},
+    pending_characters: u8 = 0,
+
+    fn handleKey(
+        self: *ShortcutState,
+        message: u32,
+        virtual_key: usize,
+        repeated: bool,
+        mods: input.Mods,
+    ) ?Shortcut {
+        const is_down = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN;
+        const is_up = message == wm.WM_KEYUP or message == wm.WM_SYSKEYUP;
+        if (!is_down and !is_up) return null;
+
+        if (is_up) {
+            for (std.enums.values(Shortcut)) |shortcut| {
+                if (self.held.contains(shortcut) and shortcutVirtualKey(shortcut, virtual_key)) {
+                    self.held.remove(shortcut);
+                    return shortcut;
+                }
+            }
+            return null;
+        }
+
+        const shortcut = shortcutForKey(virtual_key, mods) orelse return null;
+        self.held.insert(shortcut);
+        // TranslateMessage can generate a WM_CHAR or WM_SYSCHAR even though
+        // this command was handled by the application. Keep it out of ConPTY.
+        if (shortcut != .cycle_forward and shortcut != .cycle_backward)
+            self.pending_characters +|= 1;
+        if (repeated and shortcut != .cycle_forward and shortcut != .cycle_backward)
+            return .suppress;
+        return shortcut;
+    }
+
+    fn consumeCharacter(self: *ShortcutState) bool {
+        if (self.pending_characters == 0) return false;
+        self.pending_characters -= 1;
+        return true;
+    }
+};
+
+fn shortcutForKey(virtual_key: usize, mods: input.Mods) ?Shortcut {
+    if (mods.ctrl and mods.shift) return switch (virtual_key) {
+        'T' => .new_tab,
+        'W' => .close_tab,
+        'V' => .paste,
+        'C' => .copy,
+        else => null,
+    };
+    if (mods.ctrl and virtual_key == 0x09)
+        return if (mods.shift) .cycle_backward else .cycle_forward;
+    if (mods.alt and virtual_key >= '1' and virtual_key <= '9') return .select_tab;
+    return null;
+}
+
+fn shortcutVirtualKey(shortcut: Shortcut, virtual_key: usize) bool {
+    return switch (shortcut) {
+        .suppress => false,
+        .new_tab => virtual_key == 'T',
+        .close_tab => virtual_key == 'W',
+        .cycle_forward, .cycle_backward => virtual_key == 0x09,
+        .select_tab => virtual_key >= '1' and virtual_key <= '9',
+        .paste => virtual_key == 'V',
+        .copy => virtual_key == 'C',
+    };
+}
+
+test "shortcut dispatch consumes press release and generated character" {
+    var state: ShortcutState = .{};
+    const mods: input.Mods = .{ .ctrl = true, .shift = true };
+    try std.testing.expectEqual(
+        Shortcut.new_tab,
+        state.handleKey(wm.WM_KEYDOWN, 'T', false, mods).?,
+    );
+    try std.testing.expect(state.consumeCharacter());
+    try std.testing.expect(!state.consumeCharacter());
+    try std.testing.expectEqual(
+        Shortcut.new_tab,
+        state.handleKey(wm.WM_KEYUP, 'T', false, .{}).?,
+    );
+}
+
+test "create and close shortcuts suppress repeats while tab cycling repeats" {
+    var state: ShortcutState = .{};
+    const tab_mods: input.Mods = .{ .ctrl = true, .shift = true };
+    try std.testing.expectEqual(
+        Shortcut.close_tab,
+        state.handleKey(wm.WM_KEYDOWN, 'W', false, tab_mods).?,
+    );
+    try std.testing.expectEqual(
+        Shortcut.suppress,
+        state.handleKey(wm.WM_KEYDOWN, 'W', true, tab_mods).?,
+    );
+    try std.testing.expect(state.consumeCharacter());
+    try std.testing.expect(state.consumeCharacter());
+
+    const cycle_mods: input.Mods = .{ .ctrl = true };
+    try std.testing.expectEqual(
+        Shortcut.cycle_forward,
+        state.handleKey(wm.WM_KEYDOWN, 0x09, false, cycle_mods).?,
+    );
+    try std.testing.expectEqual(
+        Shortcut.cycle_forward,
+        state.handleKey(wm.WM_KEYDOWN, 0x09, true, cycle_mods).?,
+    );
+}
+
+fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) bool {
     const is_down = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN;
     const bits: usize = @bitCast(lparam);
     const repeated = (bits & (@as(usize, 1) << 30)) != 0;
-    if (is_down and currentModifiers().ctrl and currentModifiers().shift) {
-        switch (wparam) {
-            'T' => {
-                if (!repeated) createTerminalTab(app_window orelse return) catch |err| std.log.err("failed to create terminal tab: {}", .{err});
-                return;
-            },
-            'W' => {
-                if (!repeated) if (workspace_state.active_tab_id) |id| closeTerminalTab(app_window orelse return, id);
-                return;
-            },
-            else => {},
-        }
+    const modifiers = currentModifiers();
+    if (shortcut_state.handleKey(message, wparam, repeated, modifiers)) |shortcut| switch (shortcut) {
+        .suppress => {},
+        .new_tab => if (is_down) {
+            const window = app_window orelse return true;
+            createTerminalTab(window) catch |err| std.log.err("failed to create terminal tab: {}", .{err});
+        },
+        .close_tab => if (is_down) if (workspace_state.active_tab_id) |id| {
+            closeTerminalTab(app_window orelse return true, id);
+        },
+        .cycle_forward, .cycle_backward => {
+            if (!is_down) return true;
+            const current = workspace_state.indexOfTab(workspace_state.active_tab_id orelse return true) orelse return true;
+            const count = workspace_state.tabs.items.len;
+            const next = if (shortcut == .cycle_backward) (current + count - 1) % count else (current + 1) % count;
+            activateTab(app_window orelse return true, workspace_state.tabs.items[next].id) catch {};
+        },
+        .select_tab => {
+            if (!is_down) return true;
+            const index: usize = @intCast(wparam - '1');
+            if (index < workspace_state.tabs.items.len) activateTab(app_window orelse return true, workspace_state.tabs.items[index].id) catch {};
+        },
+        .paste => if (is_down) pasteClipboard(null),
+        .copy => if (is_down) copySelection(null),
+    } else {
+        if (isSmokeMode(active_mode) or activeProcess() == null) return false;
+        const action: input.Action = if (!is_down)
+            .release
+        else if (repeated)
+            .repeat
+        else
+            .press;
+        const event = input_translator.keyEvent(
+            @truncate(wparam),
+            @truncate((bits >> 16) & 0xff),
+            action,
+            modifiers,
+            (bits & (@as(usize, 1) << 24)) != 0,
+            @truncate(bits & 0xffff),
+        ) orelse return false;
+        encodeAndQueueInput(event);
+        return false;
     }
-    if (is_down and currentModifiers().ctrl and (wparam == 0x09)) {
-        const current = workspace_state.indexOfTab(workspace_state.active_tab_id orelse return) orelse return;
-        const count = workspace_state.tabs.items.len;
-        const next = if (currentModifiers().shift) (current + count - 1) % count else (current + 1) % count;
-        activateTab(app_window orelse return, workspace_state.tabs.items[next].id) catch {};
-        return;
-    }
-    if (is_down and currentModifiers().alt and wparam >= '1' and wparam <= '9') {
-        const index: usize = @intCast(wparam - '1');
-        if (index < workspace_state.tabs.items.len) activateTab(app_window orelse return, workspace_state.tabs.items[index].id) catch {};
-        return;
-    }
-    if (isSmokeMode(active_mode) or activeProcess() == null) return;
-
-    if (is_down and currentModifiers().ctrl and currentModifiers().shift) {
-        switch (wparam) {
-            'V' => {
-                pasteClipboard(null);
-                return;
-            },
-            'C' => {
-                copySelection(null);
-                return;
-            },
-            else => {},
-        }
-    }
-    const action: input.Action = if (!is_down)
-        .release
-    else if ((bits & (@as(usize, 1) << 30)) != 0)
-        .repeat
-    else
-        .press;
-    const event = input_translator.keyEvent(
-        @truncate(wparam),
-        @truncate((bits >> 16) & 0xff),
-        action,
-        currentModifiers(),
-        (bits & (@as(usize, 1) << 24)) != 0,
-        @truncate(bits & 0xffff),
-    ) orelse return;
-    encodeAndQueueInput(event);
+    return true;
 }
 
 const MouseButton = input.MouseButton;
@@ -1095,6 +1244,7 @@ fn activeProcess() ?*conpty.Session {
 }
 
 fn currentModifiers() input.Mods {
+    if (test_modifiers) |mods| return mods;
     return .{
         .shift = keyIsDown(0x10),
         .ctrl = keyIsDown(0x11),
@@ -1549,7 +1699,8 @@ fn isSmokeMode(mode: Mode) bool {
     return mode == .smoke or
         mode == .smoke_gdi or
         mode == .smoke_phase5 or
-        mode == .smoke_tabs;
+        mode == .smoke_tabs or
+        mode == .smoke_shortcuts;
 }
 
 fn isIntegrationMode(mode: Mode) bool {
