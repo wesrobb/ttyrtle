@@ -52,6 +52,10 @@ test "inactive ConPTY sessions retain output, OSC tab labels, and asynchronous c
     try app.run(.integration_multi_session);
 }
 
-test "host close drains and tears down busy ConPTY sessions repeatedly" {
-    for (0..3) |_| try app.run(.integration_host_close);
+test "resize and DPI changes update every attached ConPTY session" {
+    try app.run(.integration_multi_resize);
+}
+
+test "repeated host close drains and tears down busy sessions without stale notifications" {
+    for (0..5) |_| try app.run(.integration_host_close);
 }

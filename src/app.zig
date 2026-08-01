@@ -51,6 +51,7 @@ pub const Mode = enum {
     integration_input,
     integration_resize,
     integration_multi_session,
+    integration_multi_resize,
     integration_host_close,
 };
 
@@ -271,7 +272,7 @@ pub fn run(mode: Mode) !void {
                 .integration => integration_command,
                 .integration_input => integration_input_command,
                 .integration_resize => integration_resize_command.?,
-                .integration_multi_session => integration_multi_first_command,
+                .integration_multi_session, .integration_multi_resize => integration_multi_first_command,
                 .integration_host_close => integration_host_close_command,
                 else => null,
             },
@@ -288,11 +289,15 @@ pub fn run(mode: Mode) !void {
             .write = queueTerminalReply,
         });
         if (mode == .integration_input) try queueIntegrationInput();
-        if (mode == .integration_multi_session) {
+        if (isMultiSessionIntegrationMode(mode)) {
             integration_multi_session.first = workspace_state.activeSession().?.id;
             try createIntegrationTerminalTab(window, integration_multi_second_command);
             integration_multi_session.second = workspace_state.activeSession().?.id;
+            if (mode == .integration_multi_resize)
+                try verifyMultiSessionResizeAndDpi(window);
         }
+        if (mode == .integration_host_close)
+            try exerciseStaleSessionNotifications(window);
     }
 
     _ = user32.ShowWindow(
@@ -1266,7 +1271,7 @@ fn windowProc(
                     _ = process.beginClosing();
                     if (process.childExitCode()) |code|
                         std.log.info("ConPTY child exited with code {d}", .{code});
-                    if (active_mode == .integration_multi_session) {
+                    if (isMultiSessionIntegrationMode(active_mode)) {
                         _ = session.noteChildExit();
                         finishMultiSessionIntegration(window);
                         return 0;
@@ -1942,7 +1947,7 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
         }
     }
 
-    if (active_mode == .integration_multi_session and batch.finished) {
+    if (isMultiSessionIntegrationMode(active_mode) and batch.finished) {
         if (batch.failure != null) integration_multi_session.failed = true;
         _ = session.noteOutputFinished();
         finishMultiSessionIntegration(window);
@@ -2305,9 +2310,93 @@ fn isIntegrationMode(mode: Mode) bool {
         .integration_input,
         .integration_resize,
         .integration_multi_session,
+        .integration_multi_resize,
         => true,
         else => false,
     };
+}
+
+fn isMultiSessionIntegrationMode(mode: Mode) bool {
+    return mode == .integration_multi_session or mode == .integration_multi_resize;
+}
+
+fn verifyMultiSessionResizeAndDpi(window: foundation.HWND) !void {
+    if (workspace_state.tabs.items.len != 2)
+        return error.MultiSessionResizeTabCountMismatch;
+
+    var outer: foundation.RECT = undefined;
+    if (user32.GetWindowRect(window, &outer) == 0)
+        return error.GetWindowRectFailed;
+    if (user32.SetWindowPos(
+        window,
+        null,
+        0,
+        0,
+        outer.right - outer.left + 173,
+        outer.bottom - outer.top + 91,
+        .{ .NOMOVE = 1, .NOZORDER = 1, .NOACTIVATE = 1 },
+    ) == 0) return error.SetWindowPosFailed;
+    try expectAllSessionDimensions(window);
+
+    if (user32.GetWindowRect(window, &outer) == 0)
+        return error.GetWindowRectFailed;
+    const target_dpi: u16 = if (user32.GetDpiForWindow(window) == 144) 96 else 144;
+    const suggested: foundation.RECT = .{
+        .left = outer.left,
+        .top = outer.top,
+        .right = outer.right,
+        .bottom = outer.bottom,
+    };
+    _ = user32.SendMessageW(
+        window,
+        wm.WM_DPICHANGED,
+        @as(usize, target_dpi) | (@as(usize, target_dpi) << 16),
+        @bitCast(@intFromPtr(&suggested)),
+    );
+    try expectAllSessionDimensions(window);
+}
+
+fn exerciseStaleSessionNotifications(window: foundation.HWND) !void {
+    const stale_session = workspace_state.activeSession() orelse
+        return error.StaleNotificationMissingSession;
+    const stale_tab = workspace_state.tabForSession(stale_session.id) orelse
+        return error.StaleNotificationMissingTab;
+    const stale_session_id = stale_session.id;
+    const stale_tab_id = stale_tab.id;
+    try createIntegrationTerminalTab(window, integration_host_close_command);
+    closeTerminalTab(window, stale_tab_id);
+    if (workspace_state.session(stale_session_id) != null)
+        return error.StaleNotificationSessionWasNotRemoved;
+
+    inline for ([_]u32{
+        conpty.output_message,
+        conpty.child_exit_message,
+        conpty.input_failure_message,
+    }) |message| {
+        _ = user32.SendMessageW(window, message, @intFromEnum(stale_session_id), 0);
+    }
+    if (workspace_state.tabs.items.len != 1)
+        return error.StaleNotificationChangedWorkspace;
+}
+
+fn expectAllSessionDimensions(window: foundation.HWND) !void {
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(window, &client) == 0)
+        return error.GetClientRectFailed;
+    const expected = terminal_metrics.dimensions(
+        client.right - client.left,
+        client.bottom - client.top,
+    ) orelse return error.MultiSessionResizeDimensionsUnavailable;
+
+    for (workspace_state.tabs.items) |*tab| {
+        const session = tab.root.terminalSession();
+        if (session.model.columns() != expected.columns or session.model.rows() != expected.rows)
+            return error.MultiSessionModelResizeMismatch;
+        const process = session.processAs(conpty.Session) orelse
+            return error.MultiSessionProcessMissing;
+        if (!std.meta.eql(process.dimensions, expected))
+            return error.MultiSessionConptyResizeMismatch;
+    }
 }
 
 fn requestIntegrationResize(window: foundation.HWND) !void {
