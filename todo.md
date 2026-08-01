@@ -16,15 +16,23 @@
     terminal-model, and ConPTY ownership while retaining one window and one tab.
   - [x] Add a native Win32 tab control synchronized from stable workspace tab
     identities and reserve its strip within the terminal's existing top margin.
+  - [x] Route ConPTY output, exit, and input-failure notifications by stable
+    session ID, including output from inactive tabs.
+  - [x] Resize every terminal model and attached ConPTY session together.
 - [ ] Support multiple top-level windows and moving tabs between windows,
   preserving their pane layouts and running terminal sessions.
 
 ## User-facing features
 
-- [ ] Add tabs following the [tab architecture](docs/architecture/tabs.md):
-  support creating, closing, switching, reordering, and naming tabs, with each
-  tab owning its pane layout and displaying useful process or
-  working-directory status.
+- [ ] Complete tabs following the [tab architecture](docs/architecture/tabs.md).
+  - [x] Create, close, and switch same-window tabs with independent terminal
+    models and ConPTY sessions (`Ctrl+Shift+T`, `Ctrl+Shift+W`, Ctrl+Tab, and
+    Alt+number shortcuts).
+  - [x] Keep inactive tabs processing output, update their OSC labels, and
+    safely drain final output before automatic close.
+  - [x] Support middle-click close and keep terminal focus after tab actions.
+  - [ ] Add inline naming, drag reordering, context-menu commands, and useful
+    process or working-directory status.
 - [ ] Add panes: support horizontal and vertical splits, focus movement,
   resizing, closing, and a clear ownership model for the terminal sessions in
   each pane. Define how pane layouts interact with tabs.

@@ -11,9 +11,11 @@ provides standard tab sizing, overflow, hit testing, keyboard behavior,
 tooltips, and an accessibility baseline. It does not own terminal sessions or
 determine their lifetime.
 
-Start with the standard native appearance. Add subclassing and owner drawing
-only when required for close buttons, pin or activity indicators, drag
-reordering, and application themes. Notepad++ follows this general hybrid
+Start with the standard native appearance. The control is currently subclassed
+only to handle middle-click close and restore terminal focus; it otherwise
+retains native painting, selection, overflow, and accessibility behavior. Add
+owner drawing only when required for close buttons, pin or activity indicators,
+drag reordering, and application themes. Notepad++ follows this general hybrid
 approach: its `TabBarPlus` extends an owner-drawn, subclassed
 `WC_TABCONTROL` rather than replacing the control.
 
@@ -127,17 +129,18 @@ standard control.
 
 ## Implementation sequence
 
-1. Refactor the current singleton state into explicit `WindowState`,
-   `Workspace`, `Tab`, and `TerminalSession` ownership while retaining one
-   window and one tab.
-2. Add the standard `WC_TABCONTROL` child window and synchronize it with the
+1. [x] Introduce explicit `Workspace`, `Tab`, and `TerminalSession` ownership
+   while retaining one top-level window.
+2. [x] Add the standard `WC_TABCONTROL` child window and synchronize it with the
    single-tab model.
-3. Implement tab creation, closing, switching, naming, and status updates.
-4. Add reordering, then cross-window transfer after multiple top-level windows
+3. [ ] Implement tab creation, closing, switching, naming, and status updates.
+   Creation, closing, switching, background output, OSC labels, and
+   middle-click close are complete. Inline naming and richer status remain.
+4. [ ] Add reordering, then cross-window transfer after multiple top-level windows
    exist.
-5. Introduce owner drawing or subclass-specific behavior only for features that
+5. [ ] Introduce owner drawing or subclass-specific behavior only for features that
    the standard control cannot express adequately.
-6. Add pane splits beneath `Tab.root` without changing the tab-control
+6. [ ] Add pane splits beneath `Tab.root` without changing the tab-control
    integration.
 
 Unit tests should cover workspace operations without Win32. Hidden-window
