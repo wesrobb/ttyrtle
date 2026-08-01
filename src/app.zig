@@ -561,34 +561,39 @@ fn updateWindowCaption(window: foundation.HWND) void {
     _ = user32.SetWindowTextW(window, wide);
 }
 
+const ConptyTabSetup = struct {
+    window: foundation.HWND,
+    dimensions: geometry.Dimensions,
+};
+
+fn startConptyTab(session: *workspace.TerminalSession, setup: *const ConptyTabSetup) !void {
+    const process = try conpty.Session.create(
+        std.heap.smp_allocator,
+        setup.window,
+        @intFromEnum(session.id),
+        setup.dimensions,
+        null,
+    );
+    errdefer process.destroy();
+    try session.attachProcess(.{ .context = process, .destroy = destroyConptyProcess });
+    session.model.setReplySink(.{ .context = process, .write = queueTerminalReply });
+}
+
 fn createTerminalTab(window: foundation.HWND) !void {
     var client: foundation.RECT = undefined;
     if (user32.GetClientRect(window, &client) == 0) return error.GetClientRectFailed;
     const dimensions: geometry.Dimensions = terminal_metrics.dimensions(client.right - client.left, client.bottom - client.top) orelse
         .{ .columns = 80, .rows = 24 };
-    const previous = workspace_state.active_tab_id;
-    const id = try workspace_state.createTab(dimensions.rows, dimensions.columns);
-    const session = workspace_state.session(workspace_state.tab(id).?.root.terminalSession().id).?;
-    if (!isSmokeMode(active_mode)) {
-        const process = conpty.Session.create(
-            std.heap.smp_allocator,
-            window,
-            @intFromEnum(session.id),
-            dimensions,
-            null,
-        ) catch |err| {
-            _ = workspace_state.closeTab(id);
-            workspace_state.active_tab_id = previous;
-            return err;
-        };
-        session.attachProcess(.{ .context = process, .destroy = destroyConptyProcess }) catch |err| {
-            process.destroy();
-            _ = workspace_state.closeTab(id);
-            workspace_state.active_tab_id = previous;
-            return err;
-        };
-        session.model.setReplySink(.{ .context = process, .write = queueTerminalReply });
-    }
+    var setup: ConptyTabSetup = .{ .window = window, .dimensions = dimensions };
+    const id = if (isSmokeMode(active_mode))
+        try workspace_state.createTab(dimensions.rows, dimensions.columns)
+    else
+        try workspace_state.createTabWithSetup(
+            dimensions.rows,
+            dimensions.columns,
+            &setup,
+            startConptyTab,
+        );
     try syncNativeTabs();
     try activateTab(window, id);
     updateWindowCaption(window);
@@ -911,7 +916,8 @@ fn windowProc(
                     _ = process.beginClosing();
                     if (process.childExitCode()) |code|
                         std.log.info("ConPTY child exited with code {d}", .{code});
-                    if (session.output_finished) closeTerminalTab(window, workspace_state.tabForSession(session.id).?.id);
+                    if (session.noteChildExit())
+                        closeTerminalTab(window, workspace_state.tabForSession(session.id).?.id);
                 }
             }
             return 0;
@@ -1584,8 +1590,7 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
             terminalContains(marker);
         _ = user32.DestroyWindow(window);
     } else if (batch.finished) {
-        session.output_finished = true;
-        if (process.childExitCode() != null)
+        if (session.noteOutputFinished())
             closeTerminalTab(window, workspace_state.tabForSession(session.id).?.id);
     }
 }

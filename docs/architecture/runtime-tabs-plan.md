@@ -98,8 +98,8 @@ same-window tab work.
 - [x] Verify reordering preserves model/session identity and completion state.
 - [x] Verify explicit title overrides take precedence and clearing restores an
   OSC title.
-- [ ] Add a direct per-session child-exit/output-EOF order test.
-- [ ] Add direct create-tab rollback tests using injected startup/attachment
+- [x] Add a direct per-session child-exit/output-EOF order test.
+- [x] Add direct create-tab rollback tests using injected startup/attachment
   failures.
 
 ### Hidden Win32 integration tests

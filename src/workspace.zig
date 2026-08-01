@@ -33,6 +33,7 @@ pub const TerminalSession = struct {
     /// EOF is independent from process exit: ConPTY can still have final
     /// bytes buffered after its child has exited.
     output_finished: bool = false,
+    child_exited: bool = false,
 
     fn init(
         self: *TerminalSession,
@@ -62,6 +63,18 @@ pub const TerminalSession = struct {
         self.model.setReplySink(null);
         if (self.process) |process| process.destroy(process.context);
         self.process = null;
+    }
+
+    /// Returns true once both asynchronous completion signals have arrived.
+    pub fn noteChildExit(self: *TerminalSession) bool {
+        self.child_exited = true;
+        return self.output_finished;
+    }
+
+    /// Returns true once both asynchronous completion signals have arrived.
+    pub fn noteOutputFinished(self: *TerminalSession) bool {
+        self.output_finished = true;
+        return self.child_exited;
     }
 
     fn deinit(self: *TerminalSession) void {
@@ -137,21 +150,43 @@ pub const Workspace = struct {
         rows: u16,
         columns: u16,
     ) !TabId {
+        return self.createTabWithSetup(rows, columns, {}, noOpTabSetup);
+    }
+
+    /// Creates a tab transactionally. If session startup or process attachment
+    /// fails, the new tab (and any process it owns) is removed and the prior
+    /// active tab is restored.
+    pub fn createTabWithSetup(
+        self: *Workspace,
+        rows: u16,
+        columns: u16,
+        context: anytype,
+        comptime setup: fn (*TerminalSession, @TypeOf(context)) anyerror!void,
+    ) !TabId {
+        const previous_active = self.active_tab_id;
         const tab_id = self.ids.tab();
-        const terminal_session = try self.allocator.create(TerminalSession);
-        errdefer self.allocator.destroy(terminal_session);
-        try terminal_session.init(
-            self.allocator,
-            self.ids.session(),
-            rows,
-            columns,
-        );
-        errdefer terminal_session.deinit();
-        try self.tabs.append(self.allocator, .{
-            .id = tab_id,
-            .root = .{ .terminal = terminal_session },
-        });
+        const terminal_session = blk: {
+            const created = try self.allocator.create(TerminalSession);
+            errdefer self.allocator.destroy(created);
+            try created.init(
+                self.allocator,
+                self.ids.session(),
+                rows,
+                columns,
+            );
+            errdefer created.deinit();
+            try self.tabs.append(self.allocator, .{
+                .id = tab_id,
+                .root = .{ .terminal = created },
+            });
+            break :blk created;
+        };
+        errdefer {
+            _ = self.closeTab(tab_id);
+            self.active_tab_id = previous_active;
+        }
         if (self.active_tab_id == null) self.active_tab_id = tab_id;
+        try setup(terminal_session, context);
         return tab_id;
     }
 
@@ -234,12 +269,31 @@ pub const Workspace = struct {
     }
 };
 
+fn noOpTabSetup(_: *TerminalSession, _: void) !void {}
+
 const TestProcess = struct {
     destroy_count: usize = 0,
 
     fn destroy(context: *anyopaque) void {
         const self: *TestProcess = @ptrCast(@alignCast(context));
         self.destroy_count += 1;
+    }
+};
+
+const FailingTabSetup = struct {
+    process: ?*TestProcess = null,
+
+    fn failStartup(_: *TerminalSession, _: *FailingTabSetup) !void {
+        return error.InjectedStartupFailure;
+    }
+
+    fn failAfterAttach(session: *TerminalSession, self: *FailingTabSetup) !void {
+        const process = self.process.?;
+        try session.attachProcess(.{
+            .context = process,
+            .destroy = TestProcess.destroy,
+        });
+        return error.InjectedAttachmentFailure;
     }
 };
 
@@ -375,4 +429,52 @@ test "reordering preserves session identity and completion state" {
     try std.testing.expectEqual(session_id, value.tabs.items[0].root.terminalSession().id);
     try std.testing.expect(value.tabs.items[0].root.terminalSession().output_finished);
     try std.testing.expectEqual(first, value.active_tab_id.?);
+}
+
+test "a session closes only after child exit and output EOF in either order" {
+    var ids: IdSource = .{};
+    var value = Workspace.init(std.testing.allocator, &ids);
+    defer value.deinit();
+    _ = try value.createTab(24, 80);
+    const first = value.activeSession().?;
+
+    try std.testing.expect(!first.noteChildExit());
+    try std.testing.expect(first.noteOutputFinished());
+
+    const second_id = try value.createTab(24, 80);
+    const second = value.tab(second_id).?.root.terminalSession();
+    try std.testing.expect(!second.noteOutputFinished());
+    try std.testing.expect(second.noteChildExit());
+}
+
+test "tab setup rollback restores the prior active tab after startup failure" {
+    var ids: IdSource = .{};
+    var value = Workspace.init(std.testing.allocator, &ids);
+    defer value.deinit();
+    const first = try value.createTab(24, 80);
+    var setup: FailingTabSetup = .{};
+
+    try std.testing.expectError(
+        error.InjectedStartupFailure,
+        value.createTabWithSetup(24, 80, &setup, FailingTabSetup.failStartup),
+    );
+    try std.testing.expectEqual(@as(usize, 1), value.tabs.items.len);
+    try std.testing.expectEqual(first, value.active_tab_id.?);
+}
+
+test "tab setup rollback closes an attached process after attachment failure" {
+    var ids: IdSource = .{};
+    var value = Workspace.init(std.testing.allocator, &ids);
+    defer value.deinit();
+    const first = try value.createTab(24, 80);
+    var process: TestProcess = .{};
+    var setup: FailingTabSetup = .{ .process = &process };
+
+    try std.testing.expectError(
+        error.InjectedAttachmentFailure,
+        value.createTabWithSetup(24, 80, &setup, FailingTabSetup.failAfterAttach),
+    );
+    try std.testing.expectEqual(@as(usize, 1), value.tabs.items.len);
+    try std.testing.expectEqual(first, value.active_tab_id.?);
+    try std.testing.expectEqual(@as(usize, 1), process.destroy_count);
 }
