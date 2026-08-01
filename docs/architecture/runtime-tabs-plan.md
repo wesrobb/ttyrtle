@@ -13,14 +13,13 @@ remain out of scope for this milestone.
 
 ## Progress summary
 
-The runtime lifecycle is implemented and tested: each tab has its own terminal
-model and ConPTY process, output is routed by stable session ID even when the
-tab is inactive, resizing applies to every session, and the native strip stays
-synchronized for creation, close, and selection. The standard control is
-subclassed only for middle-click close and focus restoration.
-
-Inline rename, context menus, and drag reordering are the primary remaining
-same-window tab work.
+The same-window runtime-tab milestone is complete and tested: each tab has its
+own terminal model and ConPTY process, output is routed by stable session ID
+even when the tab is inactive, resizing applies to every session, and the
+native strip stays synchronized for creation, close, selection, and reorder.
+The standard control remains responsible for native painting, selection,
+overflow, and accessibility, with a small subclass for middle-click close,
+focus restoration, and drag reordering.
 
 ## Implementation work
 
@@ -51,9 +50,8 @@ same-window tab work.
 - [x] Close a tab idempotently, tear down only its process, select the nearest
   remaining tab, synchronize the strip, and close the window when no tabs
   remain.
-- [ ] Reorder by stable ID, rebuild the native list, and restore the active
-  selection. The workspace model already supports reordering; UI interaction
-  remains to be added.
+- [x] Reorder by stable ID, rebuild the native list, and restore the active
+  selection.
 - [x] Resize every terminal model and attached ConPTY session on window-size
   and DPI changes.
 - [x] On `WM_CLOSE`, tear down all workspace sessions exactly once.
@@ -84,7 +82,7 @@ same-window tab work.
 - [x] Prevent held-key repeats for create/close while allowing repeat cycling.
 - [x] Right-click: select the hit tab and show a native `New Tab`, `Rename`,
   `Close` popup; support keyboard invocation anchored to the active tab.
-- [ ] Left-button drag: record a stable-ID candidate, begin after the system
+- [x] Left-button drag: record a stable-ID candidate, begin after the system
   drag threshold, capture the mouse, reorder on tab-boundary crossings, allow
   drops before/after the visible range, and cancel/reset reliably.
 
@@ -111,20 +109,20 @@ same-window tab work.
   helpers), including release/character suppression.
 - [x] Exercise rename commit/cancel/reset, middle-click close, and context-menu
   actions.
-- [ ] Exercise drag reordering in both directions.
-- [ ] Start multiple finite ConPTY sessions with distinct markers and verify
+- [x] Exercise drag reordering in both directions.
+- [x] Start multiple finite ConPTY sessions with distinct markers and verify
   inactive output, background OSC labels, and EOF/exit arrival in either
   order.
-- [ ] Verify multi-session resize/DPI dimensions and repeated window close
+- [x] Verify multi-session resize/DPI dimensions and repeated window close
   without stale-message dereferences.
 
 ## Documentation and completion
 
 - [x] Update the README with implemented tab shortcuts and current limits.
 - [x] Update `todo.md` and `docs/architecture/tabs.md` with current progress.
-- [ ] Mark the user-facing tabs TODO fully complete only after inline naming,
-  drag reordering, status behavior, and their tests pass.
-- [ ] Keep multiple windows/cross-window tab movement, panes, richer process
+- [x] Mark the user-facing tabs TODO fully complete: inline naming, dynamic
+  labels, drag reordering, and their tests pass.
+- [x] Keep multiple windows/cross-window tab movement, panes, richer process
   and CWD integration, owner-drawn close buttons, configurable hotkeys, and
   large-tab stress testing as future work.
 

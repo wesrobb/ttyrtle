@@ -38,6 +38,7 @@ sound.
   one-based tab position.
 - Right-click a tab, or invoke the keyboard context menu, for New Tab, Rename,
   and Close actions.
+- Drag a tab with the left mouse button to reorder same-window tabs.
 - Terminal output continues to be parsed while its tab is inactive. OSC titles
   label the corresponding tab and window; an explicit tab name takes priority.
 - `Ctrl+Shift+C` copies the current selection as Unicode text.
@@ -92,8 +93,9 @@ layout rebuilds, requested and presented frames, GPU presents, and device
 recreations. The counter storage and increments are omitted from optimized
 builds. The integration path launches finite ConPTY children, verifies
 known truecolor VT output and queued Unicode input in the Ghostty model,
-confirms reader teardown, and requires a hosted process to observe an exact
-window-driven terminal resize.
+confirms reader teardown, requires a hosted process to observe an exact
+window-driven terminal resize, and exercises multiple inactive sessions,
+background OSC labels, resize/DPI propagation, and stale notifications.
 GitHub Actions runs `zig build verify` on Windows with pinned Ghostty and
 zigwin32 revisions.
 
@@ -123,8 +125,8 @@ font face at the active DPI.
 Font selection and size are not configurable yet. The internal workspace owns
 each tab's pane root, terminal model, and ConPTY process. Same-window tabs
 support creation, closing, switching, inline renaming, context-menu actions,
-and dynamic OSC labels while inactive tabs continue to process output.
-Cross-window movement, panes, drag reordering, visible close buttons,
+drag reordering, and dynamic OSC labels while inactive tabs continue to process
+output. Cross-window movement, panes, visible close buttons,
 configurable hotkeys, shell working-directory integration, and large-tab stress
 testing remain future work. Configuration,
 profiles, accessibility, and session persistence remain separate future work.

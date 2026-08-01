@@ -19,12 +19,14 @@
   - [x] Route ConPTY output, exit, and input-failure notifications by stable
     session ID, including output from inactive tabs.
   - [x] Resize every terminal model and attached ConPTY session together.
+  - [x] Complete same-window tab creation, closing, switching, naming,
+    context menus, and drag reordering.
 - [ ] Support multiple top-level windows and moving tabs between windows,
   preserving their pane layouts and running terminal sessions.
 
 ## User-facing features
 
-- [ ] Complete tabs following the [tab architecture](docs/architecture/tabs.md).
+- [x] Complete same-window tabs following the [tab architecture](docs/architecture/tabs.md).
   - [x] Create, close, and switch same-window tabs with independent terminal
     models and ConPTY sessions (`Ctrl+Shift+T`, `Ctrl+Shift+W`, Ctrl+Tab, and
     Alt+number shortcuts).
@@ -32,7 +34,8 @@
     safely drain final output before automatic close.
   - [x] Support middle-click close and keep terminal focus after tab actions.
   - [x] Add inline naming and context-menu commands.
-  - [ ] Add drag reordering and useful process or working-directory status.
+  - [x] Add drag reordering.
+  - [ ] Add useful process or working-directory status.
 - [ ] Add panes: support horizontal and vertical splits, focus movement,
   resizing, closing, and a clear ownership model for the terminal sessions in
   each pane. Define how pane layouts interact with tabs.
