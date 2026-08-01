@@ -126,7 +126,6 @@ Font selection and size are not configurable yet. The internal workspace owns
 each tab's pane root, terminal model, and ConPTY process. Same-window tabs
 support creation, closing, switching, inline renaming, context-menu actions,
 drag reordering, and dynamic OSC labels while inactive tabs continue to process
-output. Cross-window movement, panes, visible close buttons,
-configurable hotkeys, shell working-directory integration, and large-tab stress
-testing remain future work. Configuration,
-profiles, accessibility, and session persistence remain separate future work.
+output. The [feature-work tracker](todo.md) is the authoritative roadmap for
+future capabilities such as cross-window movement, panes, configuration,
+accessibility, and release work.

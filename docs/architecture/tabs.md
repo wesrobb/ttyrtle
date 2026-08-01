@@ -127,23 +127,14 @@ semantics intact. Custom painting should not turn the tab strip into an
 unrelated custom widget or discard the accessibility benefits of using the
 standard control.
 
-## Implementation sequence
+## Implementation status
 
-1. [x] Introduce explicit `Workspace`, `Tab`, and `TerminalSession` ownership
-   while retaining one top-level window.
-2. [x] Add the standard `WC_TABCONTROL` child window and synchronize it with the
-   single-tab model.
-3. [x] Implement same-window tab creation, closing, switching, naming, and
-   dynamic labels. Background output, OSC labels, and middle-click close are
-   included.
-4. [x] Add same-window reordering. Cross-window transfer remains future work
-   after multiple top-level windows exist.
-5. [ ] Introduce owner drawing or subclass-specific behavior only for features that
-   the standard control cannot express adequately.
-6. [ ] Add pane splits beneath `Tab.root` without changing the tab-control
-   integration.
+Same-window tabs are complete. Their implementation and verification record is
+the [runtime-tabs plan](runtime-tabs-plan.md). Unit tests cover workspace
+operations without Win32; hidden-window integration tests cover native selection
+and drag notifications, multiple asynchronous sessions, resize/DPI propagation,
+and repeated teardown.
 
-Unit tests cover workspace operations without Win32. Hidden-window integration
-tests cover native selection and drag notifications, multiple asynchronous
-sessions, resize/DPI propagation, and repeated teardown. Moving a running tab
-between windows remains future coverage.
+The feature-work tracker in [todo.md](../../todo.md) is the authoritative place
+for status and plans for future work, including cross-window transfer, panes,
+owner-drawn tab affordances, and activity/status behavior.

@@ -122,9 +122,8 @@ focus restoration, and drag reordering.
 - [x] Update `todo.md` and `docs/architecture/tabs.md` with current progress.
 - [x] Mark the user-facing tabs TODO fully complete: inline naming, dynamic
   labels, drag reordering, and their tests pass.
-- [x] Keep multiple windows/cross-window tab movement, panes, richer process
-  and CWD integration, owner-drawn close buttons, configurable hotkeys, and
-  large-tab stress testing as future work.
+- [x] Record deferred feature work in the authoritative
+  [feature-work tracker](../../todo.md).
 
 ## Verification
 

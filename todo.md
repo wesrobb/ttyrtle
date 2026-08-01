@@ -1,103 +1,82 @@
-# TODO
+# Feature work
 
-## High priority
+This is ttyrtle's single source of truth for feature-work status and planning.
 
-- [ ] Add performance and stress tests covering large scrollback histories,
-  rapid resize, sustained high-output commands, many tabs and panes, device
-  loss, and repeated session creation and teardown. Define useful resource and
-  responsiveness limits and detect regressions in CI where practical.
+## Statuses
 
-## Architecture
+- **Needs planning**: the feature has a defined outcome but no approved plan.
+- **Planned**: implementation has not started; the entry links to its plan.
+- **In progress**: implementation is underway; the entry links to its plan.
+- **Done**: implementation and its required verification are complete; the
+  entry links to the plan that records that work.
 
-- [ ] Refactor the single-session application into a multi-session workspace
-  model with clear ownership between windows, tabs, pane layout trees, and
-  terminal sessions.
-  - [x] Introduce stable tab/session IDs and explicit workspace, tab, pane-root,
-    terminal-model, and ConPTY ownership while retaining one window and one tab.
-  - [x] Add a native Win32 tab control synchronized from stable workspace tab
-    identities and reserve its strip within the terminal's existing top margin.
-  - [x] Route ConPTY output, exit, and input-failure notifications by stable
-    session ID, including output from inactive tabs.
-  - [x] Resize every terminal model and attached ConPTY session together.
-  - [x] Complete same-window tab creation, closing, switching, naming,
-    context menus, and drag reordering.
-- [ ] Support multiple top-level windows and moving tabs between windows,
-  preserving their pane layouts and running terminal sessions.
+Every entry except **Needs planning** must link to its plan. Create that plan
+under `docs/architecture/` before changing an entry to **Planned**; update this
+file as the work advances. Architecture documents may describe designs and
+constraints, but they do not replace this tracker.
 
-## User-facing features
+## Done
 
-- [x] Complete same-window tabs following the [tab architecture](docs/architecture/tabs.md).
-  - [x] Create, close, and switch same-window tabs with independent terminal
-    models and ConPTY sessions (`Ctrl+Shift+T`, `Ctrl+Shift+W`, Ctrl+Tab, and
-    Alt+number shortcuts).
-  - [x] Keep inactive tabs processing output, update their OSC labels, and
-    safely drain final output before automatic close.
-  - [x] Support middle-click close and keep terminal focus after tab actions.
-  - [x] Add inline naming and context-menu commands.
-  - [x] Add drag reordering.
-  - [ ] Add useful process or working-directory status.
-- [ ] Add panes: support horizontal and vertical splits, focus movement,
-  resizing, closing, and a clear ownership model for the terminal sessions in
-  each pane. Define how pane layouts interact with tabs.
-- [ ] Add a configuration system for startup and runtime settings. Evaluate an
-  embedded Lua configuration against a simpler declarative format, including
-  startup cost, diagnostics, reload behavior, API stability, and the security
-  implications of executing user code.
-- [ ] After the configuration system is established, add profiles for shell,
-  arguments, starting directory, environment variables, icon, theme, font, and
-  initial tab or pane layout.
-- [ ] Add customizable hotkeys with sane Windows-specific defaults. Cover tab
-  and pane management, clipboard operations, font sizing, command dispatch,
-  conflict detection, and an escape mechanism for sending bound keys through
-  to the terminal.
-- [ ] Add a command palette backed by the same action registry as hotkeys so
-  terminal, tab, pane, and window commands remain discoverable.
-- [ ] Add theme support for terminal palettes and application chrome. Ship a
-  small set of built-in light and dark themes and allow configuration to
-  override individual colors.
-- [ ] Choose a better default terminal font with Nerd Font glyph coverage.
-  Confirm redistribution licensing and bundle the selected font if practical;
-  retain DirectWrite fallback and allow users to configure the family, size,
-  weight, and style.
-- [ ] Add font zoom and reset actions with correct sizing when windows move
-  between monitors with different DPI settings.
-- [ ] Add configurable visual and audible bell behavior after the configuration
-  system is established, including taskbar attention for background tabs.
+- **Done** — [Same-window runtime tabs](docs/architecture/runtime-tabs-plan.md):
+  independent terminal and ConPTY sessions; create, close, switch, rename,
+  context menu, middle-click close, shortcuts, drag reordering, inactive output
+  processing, dynamic OSC labels, and multi-session resize/DPI/teardown tests.
+- **Done** — [Multi-session workspace foundation](docs/architecture/runtime-tabs-plan.md):
+  stable tab/session identities, workspace ownership, notification routing, and
+  safe per-session lifecycle handling for one top-level window.
 
-## Terminal interaction
+## Needs planning
 
-- [ ] Add scrollback history with configurable limits, keyboard and mouse
-  navigation, and selection that can extend beyond the visible viewport.
-- [ ] Add OSC 8 hyperlinks with safe modifier-click opening and an appropriate
-  confirmation policy for untrusted targets.
-- [ ] Complete IME support with pre-edit composition rendering and correctly
-  positioned candidate windows.
-- [ ] Add word and line selection, keyboard-driven selection, and selection
-  auto-scroll beyond the viewport.
-- [ ] After the configuration system is established, make double- and
-  triple-click selection behavior customizable.
-- [ ] Add shell integration for current-directory tracking, command boundaries,
-  command status, and smarter tab titles.
-- [ ] Add accessibility support through Windows UI Automation, including screen
-  reader access and Windows high-contrast behavior.
+### Windows, tabs, and panes
 
-## Reliability and distribution
+- Multiple top-level windows and moving running tabs between them while
+  preserving pane layouts and sessions.
+- Pane splits: horizontal/vertical splits, focus movement, resizing, closing,
+  and tab/pane ownership rules.
+- Tab process or working-directory status.
+- Owner-drawn tab affordances such as visible close buttons, pins, and activity
+  indicators.
 
-- [ ] Add clear user-facing diagnostics for invalid configuration, missing
-  fonts, renderer fallback, and shell or ConPTY startup failures.
-- [ ] Add crash recovery and diagnostic bundle generation. On the next launch,
-  offer recovery and diagnostic submission/export only with explicit manual
-  approval; never restore sessions or send diagnostics automatically, and
-  exclude terminal contents by default.
-- [ ] Add application icons, version metadata, release packaging, and installer
-  support, including Scoop and WinGet package distribution.
+### Configuration and appearance
 
-## Rendering performance
+- A configuration system, including evaluation of embedded Lua versus a
+  declarative format, diagnostics, reload behavior, API stability, and
+  execution security.
+- Profiles for shell, arguments, starting directory, environment, icon, theme,
+  font, and initial tab/pane layout.
+- Customizable Windows-appropriate hotkeys, conflict detection, and a way to
+  send bound keys through to the terminal.
+- A command palette backed by the hotkey action registry.
+- Terminal and application-chrome themes with built-in light/dark themes.
+- A better default terminal font with Nerd Font glyph coverage and a licensing
+  decision.
+- Font zoom and reset behavior that remains correct across DPI changes.
+- Configurable visual and audible bells, including background-tab attention.
 
-- [ ] Add scroll-aware back-buffer updates after the retained Direct2D renderer
-  is established: detect terminal scroll damage, shift reusable rendered pixels
-  within the affected region, and redraw only newly exposed rows. Handle
-  multiple scroll operations in one terminal batch, partial scroll regions,
-  cursor and selection overlays, resize/DPI invalidation, and cases where a
-  dirty-row redraw is cheaper than copying. Benchmark the result before making
-  it the default path.
+### Terminal interaction
+
+- Scrollback history with configurable limits, keyboard/mouse navigation, and
+  selection beyond the visible viewport.
+- OSC 8 hyperlinks with safe modifier-click opening and an untrusted-target
+  confirmation policy.
+- Full IME support, including pre-edit composition rendering and candidate-window
+  positioning.
+- Word/line selection, keyboard selection, and selection auto-scroll.
+- Configurable double- and triple-click selection after configuration exists.
+- Shell integration for current-directory tracking, command boundaries, command
+  status, and smarter tab titles.
+- Windows UI Automation accessibility and high-contrast behavior.
+
+### Reliability, distribution, and performance
+
+- User-facing diagnostics for invalid configuration, missing fonts, renderer
+  fallback, and shell or ConPTY startup failures.
+- Crash recovery and opt-in diagnostic bundle generation without automatic
+  session restoration or terminal-content disclosure.
+- Application icons, version metadata, release packaging, installer support,
+  Scoop, and WinGet distribution.
+- Performance and stress tests for large scrollback, rapid resizing, sustained
+  output, many tabs/panes, device loss, and repeated session lifecycle; define
+  resource/responsiveness limits and CI regression checks.
+- Scroll-aware retained-renderer back-buffer updates, including damage tracking,
+  copy-versus-redraw decisions, resize/DPI invalidation, and benchmarks.
