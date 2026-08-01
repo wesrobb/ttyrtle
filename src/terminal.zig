@@ -48,6 +48,8 @@ pub const RenderDamage = union(enum) {
     full,
 };
 
+const SelectionRange = ?[2]u16;
+
 const counters_enabled = builtin.mode == .Debug or builtin.is_test;
 
 /// Per-terminal primary-screen history budget. Configuration will replace this
@@ -75,6 +77,7 @@ pub const TerminalModel = struct {
     cell_height: u32,
     cursor_blink_visible: bool,
     selection_refresh: bool,
+    selection_snapshot: std.ArrayListUnmanaged(SelectionRange),
     damage_full: bool,
     damage_rows: std.ArrayListUnmanaged(u16),
     output_batch_count: if (counters_enabled) u64 else void,
@@ -111,6 +114,7 @@ pub const TerminalModel = struct {
             .cell_height = 0,
             .cursor_blink_visible = true,
             .selection_refresh = false,
+            .selection_snapshot = .empty,
             .damage_full = false,
             .damage_rows = .empty,
             .output_batch_count = if (counters_enabled) 0 else {},
@@ -140,6 +144,7 @@ pub const TerminalModel = struct {
         self.stream.deinit();
         self.render_state.deinit(self.allocator);
         self.core.deinit(self.allocator);
+        self.selection_snapshot.deinit(self.allocator);
         self.damage_rows.deinit(self.allocator);
         self.* = undefined;
     }
@@ -197,10 +202,6 @@ pub const TerminalModel = struct {
 
     pub fn viewportFollowsBottom(self: *const TerminalModel) bool {
         return self.core.screens.active.pages.viewport == .active;
-    }
-
-    pub fn hasSelection(self: *const TerminalModel) bool {
-        return self.core.screens.active.selection != null;
     }
 
     pub fn setReplySink(self: *TerminalModel, sink: ?ReplySink) void {
@@ -394,17 +395,23 @@ pub const TerminalModel = struct {
         const anchor = screen.selection orelse return;
         const start = anchor.start();
         const end = self.viewportPin(row, column) orelse return;
-        self.markVisibleSelectionRows();
+        self.snapshotVisibleSelection() catch {
+            self.markFullDamage();
+            return;
+        };
         screen.select(.init(start, end, false)) catch self.markFullDamage();
         self.refreshSelection() catch self.markFullDamage();
-        self.markVisibleSelectionRows();
+        self.markChangedVisibleSelectionRows();
     }
 
     pub fn clearSelection(self: *TerminalModel) void {
-        self.markVisibleSelectionRows();
+        self.snapshotVisibleSelection() catch {
+            self.markFullDamage();
+            return;
+        };
         self.core.screens.active.clearSelection();
         self.refreshSelection() catch self.markFullDamage();
-        self.markVisibleSelectionRows();
+        self.markChangedVisibleSelectionRows();
     }
 
     pub fn selectionTextAlloc(
@@ -517,12 +524,15 @@ pub const TerminalModel = struct {
     }
 
     fn setSelection(self: *TerminalModel, start_row: u32, start_column: u32, end_row: u32, end_column: u32) void {
-        self.markVisibleSelectionRows();
         const start = self.viewportPin(start_row, start_column) orelse return;
         const end = self.viewportPin(end_row, end_column) orelse return;
+        self.snapshotVisibleSelection() catch {
+            self.markFullDamage();
+            return;
+        };
         self.core.screens.active.select(.init(start, end, false)) catch self.markFullDamage();
         self.refreshSelection() catch self.markFullDamage();
-        self.markVisibleSelectionRows();
+        self.markChangedVisibleSelectionRows();
     }
 
     fn refreshSelection(self: *TerminalModel) !void {
@@ -531,9 +541,23 @@ pub const TerminalModel = struct {
         try self.refresh();
     }
 
-    fn markVisibleSelectionRows(self: *TerminalModel) void {
-        for (self.render_state.row_data.items(.selection), 0..) |range, row| {
-            if (range != null) self.mergeDamageRow(@intCast(row)) catch self.markFullDamage();
+    fn snapshotVisibleSelection(self: *TerminalModel) !void {
+        const selection = self.render_state.row_data.items(.selection);
+        try self.selection_snapshot.resize(self.allocator, selection.len);
+        @memcpy(self.selection_snapshot.items, selection);
+    }
+
+    fn markChangedVisibleSelectionRows(self: *TerminalModel) void {
+        const current = self.render_state.row_data.items(.selection);
+        const row_count = @max(self.selection_snapshot.items.len, current.len);
+        for (0..row_count) |row| {
+            const previous: SelectionRange = if (row < self.selection_snapshot.items.len)
+                self.selection_snapshot.items[row]
+            else
+                null;
+            const next: SelectionRange = if (row < current.len) current[row] else null;
+            if (!std.meta.eql(previous, next))
+                self.mergeDamageRow(@intCast(row)) catch self.markFullDamage();
         }
     }
 
@@ -827,6 +851,25 @@ test "selection changes damage only its old and new visible rows" {
         else => return error.ExpectedPartialDamage,
     };
     try std.testing.expectEqualSlices(u16, &.{ 1, 2 }, rows);
+}
+
+test "selection extension damages only rows whose selected range changed" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 5, 20);
+    defer model.deinit();
+    model.acknowledgeDamage();
+
+    model.startSelection(0, 3);
+    model.updateSelection(3, 4);
+    model.acknowledgeDamage();
+
+    model.updateSelection(3, 5);
+
+    const rows = switch (model.damage()) {
+        .partial => |value| value,
+        else => return error.ExpectedPartialDamage,
+    };
+    try std.testing.expectEqualSlices(u16, &.{3}, rows);
 }
 
 test "damage remains pending until acknowledged" {

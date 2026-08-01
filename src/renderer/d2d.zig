@@ -29,6 +29,7 @@ const RowLayouts = struct {
     row_generation: u64 = 0,
     font_generation: u64 = 0,
     content_fingerprint: u64 = 0,
+    shape_fingerprint: u64 = 0,
     layout: ?*dwrite.IDWriteTextLayout = null,
 
     fn clear(self: *RowLayouts) void {
@@ -37,6 +38,7 @@ const RowLayouts = struct {
         self.row_generation = 0;
         self.font_generation = 0;
         self.content_fingerprint = 0;
+        self.shape_fingerprint = 0;
     }
 
     fn deinit(self: *RowLayouts) void {
@@ -347,6 +349,7 @@ pub const DeviceResources = struct {
         _ = try self.ensureTextFormat(metrics, dpi);
         try self.resizeRowLayouts(cache.rows.items.len);
         self.rotateRowLayoutsUp(cache.scroll_up_rows);
+        self.rotateRowLayoutsDown(cache.scroll_down_rows);
         if (!self.scene_valid) {
             try self.drawScene(cache, .full, metrics, dpi);
         } else switch (damage) {
@@ -592,6 +595,16 @@ pub const DeviceResources = struct {
         }
     }
 
+    /// Keep DirectWrite layouts paired with cached content when scrolling into
+    /// history moves retained terminal lines toward the bottom.
+    fn rotateRowLayoutsDown(self: *DeviceResources, count: u16) void {
+        const rows = @min(@as(usize, count), self.row_layouts.items.len);
+        for (0..rows) |_| {
+            const moved = self.row_layouts.pop().?;
+            self.row_layouts.insertAssumeCapacity(0, moved);
+        }
+    }
+
     fn ensureRowLayouts(
         self: *DeviceResources,
         row_index: usize,
@@ -604,12 +617,26 @@ pub const DeviceResources = struct {
             layouts.font_generation == self.font_generation)
             return layouts;
 
+        // Selection, cursor, and color changes only alter drawing effects.
+        // Keep the expensive shaped layout when its text and cell advances
+        // are unchanged, and update the brush ranges in place.
+        if (layouts.layout) |layout| {
+            if (layouts.font_generation == self.font_generation and
+                layouts.shape_fingerprint == row.shape_fingerprint)
+            {
+                try self.applyDrawingEffects(layout, row);
+                layouts.row_generation = row.generation;
+                layouts.content_fingerprint = row.fingerprint;
+                return layouts;
+            }
+        }
+
         // Broad terminal damage can move unchanged rows to new viewport
         // positions. DirectWrite layouts are position-independent, so transfer
         // an identical retained layout instead of constructing it again. A
         // block cursor changes the drawing effect in the row, so that row is
         // intentionally rebuilt.
-        if (!row.selection_active and !rowHasCursor(row) and !rowHasSelection(row)) {
+        if (!rowHasCursor(row)) {
             for (self.row_layouts.items, 0..) |candidate, index| {
                 if (index == row_index or candidate.layout == null or
                     candidate.font_generation != self.font_generation or
@@ -688,6 +715,27 @@ pub const DeviceResources = struct {
             if (layout1.SetCharacterSpacing(0, trailing, 0, range).failed)
                 return error.ConfigureTextLayoutFailed;
         }
+        try self.applyDrawingEffects(layout, row);
+        layouts.layout = layout;
+        if (counters_enabled) self.layout_build_count +|= 1;
+        layouts.row_generation = row.generation;
+        layouts.font_generation = self.font_generation;
+        layouts.content_fingerprint = row.fingerprint;
+        layouts.shape_fingerprint = row.shape_fingerprint;
+        return layouts;
+    }
+
+    fn applyDrawingEffects(
+        self: *DeviceResources,
+        layout: *dwrite.IDWriteTextLayout,
+        row: *const render_commands.CachedRow,
+    ) !void {
+        const full_range: dwrite.DWRITE_TEXT_RANGE = .{
+            .startPosition = 0,
+            .length = @intCast(row.utf16.items.len),
+        };
+        if (layout.SetDrawingEffect(null, full_range).failed)
+            return error.ConfigureTextLayoutFailed;
         for (row.text_runs.items) |text_run| {
             const brush = try self.getBrush(text_run.color);
             if (layout.SetDrawingEffect(
@@ -698,12 +746,6 @@ pub const DeviceResources = struct {
                 },
             ).failed) return error.ConfigureTextLayoutFailed;
         }
-        layouts.layout = layout;
-        if (counters_enabled) self.layout_build_count +|= 1;
-        layouts.row_generation = row.generation;
-        layouts.font_generation = self.font_generation;
-        layouts.content_fingerprint = row.fingerprint;
-        return layouts;
     }
 
     fn presentScene(self: *DeviceResources) !void {
@@ -834,11 +876,6 @@ pub const DeviceResources = struct {
 
 fn rowHasCursor(row: *const render_commands.CachedRow) bool {
     for (row.cells.items) |cell| if (cell.cursor) return true;
-    return false;
-}
-
-fn rowHasSelection(row: *const render_commands.CachedRow) bool {
-    for (row.cells.items) |cell| if (cell.selected) return true;
     return false;
 }
 

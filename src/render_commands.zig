@@ -39,7 +39,7 @@ pub const GraphemeSpan = struct {
 pub const CachedRow = struct {
     generation: u64 = 0,
     fingerprint: u64 = 0,
-    selection_active: bool = false,
+    shape_fingerprint: u64 = 0,
     utf16: std.ArrayListUnmanaged(u16) = .empty,
     utf16_to_cell: std.ArrayListUnmanaged(u16) = .empty,
     cells: std.ArrayListUnmanaged(CellMetadata) = .empty,
@@ -104,6 +104,9 @@ pub const RenderCache = struct {
     /// Positive means the terminal viewport scrolled upward by this many rows
     /// during the most recent full-damage update.
     scroll_up_rows: u16 = 0,
+    /// Positive means the terminal viewport scrolled downward by this many
+    /// rows during the most recent full-damage update.
+    scroll_down_rows: u16 = 0,
     dirty_row_count: if (counters_enabled) u64 else void,
     rebuilt_row_count: if (counters_enabled) u64 else void,
     rectangle_request_count: if (counters_enabled) u64 else void,
@@ -148,6 +151,7 @@ pub const RenderCache = struct {
         self.metrics = metrics;
         self.background = model.background();
         self.scroll_up_rows = 0;
+        self.scroll_down_rows = 0;
 
         if (dimensions_changed or metrics_changed) {
             try self.rebuildAll(model, metrics);
@@ -389,7 +393,7 @@ pub const RenderCache = struct {
         }
         row.generation +%= 1;
         row.fingerprint = model.rowFingerprint(row_index);
-        row.selection_active = model.hasSelection();
+        row.shape_fingerprint = shapeFingerprint(row);
         if (counters_enabled and count_rebuild) self.rebuilt_row_count +|= 1;
     }
 
@@ -409,10 +413,33 @@ pub const RenderCache = struct {
         return null;
     }
 
+    fn detectScrollDown(self: *const RenderCache, model: *const terminal.TerminalModel) ?usize {
+        const row_count = self.rows.items.len;
+        if (row_count < 2) return null;
+        // Find the current last row in the old cache, then verify the overlap.
+        // Scrolling into history moves retained viewport rows downward.
+        const last = model.rowFingerprint(row_count - 1);
+        for (1..row_count) |shift| {
+            if (self.rows.items[row_count - 1 - shift].fingerprint != last) continue;
+            for (0..row_count - shift) |row| {
+                if (model.rowFingerprint(row + shift) != self.rows.items[row].fingerprint)
+                    break;
+            } else return shift;
+        }
+        return null;
+    }
+
     fn rotateRowsUp(self: *RenderCache, count: usize) void {
         for (0..count) |_| {
             const moved = self.rows.orderedRemove(0);
             self.rows.appendAssumeCapacity(moved);
+        }
+    }
+
+    fn rotateRowsDown(self: *RenderCache, count: usize) void {
+        for (0..count) |_| {
+            const moved = self.rows.pop().?;
+            self.rows.insertAssumeCapacity(0, moved);
         }
     }
 
@@ -435,8 +462,19 @@ pub const RenderCache = struct {
         model: *const terminal.TerminalModel,
         metrics: geometry.Metrics,
     ) !bool {
-        if (model.hasSelection()) return false;
-        const rows = self.detectScrollUp(model) orelse return false;
+        if (self.detectScrollUp(model)) |rows|
+            return self.reuseRowsScrolledUp(model, metrics, rows);
+        if (self.detectScrollDown(model)) |rows|
+            return self.reuseRowsScrolledDown(model, metrics, rows);
+        return false;
+    }
+
+    fn reuseRowsScrolledUp(
+        self: *RenderCache,
+        model: *const terminal.TerminalModel,
+        metrics: geometry.Metrics,
+        rows: usize,
+    ) !bool {
         self.rotateRowsUp(rows);
         const start = self.rows.items.len - rows;
         const delta_y: i32 = -@as(i32, @intCast(rows * metrics.cell_height));
@@ -453,6 +491,32 @@ pub const RenderCache = struct {
         for (start..self.rows.items.len) |row|
             try self.rebuildRow(model, metrics, @intCast(row));
         self.scroll_up_rows = @intCast(rows);
+        self.recordDirtyRows(rows);
+        if (counters_enabled) {
+            self.scroll_reuse_count +|= 1;
+            self.scroll_reused_row_count +|= @intCast(self.rows.items.len - rows);
+        }
+        return true;
+    }
+
+    fn reuseRowsScrolledDown(
+        self: *RenderCache,
+        model: *const terminal.TerminalModel,
+        metrics: geometry.Metrics,
+        rows: usize,
+    ) !bool {
+        self.rotateRowsDown(rows);
+        const delta_y: i32 = @intCast(rows * metrics.cell_height);
+        for (self.rows.items[rows..]) |*row| rebaseRowGeometry(row, delta_y);
+
+        const cursor = model.cursor();
+        for (self.rows.items[rows..], rows..) |*row, index| {
+            if (rowHasCursor(row) or (cursor.visible and cursor.row == index))
+                try self.refreshCursorRow(model, metrics, @intCast(index));
+        }
+        for (0..rows) |row|
+            try self.rebuildRow(model, metrics, @intCast(row));
+        self.scroll_down_rows = @intCast(rows);
         self.recordDirtyRows(rows);
         if (counters_enabled) {
             self.scroll_reuse_count +|= 1;
@@ -546,6 +610,22 @@ fn appendUtf16(
     try row.utf16_to_cell.append(allocator, column);
 }
 
+fn shapeFingerprint(row: *const CachedRow) u64 {
+    var hash: u64 = 0xcbf29ce484222325;
+    for (row.utf16.items) |code_unit|
+        hash = fingerprintMix(hash, code_unit);
+    for (row.graphemes.items) |grapheme| {
+        hash = fingerprintMix(hash, grapheme.text_start);
+        hash = fingerprintMix(hash, grapheme.text_len);
+        hash = fingerprintMix(hash, grapheme.cell_count);
+    }
+    return hash;
+}
+
+fn fingerprintMix(hash: u64, value: anytype) u64 {
+    return (hash ^ @as(u64, @intCast(value))) *% 0x100000001b3;
+}
+
 test "cache rebuilds only dirty rows" {
     var model: terminal.TerminalModel = undefined;
     try model.init(std.testing.allocator, 4, 20);
@@ -594,6 +674,30 @@ test "cache reuses retained rows when live output scrolls a full viewport" {
 
     try std.testing.expectEqual(@as(u16, 1), cache.scroll_up_rows);
     try std.testing.expectEqual(old_second_generation, cache.rows.items[0].generation);
+    const after = cache.diagnostics();
+    try std.testing.expectEqual(before.rebuilt_rows + 1, after.rebuilt_rows);
+}
+
+test "cache reuses retained rows when live output scrolls a selection" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    try model.write("zero\r\none\r\ntwo\r\nthree");
+    model.startSelection(1, 0);
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    model.acknowledgeDamage();
+    const before = cache.diagnostics();
+    const selected_generation = cache.rows.items[1].generation;
+
+    try model.write("\r\nfour");
+    try cache.update(&model, metrics, model.damage());
+
+    try std.testing.expect(model.cell(0, 0).?.selected);
+    try std.testing.expectEqual(@as(u16, 1), cache.scroll_up_rows);
+    try std.testing.expectEqual(selected_generation, cache.rows.items[0].generation);
     const after = cache.diagnostics();
     try std.testing.expectEqual(before.rebuilt_rows + 1, after.rebuilt_rows);
 }
@@ -670,6 +774,64 @@ test "cache reuses retained rows for a coalesced multi-line scroll burst" {
     try std.testing.expectEqual(before.rebuilt_rows + 2, after.rebuilt_rows);
 }
 
+test "cache reuses retained rows when scrolling upward into history" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    try model.write("zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
+    model.startSelection(1, 0);
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    model.acknowledgeDamage();
+    const before = cache.diagnostics();
+    const old_first_generation = cache.rows.items[0].generation;
+    const selected_generation = cache.rows.items[1].generation;
+
+    try model.scrollViewport(-1);
+    try cache.update(&model, metrics, model.damage());
+
+    try std.testing.expectEqual(@as(u16, 1), cache.scroll_down_rows);
+    try std.testing.expectEqual(old_first_generation, cache.rows.items[1].generation);
+    try std.testing.expectEqual(selected_generation, cache.rows.items[2].generation);
+    try std.testing.expect(model.cell(2, 0).?.selected);
+    const retained = &cache.rows.items[2];
+    const expected_top: i32 = @intCast(metrics.margin_y + 2 * metrics.cell_height);
+    for (retained.text_runs.items) |text_run|
+        try std.testing.expectEqual(expected_top, text_run.y);
+    try std.testing.expect(retained.rectangles.items.len != 0);
+    for (retained.rectangles.items) |rectangle| {
+        try std.testing.expect(rectangle.top >= expected_top);
+        try std.testing.expect(rectangle.bottom <=
+            expected_top + @as(i32, @intCast(metrics.cell_height)));
+    }
+    const after = cache.diagnostics();
+    try std.testing.expectEqual(before.rebuilt_rows + 1, after.rebuilt_rows);
+}
+
+test "cache reuses retained rows for a multi-line scroll into history" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 5, 20);
+    defer model.deinit();
+    try model.write("zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    model.acknowledgeDamage();
+    const before = cache.diagnostics();
+    const old_first_generation = cache.rows.items[0].generation;
+
+    try model.scrollViewport(-2);
+    try cache.update(&model, metrics, model.damage());
+
+    try std.testing.expectEqual(@as(u16, 2), cache.scroll_down_rows);
+    try std.testing.expectEqual(old_first_generation, cache.rows.items[2].generation);
+    const after = cache.diagnostics();
+    try std.testing.expectEqual(before.rebuilt_rows + 2, after.rebuilt_rows);
+}
+
 test "cache retains UTF-16 cell mapping and combining graphemes" {
     var model: terminal.TerminalModel = undefined;
     try model.init(std.testing.allocator, 2, 10);
@@ -735,6 +897,26 @@ test "cache preserves wide selection inverse underline and cursor metadata" {
     try std.testing.expect(found_inverse_background);
     try std.testing.expect(found_underline);
     try std.testing.expect(found_cursor);
+}
+
+test "selection changes visual fingerprint without changing row shape" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 2, 12);
+    defer model.deinit();
+    try model.write("selection");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    model.acknowledgeDamage();
+    const content_before = cache.rows.items[0].fingerprint;
+    const shape_before = cache.rows.items[0].shape_fingerprint;
+
+    model.startSelection(0, 0);
+    try cache.update(&model, metrics, model.damage());
+
+    try std.testing.expect(content_before != cache.rows.items[0].fingerprint);
+    try std.testing.expectEqual(shape_before, cache.rows.items[0].shape_fingerprint);
 }
 
 test "cache resize drops stale rows and initializes new rows" {

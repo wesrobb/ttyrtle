@@ -2329,6 +2329,18 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         clean.layout_build_count != initial.layout_build_count)
         return error.CleanPaintRebuiltLayouts;
 
+    model.startSelection(0, 0);
+    const before_selection = active_renderer.diagnostics();
+    try paintForTesting(window);
+    const after_selection = active_renderer.diagnostics();
+    if (after_selection.layout_build_count != before_selection.layout_build_count)
+        return error.SelectionRebuiltLayout;
+    model.clearSelection();
+    try paintForTesting(window);
+    if (active_renderer.diagnostics().layout_build_count !=
+        after_selection.layout_build_count)
+        return error.SelectionClearRebuiltLayout;
+
     const clean_row_generation = active_renderer.layoutGenerationForTesting(2) orelse
         return error.RowLayoutGenerationUnavailable;
     const chunks = [_][]const u8{
@@ -2341,7 +2353,7 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     const after_batch = active_renderer.diagnostics();
     if (after_batch.gpu_present_count != before_batch.gpu_present_count + 1)
         return error.OutputBatchPresentedMoreThanOnce;
-    if (after_batch.layout_build_count != before_batch.layout_build_count + 2)
+    if (after_batch.layout_build_count != before_batch.layout_build_count + 1)
         return error.DirtyRowLayoutRebuildWasNotProportional;
     if (active_renderer.layoutGenerationForTesting(2) != clean_row_generation)
         return error.CleanRowLayoutGenerationChanged;
