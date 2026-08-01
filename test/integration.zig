@@ -28,6 +28,10 @@ test "inline tab rename commits cancels clears and survives resize" {
     try app.run(.smoke_rename);
 }
 
+test "tab context menus and middle-click dispatch native actions" {
+    try app.run(.smoke_tab_interactions);
+}
+
 test "finite ConPTY child output reaches the terminal model" {
     try app.run(.integration);
 }

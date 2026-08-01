@@ -45,6 +45,7 @@ pub const Mode = enum {
     smoke_tabs,
     smoke_shortcuts,
     smoke_rename,
+    smoke_tab_interactions,
     integration,
     integration_input,
     integration_resize,
@@ -65,6 +66,7 @@ var integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 
 var input_translator: input.Translator = .{};
 var shortcut_state: ShortcutState = .{};
 var test_modifiers: ?input.Mods = null;
+var test_context_menu_command: ?usize = null;
 var rename_editor: ?RenameEditor = null;
 var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
 var selection_dragging = false;
@@ -105,6 +107,7 @@ pub fn run(mode: Mode) !void {
     input_translator = .{};
     shortcut_state = .{};
     test_modifiers = null;
+    test_context_menu_command = null;
     rename_editor = null;
     terminal_metrics = .forDpi(geometry.base_dpi);
     selection_dragging = false;
@@ -203,6 +206,7 @@ pub fn run(mode: Mode) !void {
     if (mode == .smoke_tabs) try verifyNativeTabControl(window);
     if (mode == .smoke_shortcuts) try verifyShortcutDispatch(window);
     if (mode == .smoke_rename) try verifyInlineRename(window);
+    if (mode == .smoke_tab_interactions) try verifyTabInteractions(window);
 
     var integration_resize_command: ?[]u8 = null;
     defer if (integration_resize_command) |command| allocator.free(command);
@@ -538,6 +542,10 @@ fn showTabContextMenu(id: workspace.TabId, point: foundation.POINT) !void {
         return error.AppendContextMenuItemFailed;
     if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_close_tab, context_menu_close_tab_label) == 0)
         return error.AppendContextMenuItemFailed;
+    if (test_context_menu_command) |command| {
+        _ = user32.SendMessageW(window, wm.WM_COMMAND, command, 0);
+        return;
+    }
     _ = user32.SetForegroundWindow(window);
     _ = user32.TrackPopupMenu(menu, wm.TPM_RIGHTBUTTON, point.x, point.y, 0, window, null);
 }
@@ -921,6 +929,49 @@ fn verifyInlineRename(window: foundation.HWND) !void {
     try beginRenameTab(created);
     closeTerminalTab(window, created);
     if (rename_editor != null) return error.RenameEditorDidNotCancelForClose;
+}
+
+fn verifyTabInteractions(window: foundation.HWND) !void {
+    const control = tab_control orelse return error.TabControlUnavailable;
+    try createTerminalTab(window);
+    const hit_id = workspace_state.active_tab_id orelse return error.InteractionMissingActiveTab;
+    const hit_index = nativeIndexForTab(hit_id) orelse return error.InteractionMissingNativeTab;
+    var bounds: foundation.RECT = undefined;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, hit_index, @bitCast(@intFromPtr(&bounds))) == 0)
+        return error.GetTabItemRectFailed;
+    var screen_point: foundation.POINT = .{ .x = bounds.left + 4, .y = bounds.top + 4 };
+    if (user32.ClientToScreen(control, &screen_point) == 0) return error.ClientToScreenFailed;
+
+    test_context_menu_command = context_menu_rename_tab;
+    defer test_context_menu_command = null;
+    _ = user32.SendMessageW(control, wm.WM_CONTEXTMENU, 0, packMessagePoint(screen_point));
+    const editor = rename_editor orelse return error.ContextMenuRenameDidNotOpenEditor;
+    if (editor.tab_id != hit_id) return error.ContextMenuDidNotSelectHitTab;
+    cancelRename();
+
+    const count_before_create = workspace_state.tabs.items.len;
+    test_context_menu_command = context_menu_new_tab;
+    _ = user32.SendMessageW(window, wm.WM_CONTEXTMENU, 0, -1);
+    if (workspace_state.tabs.items.len != count_before_create + 1)
+        return error.KeyboardContextMenuDidNotCreateTab;
+    const created = workspace_state.active_tab_id orelse return error.ContextMenuCreateDidNotActivateTab;
+    if (created == hit_id) return error.ContextMenuCreateDidNotSelectNewTab;
+
+    test_context_menu_command = context_menu_close_tab;
+    _ = user32.SendMessageW(window, wm.WM_CONTEXTMENU, 0, -1);
+    if (workspace_state.tabs.items.len != count_before_create)
+        return error.KeyboardContextMenuDidNotCloseTab;
+    if (workspace_state.active_tab_id != hit_id)
+        return error.ContextMenuCloseDidNotRestoreNearestTab;
+
+    const count_before_middle_close = workspace_state.tabs.items.len;
+    _ = user32.SendMessageW(control, wm.WM_MBUTTONDOWN, 0, packMessagePoint(.{
+        .x = bounds.left + 4,
+        .y = bounds.top + 4,
+    }));
+    if (workspace_state.tabs.items.len != count_before_middle_close - 1)
+        return error.MiddleClickDidNotCloseTab;
+    if (workspace_state.tab(hit_id) != null) return error.MiddleClickClosedWrongTab;
 }
 
 fn windowProc(
@@ -1361,6 +1412,12 @@ fn messagePoint(lparam: isize) foundation.POINT {
         .x = @as(i16, @bitCast(@as(u16, @truncate(bits)))),
         .y = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16)))),
     };
+}
+
+fn packMessagePoint(point: foundation.POINT) isize {
+    const x: u16 = @bitCast(@as(i16, @intCast(point.x)));
+    const y: u16 = @bitCast(@as(i16, @intCast(point.y)));
+    return @intCast(@as(u32, x) | (@as(u32, y) << 16));
 }
 
 fn signedHighWord(value: usize) i16 {
@@ -1986,7 +2043,8 @@ fn isSmokeMode(mode: Mode) bool {
         mode == .smoke_phase5 or
         mode == .smoke_tabs or
         mode == .smoke_shortcuts or
-        mode == .smoke_rename;
+        mode == .smoke_rename or
+        mode == .smoke_tab_interactions;
 }
 
 fn isIntegrationMode(mode: Mode) bool {

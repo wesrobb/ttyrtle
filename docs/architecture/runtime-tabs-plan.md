@@ -107,10 +107,11 @@ same-window tab work.
 - [x] Verify native tab count, stable `lParam` identities, selection changes,
   runtime tab creation/activation, and close synchronization.
 - [x] Verify the existing finite-session, resize, input, and host-close paths.
-- [ ] Exercise shortcut dispatch itself (rather than its shared lifecycle
+- [x] Exercise shortcut dispatch itself (rather than its shared lifecycle
   helpers), including release/character suppression.
-- [ ] Exercise rename commit/cancel/reset, middle-click close, context-menu
-  actions, and drag reordering in both directions.
+- [x] Exercise rename commit/cancel/reset, middle-click close, and context-menu
+  actions.
+- [ ] Exercise drag reordering in both directions.
 - [ ] Start multiple finite ConPTY sessions with distinct markers and verify
   inactive output, background OSC labels, and EOF/exit arrival in either
   order.
