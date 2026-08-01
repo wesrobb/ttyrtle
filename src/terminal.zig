@@ -50,6 +50,10 @@ pub const RenderDamage = union(enum) {
 
 const counters_enabled = builtin.mode == .Debug or builtin.is_test;
 
+/// Per-terminal primary-screen history budget. Configuration will replace this
+/// application default in a later milestone.
+pub const default_scrollback_bytes: usize = 10 * 1024 * 1024;
+
 pub const TerminalModel = struct {
     pub const Diagnostics = struct {
         output_batches: u64,
@@ -69,9 +73,8 @@ pub const TerminalModel = struct {
     bell_count: usize,
     cell_width: u32,
     cell_height: u32,
-    selection_anchor: ?Cursor,
-    selection_head: ?Cursor,
     cursor_blink_visible: bool,
+    selection_refresh: bool,
     damage_full: bool,
     damage_rows: std.ArrayListUnmanaged(u16),
     output_batch_count: if (counters_enabled) u64 else void,
@@ -92,7 +95,11 @@ pub const TerminalModel = struct {
             .core = try .init(
                 std.Io.Threaded.global_single_threaded.io(),
                 allocator,
-                .{ .rows = row_count, .cols = column_count },
+                .{
+                    .rows = row_count,
+                    .cols = column_count,
+                    .max_scrollback_bytes = default_scrollback_bytes,
+                },
             ),
             .stream = undefined,
             .render_state = .empty,
@@ -102,9 +109,8 @@ pub const TerminalModel = struct {
             .bell_count = 0,
             .cell_width = 0,
             .cell_height = 0,
-            .selection_anchor = null,
-            .selection_head = null,
             .cursor_blink_visible = true,
+            .selection_refresh = false,
             .damage_full = false,
             .damage_rows = .empty,
             .output_batch_count = if (counters_enabled) 0 else {},
@@ -159,6 +165,42 @@ pub const TerminalModel = struct {
             return error.ReplyDeliveryFailed;
         }
         try self.refresh();
+        // A retained viewport may have had its oldest pages evicted or its
+        // pinned selection remapped by output, neither of which is expressible
+        // as a reliable row-local cache update.
+        if (!self.viewportFollowsBottom()) self.markFullDamage();
+    }
+
+    /// Scroll the visible viewport. Negative deltas move into history.
+    pub fn scrollViewport(self: *TerminalModel, delta: isize) !void {
+        self.core.scrollViewport(.{ .delta = delta });
+        try self.refresh();
+        self.markFullDamage();
+    }
+
+    pub fn scrollViewportPage(self: *TerminalModel, direction: enum { up, down }) !void {
+        const page_rows: isize = @intCast(@max(self.rows() -| 1, 1));
+        try self.scrollViewport(if (direction == .up) -page_rows else page_rows);
+    }
+
+    pub fn scrollViewportTop(self: *TerminalModel) !void {
+        self.core.scrollViewport(.top);
+        try self.refresh();
+        self.markFullDamage();
+    }
+
+    pub fn scrollViewportBottom(self: *TerminalModel) !void {
+        self.core.scrollViewport(.bottom);
+        try self.refresh();
+        self.markFullDamage();
+    }
+
+    pub fn viewportFollowsBottom(self: *const TerminalModel) bool {
+        return self.core.screens.active.pages.viewport == .active;
+    }
+
+    pub fn hasSelection(self: *const TerminalModel) bool {
+        return self.core.screens.active.selection != null;
     }
 
     pub fn setReplySink(self: *TerminalModel, sink: ?ReplySink) void {
@@ -195,6 +237,7 @@ pub const TerminalModel = struct {
             },
         });
         try self.refresh();
+        self.markFullDamage();
     }
 
     fn fromHandler(handler: *VtHandler) *TerminalModel {
@@ -343,72 +386,37 @@ pub const TerminalModel = struct {
     }
 
     pub fn startSelection(self: *TerminalModel, row: u32, column: u32) void {
-        const old_bounds = self.selectionBounds();
-        const point: Cursor = .{
-            .row = @min(row, self.rows() -| 1),
-            .column = @min(column, self.columns() -| 1),
-            .style = .block,
-            .color = .{ .red = 0, .green = 0, .blue = 0 },
-            .visible = false,
-            .blinking = false,
-        };
-        self.selection_anchor = point;
-        self.selection_head = point;
-        self.mergeSelectionDamage(old_bounds, self.selectionBounds());
+        self.setSelection(row, column, row, column);
     }
 
     pub fn updateSelection(self: *TerminalModel, row: u32, column: u32) void {
-        if (self.selection_anchor == null) return;
-        const old_bounds = self.selectionBounds();
-        self.selection_head = .{
-            .row = @min(row, self.rows() -| 1),
-            .column = @min(column, self.columns() -| 1),
-            .style = .block,
-            .color = .{ .red = 0, .green = 0, .blue = 0 },
-            .visible = false,
-            .blinking = false,
-        };
-        self.mergeSelectionDamage(old_bounds, self.selectionBounds());
+        const screen = self.core.screens.active;
+        const anchor = screen.selection orelse return;
+        const start = anchor.start();
+        const end = self.viewportPin(row, column) orelse return;
+        self.markVisibleSelectionRows();
+        screen.select(.init(start, end, false)) catch self.markFullDamage();
+        self.refreshSelection() catch self.markFullDamage();
+        self.markVisibleSelectionRows();
     }
 
     pub fn clearSelection(self: *TerminalModel) void {
-        const old_bounds = self.selectionBounds();
-        self.selection_anchor = null;
-        self.selection_head = null;
-        self.mergeSelectionDamage(old_bounds, null);
+        self.markVisibleSelectionRows();
+        self.core.screens.active.clearSelection();
+        self.refreshSelection() catch self.markFullDamage();
+        self.markVisibleSelectionRows();
     }
 
     pub fn selectionTextAlloc(
         self: *const TerminalModel,
         allocator: std.mem.Allocator,
-    ) ![]u8 {
-        const bounds = self.selectionBounds() orelse return allocator.alloc(u8, 0);
-        var output: std.Io.Writer.Allocating = .init(allocator);
-        defer output.deinit();
-        for (bounds.start.row..bounds.end.row + 1) |row| {
-            const first_column = if (row == bounds.start.row)
-                bounds.start.column
-            else
-                0;
-            const last_column = if (row == bounds.end.row)
-                bounds.end.column
-            else
-                self.columns() - 1;
-            var line: std.Io.Writer.Allocating = .init(allocator);
-            defer line.deinit();
-            for (first_column..last_column + 1) |column| {
-                const snapshot = self.cell(row, column) orelse continue;
-                if (snapshot.spacer) continue;
-                const codepoint = snapshot.codepoint orelse ' ';
-                try writeCodepoint(&line.writer, codepoint);
-                for (snapshot.grapheme) |grapheme|
-                    try writeCodepoint(&line.writer, grapheme);
-            }
-            const text = std.mem.trimEnd(u8, line.writer.buffered(), " ");
-            try output.writer.writeAll(text);
-            if (row != bounds.end.row) try output.writer.writeByte('\n');
-        }
-        return output.toOwnedSlice();
+    ) ![:0]const u8 {
+        const selection = self.core.screens.active.selection orelse
+            return allocator.allocSentinel(u8, 0, 0);
+        const result = try self.core.screens.active.selectionString(allocator, .{
+            .sel = selection,
+        });
+        return result;
     }
 
     pub fn cell(self: *const TerminalModel, row: usize, column: usize) ?CellSnapshot {
@@ -470,30 +478,63 @@ pub const TerminalModel = struct {
             .bold = style.flags.bold,
             .faint = style.flags.faint,
             .underline = style.flags.underline != .none,
-            .selected = self.isSelected(@intCast(row), @intCast(column)),
+            .selected = if (self.render_state.row_data.items(.selection)[row]) |range|
+                column >= range[0] and column <= range[1]
+            else
+                false,
         };
     }
 
-    const SelectionBounds = struct {
-        start: Cursor,
-        end: Cursor,
-    };
-
-    fn selectionBounds(self: *const TerminalModel) ?SelectionBounds {
-        var start = self.selection_anchor orelse return null;
-        var end = self.selection_head orelse return null;
-        if (end.row < start.row or
-            (end.row == start.row and end.column < start.column))
-            std.mem.swap(Cursor, &start, &end);
-        return .{ .start = start, .end = end };
+    /// Stable representation of everything ttyrtle draws for one viewport row.
+    /// The retained renderer uses this to recognize a physical terminal scroll.
+    pub fn rowFingerprint(self: *const TerminalModel, row: usize) u64 {
+        var hash: u64 = 0xcbf29ce484222325;
+        for (0..self.columns()) |column| {
+            const snapshot = self.cell(row, column) orelse continue;
+            hash = fingerprintMix(hash, snapshot.codepoint orelse 0);
+            for (snapshot.grapheme) |codepoint|
+                hash = fingerprintMix(hash, codepoint);
+            hash = fingerprintMix(hash, @intFromBool(snapshot.spacer));
+            hash = fingerprintMix(hash, @intFromBool(snapshot.bold));
+            hash = fingerprintMix(hash, @intFromBool(snapshot.faint));
+            hash = fingerprintMix(hash, @intFromBool(snapshot.underline));
+            hash = fingerprintMix(hash, @intFromBool(snapshot.selected));
+            hash = fingerprintMix(hash, snapshot.foreground.red);
+            hash = fingerprintMix(hash, snapshot.foreground.green);
+            hash = fingerprintMix(hash, snapshot.foreground.blue);
+            hash = fingerprintMix(hash, snapshot.background.red);
+            hash = fingerprintMix(hash, snapshot.background.green);
+            hash = fingerprintMix(hash, snapshot.background.blue);
+        }
+        return hash;
     }
 
-    fn isSelected(self: *const TerminalModel, row: u32, column: u32) bool {
-        const bounds = self.selectionBounds() orelse return false;
-        if (row < bounds.start.row or row > bounds.end.row) return false;
-        if (row == bounds.start.row and column < bounds.start.column) return false;
-        if (row == bounds.end.row and column > bounds.end.column) return false;
-        return true;
+    fn viewportPin(self: *TerminalModel, row: u32, column: u32) ?ghostty.Pin {
+        return self.core.screens.active.pages.pin(.{ .viewport = .{
+            .x = @intCast(@min(column, self.columns() -| 1)),
+            .y = @min(row, self.rows() -| 1),
+        } });
+    }
+
+    fn setSelection(self: *TerminalModel, start_row: u32, start_column: u32, end_row: u32, end_column: u32) void {
+        self.markVisibleSelectionRows();
+        const start = self.viewportPin(start_row, start_column) orelse return;
+        const end = self.viewportPin(end_row, end_column) orelse return;
+        self.core.screens.active.select(.init(start, end, false)) catch self.markFullDamage();
+        self.refreshSelection() catch self.markFullDamage();
+        self.markVisibleSelectionRows();
+    }
+
+    fn refreshSelection(self: *TerminalModel) !void {
+        self.selection_refresh = true;
+        defer self.selection_refresh = false;
+        try self.refresh();
+    }
+
+    fn markVisibleSelectionRows(self: *TerminalModel) void {
+        for (self.render_state.row_data.items(.selection), 0..) |range, row| {
+            if (range != null) self.mergeDamageRow(@intCast(row)) catch self.markFullDamage();
+        }
     }
 
     fn collectRenderDamage(
@@ -508,7 +549,7 @@ pub const TerminalModel = struct {
                     if (dirty) try self.mergeDamageRow(@intCast(row));
                 }
             },
-            .full => self.markFullDamage(),
+            .full => if (!self.selection_refresh) self.markFullDamage(),
         }
 
         const new_cursor_row = renderCursorRow(&self.render_state);
@@ -528,19 +569,6 @@ pub const TerminalModel = struct {
         }
         try self.damage_rows.append(self.allocator, row);
         if (self.damage_rows.items.len == self.rows()) self.markFullDamage();
-    }
-
-    fn mergeSelectionDamage(
-        self: *TerminalModel,
-        old_bounds: ?SelectionBounds,
-        new_bounds: ?SelectionBounds,
-    ) void {
-        for (0..self.rows()) |row| {
-            const old_range = selectionRangeForRow(old_bounds, @intCast(row), self.columns());
-            const new_range = selectionRangeForRow(new_bounds, @intCast(row), self.columns());
-            if (!std.meta.eql(old_range, new_range))
-                self.mergeDamageRow(@intCast(row)) catch self.markFullDamage();
-        }
     }
 
     pub fn rowTextUtf8(
@@ -570,30 +598,12 @@ fn renderCursorRow(state: *const ghostty.RenderState) ?u16 {
     return viewport.y;
 }
 
-fn selectionRangeForRow(
-    bounds: ?TerminalModel.SelectionBounds,
-    row: u32,
-    columns: u16,
-) ?[2]u32 {
-    const selected = bounds orelse return null;
-    if (row < selected.start.row or row > selected.end.row) return null;
-    return .{
-        if (row == selected.start.row) selected.start.column else 0,
-        if (row == selected.end.row)
-            selected.end.column
-        else
-            columns -| 1,
-    };
-}
-
 fn rgb(color: ghostty.color.RGB) Rgb {
     return .{ .red = color.r, .green = color.g, .blue = color.b };
 }
 
-fn writeCodepoint(writer: *std.Io.Writer, codepoint: u21) !void {
-    var encoded: [4]u8 = undefined;
-    const length = try std.unicode.utf8Encode(codepoint, &encoded);
-    try writer.writeAll(encoded[0..length]);
+fn fingerprintMix(hash: u64, value: anytype) u64 {
+    return (hash ^ @as(u64, @intCast(value))) *% 0x100000001b3;
 }
 
 const VtHandler = @FieldType(ghostty.TerminalStream, "handler");
@@ -797,7 +807,7 @@ test "cursor blinking damages only the cursor row" {
     try std.testing.expectEqualSlices(u16, &.{2}, rows);
 }
 
-test "selection changes damage only affected rows" {
+test "selection changes damage only its old and new visible rows" {
     var model: TerminalModel = undefined;
     try model.init(std.testing.allocator, 5, 20);
     defer model.deinit();
@@ -805,7 +815,7 @@ test "selection changes damage only affected rows" {
 
     model.startSelection(1, 3);
     var rows = switch (model.damage()) {
-        .partial => |rows| rows,
+        .partial => |value| value,
         else => return error.ExpectedPartialDamage,
     };
     try std.testing.expectEqualSlices(u16, &.{1}, rows);
@@ -813,7 +823,7 @@ test "selection changes damage only affected rows" {
 
     model.updateSelection(2, 4);
     rows = switch (model.damage()) {
-        .partial => |dirty_rows| dirty_rows,
+        .partial => |value| value,
         else => return error.ExpectedPartialDamage,
     };
     try std.testing.expectEqualSlices(u16, &.{ 1, 2 }, rows);
@@ -984,4 +994,41 @@ test "selection extracts trimmed multiline Unicode text" {
     try std.testing.expectEqualStrings("éllo\nworld", text);
     try std.testing.expect(model.cell(0, 1).?.selected);
     try std.testing.expect(!model.cell(0, 0).?.selected);
+}
+
+test "scrollback retains history and output does not dislodge a historical viewport" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 3, 16);
+    defer model.deinit();
+
+    try model.write("first\r\nsecond\r\nthird\r\nfourth\r\nfifth");
+    try model.scrollViewportTop();
+    try std.testing.expect(!model.viewportFollowsBottom());
+    var buffer: [16]u8 = undefined;
+    const first_length = try model.rowTextUtf8(0, &buffer);
+    try std.testing.expectEqualStrings("first", buffer[0..first_length]);
+
+    try model.write("\r\nsixth");
+    try std.testing.expect(!model.viewportFollowsBottom());
+    const retained_length = try model.rowTextUtf8(0, &buffer);
+    try std.testing.expectEqualStrings("first", buffer[0..retained_length]);
+
+    try model.scrollViewportBottom();
+    try std.testing.expect(model.viewportFollowsBottom());
+}
+
+test "scrollback delta and page navigation clamp at live bottom" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 16);
+    defer model.deinit();
+    try model.write("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6");
+
+    try model.scrollViewport(-1);
+    try std.testing.expect(!model.viewportFollowsBottom());
+    try model.scrollViewportPage(.down);
+    try std.testing.expect(model.viewportFollowsBottom());
+    try model.scrollViewportTop();
+    try std.testing.expect(!model.viewportFollowsBottom());
+    try model.scrollViewportPage(.up);
+    try std.testing.expect(!model.viewportFollowsBottom());
 }

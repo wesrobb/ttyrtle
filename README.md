@@ -43,10 +43,14 @@ sound.
   label the corresponding tab and window; an explicit tab name takes priority.
 - `Ctrl+Shift+C` copies the current selection as Unicode text.
 - `Ctrl+Shift+V` pastes Unicode clipboard text.
-- Drag with the left mouse button to select text.
+- Drag with the left mouse button to select text, including retained history.
 - Hold `Shift` while dragging to select locally when an application has mouse
   reporting enabled.
 - Focus and mouse events are sent only when requested by terminal modes.
+- Each tab retains up to 10 MiB of primary-screen scrollback. Use the mouse
+  wheel to browse it; when an application enables mouse reporting, hold
+  `Shift` while wheeling for local history. `Shift+Page Up`/`Shift+Page Down`
+  page through history, and `Ctrl+Home`/`Ctrl+End` go to its top/live bottom.
 - Paste bytes are sanitized by Ghostty. Multiline paste is rejected unless
   bracketed-paste mode is active.
 
@@ -99,6 +103,13 @@ background OSC labels, resize/DPI propagation, and stale notifications.
 GitHub Actions runs `zig build verify` on Windows with pinned Ghostty and
 zigwin32 revisions.
 
+The GPU smoke benchmark also sends a 180-line live-output burst to a populated
+viewport. It must coalesce that burst into one presentation and complete within
+three seconds. This guards against a regression that waits for v-sync once per
+output notification; detailed diagnostics identify whether time is spent in
+terminal refresh, retained-row rebuilding, text layout, scene drawing, or
+presentation.
+
 ConPTY startup failures are recoverable errors. The failing API and its Win32
 error code (or HRESULT for `CreatePseudoConsole`) are written to diagnostics
 before the application exits.
@@ -108,7 +119,8 @@ before the application exits.
 Keyboard input supports printable Unicode, common editing/navigation keys,
 function keys, modifiers, and repeats. Committed IME text follows the normal
 Windows character path, but pre-edit composition and candidate positioning are
-not rendered yet. Selection is viewport-local and does not yet scroll beyond
+not rendered yet. Selection is backed by Ghostty's retained screen state and
+can span scrollback and the live viewport.
 the visible grid.
 
 The Direct2D renderer shapes one complete UTF-16 row at a time with persistent

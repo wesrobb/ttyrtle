@@ -38,6 +38,8 @@ pub const GraphemeSpan = struct {
 
 pub const CachedRow = struct {
     generation: u64 = 0,
+    fingerprint: u64 = 0,
+    selection_active: bool = false,
     utf16: std.ArrayListUnmanaged(u16) = .empty,
     utf16_to_cell: std.ArrayListUnmanaged(u16) = .empty,
     cells: std.ArrayListUnmanaged(CellMetadata) = .empty,
@@ -88,6 +90,9 @@ pub const RenderCache = struct {
     pub const Diagnostics = struct {
         dirty_rows: u64,
         rebuilt_rows: u64,
+        scroll_reuses: u64,
+        scroll_reused_rows: u64,
+        full_rebuilds: u64,
         rectangle_requests: u64,
         rectangle_commands: u64,
     };
@@ -96,10 +101,16 @@ pub const RenderCache = struct {
     rows: std.ArrayListUnmanaged(CachedRow) = .empty,
     columns: u16 = 0,
     metrics: ?geometry.Metrics = null,
+    /// Positive means the terminal viewport scrolled upward by this many rows
+    /// during the most recent full-damage update.
+    scroll_up_rows: u16 = 0,
     dirty_row_count: if (counters_enabled) u64 else void,
     rebuilt_row_count: if (counters_enabled) u64 else void,
     rectangle_request_count: if (counters_enabled) u64 else void,
     rectangle_merge_count: if (counters_enabled) u64 else void,
+    scroll_reuse_count: if (counters_enabled) u64 else void,
+    scroll_reused_row_count: if (counters_enabled) u64 else void,
+    full_rebuild_count: if (counters_enabled) u64 else void,
 
     pub fn init(allocator: std.mem.Allocator) RenderCache {
         return .{
@@ -108,6 +119,9 @@ pub const RenderCache = struct {
             .rebuilt_row_count = if (counters_enabled) 0 else {},
             .rectangle_request_count = if (counters_enabled) 0 else {},
             .rectangle_merge_count = if (counters_enabled) 0 else {},
+            .scroll_reuse_count = if (counters_enabled) 0 else {},
+            .scroll_reused_row_count = if (counters_enabled) 0 else {},
+            .full_rebuild_count = if (counters_enabled) 0 else {},
         };
     }
 
@@ -133,28 +147,42 @@ pub const RenderCache = struct {
         if (dimensions_changed) try self.resize(model.rows(), model.columns());
         self.metrics = metrics;
         self.background = model.background();
+        self.scroll_up_rows = 0;
 
         if (dimensions_changed or metrics_changed) {
             try self.rebuildAll(model, metrics);
             self.recordDirtyRows(self.rows.items.len);
+            if (counters_enabled) self.full_rebuild_count +|= 1;
             return;
         }
 
         switch (damage) {
             .none => {},
             .full => {
-                try self.rebuildAll(model, metrics);
-                self.recordDirtyRows(self.rows.items.len);
+                if (!try self.reuseScrolledRows(model, metrics)) {
+                    try self.rebuildAll(model, metrics);
+                    self.recordDirtyRows(self.rows.items.len);
+                    if (counters_enabled) self.full_rebuild_count +|= 1;
+                }
             },
             .partial => |dirty_rows| {
-                var accepted: usize = 0;
-                for (dirty_rows) |row| {
-                    if (row < self.rows.items.len) {
-                        try self.rebuildRow(model, metrics, row);
-                        accepted += 1;
+                // Ghostty commonly marks every row except one as dirty for a
+                // physical scroll. Verify a scroll before rebuilding that
+                // near-full viewport row by row.
+                if (dirty_rows.len * 4 >= self.rows.items.len * 3 and
+                    try self.reuseScrolledRows(model, metrics))
+                {
+                    return;
+                } else {
+                    var accepted: usize = 0;
+                    for (dirty_rows) |row| {
+                        if (row < self.rows.items.len) {
+                            try self.rebuildRow(model, metrics, row);
+                            accepted += 1;
+                        }
                     }
+                    self.recordDirtyRows(accepted);
                 }
-                self.recordDirtyRows(accepted);
             },
         }
     }
@@ -163,12 +191,18 @@ pub const RenderCache = struct {
         if (!counters_enabled) return .{
             .dirty_rows = 0,
             .rebuilt_rows = 0,
+            .scroll_reuses = 0,
+            .scroll_reused_rows = 0,
+            .full_rebuilds = 0,
             .rectangle_requests = 0,
             .rectangle_commands = 0,
         };
         return .{
             .dirty_rows = self.dirty_row_count,
             .rebuilt_rows = self.rebuilt_row_count,
+            .scroll_reuses = self.scroll_reuse_count,
+            .scroll_reused_rows = self.scroll_reused_row_count,
+            .full_rebuilds = self.full_rebuild_count,
             .rectangle_requests = self.rectangle_request_count,
             .rectangle_commands = self.rectangle_request_count -
                 self.rectangle_merge_count,
@@ -333,7 +367,52 @@ pub const RenderCache = struct {
             });
         }
         row.generation +%= 1;
+        row.fingerprint = model.rowFingerprint(row_index);
+        row.selection_active = model.hasSelection();
         if (counters_enabled) self.rebuilt_row_count +|= 1;
+    }
+
+    fn detectScrollUp(self: *const RenderCache, model: *const terminal.TerminalModel) ?usize {
+        if (self.rows.items.len < 2) return null;
+        // Find the current first row in the old cache, then verify that one
+        // candidate. This recognizes an output burst of any viewport-sized
+        // scroll distance without repeatedly hashing the full viewport.
+        const first = model.rowFingerprint(0);
+        for (1..self.rows.items.len) |shift| {
+            if (self.rows.items[shift].fingerprint != first) continue;
+            for (1..self.rows.items.len - shift) |row| {
+                if (model.rowFingerprint(row) != self.rows.items[row + shift].fingerprint)
+                    break;
+            } else return shift;
+        }
+        return null;
+    }
+
+    fn rotateRowsUp(self: *RenderCache, count: usize) void {
+        for (0..count) |_| {
+            const moved = self.rows.orderedRemove(0);
+            self.rows.appendAssumeCapacity(moved);
+        }
+    }
+
+    fn reuseScrolledRows(
+        self: *RenderCache,
+        model: *const terminal.TerminalModel,
+        metrics: geometry.Metrics,
+    ) !bool {
+        if (model.hasSelection()) return false;
+        const rows = self.detectScrollUp(model) orelse return false;
+        self.rotateRowsUp(rows);
+        const start = self.rows.items.len - rows;
+        for (start..self.rows.items.len) |row|
+            try self.rebuildRow(model, metrics, @intCast(row));
+        self.scroll_up_rows = @intCast(rows);
+        self.recordDirtyRows(rows);
+        if (counters_enabled) {
+            self.scroll_reuse_count +|= 1;
+            self.scroll_reused_row_count +|= @intCast(self.rows.items.len - rows);
+        }
+        return true;
     }
 
     fn appendRectangle(
@@ -447,6 +526,51 @@ test "cache rebuilds only dirty rows" {
     try std.testing.expectEqual(generations[3], cache.rows.items[3].generation);
     const after = cache.diagnostics();
     try std.testing.expectEqual(before.dirty_rows + 2, after.dirty_rows);
+    try std.testing.expectEqual(before.rebuilt_rows + 2, after.rebuilt_rows);
+}
+
+test "cache reuses retained rows when live output scrolls a full viewport" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    try model.write("zero\r\none\r\ntwo\r\nthree");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    model.acknowledgeDamage();
+    const before = cache.diagnostics();
+    const old_second_generation = cache.rows.items[1].generation;
+
+    try model.write("\r\nfour");
+    try std.testing.expect(model.damage() == .full);
+    try cache.update(&model, metrics, model.damage());
+
+    try std.testing.expectEqual(@as(u16, 1), cache.scroll_up_rows);
+    try std.testing.expectEqual(old_second_generation, cache.rows.items[0].generation);
+    const after = cache.diagnostics();
+    try std.testing.expectEqual(before.rebuilt_rows + 1, after.rebuilt_rows);
+}
+
+test "cache reuses retained rows for a coalesced multi-line scroll burst" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 5, 20);
+    defer model.deinit();
+    try model.write("zero\r\none\r\ntwo\r\nthree\r\nfour");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    model.acknowledgeDamage();
+    const before = cache.diagnostics();
+    const old_third_generation = cache.rows.items[2].generation;
+
+    try model.write("\r\nfive\r\nsix");
+    try cache.update(&model, metrics, model.damage());
+
+    try std.testing.expectEqual(@as(u16, 2), cache.scroll_up_rows);
+    try std.testing.expectEqual(old_third_generation, cache.rows.items[0].generation);
+    const after = cache.diagnostics();
     try std.testing.expectEqual(before.rebuilt_rows + 2, after.rebuilt_rows);
 }
 

@@ -55,7 +55,7 @@ constraints, but they do not replace this tracker.
 
 ### Terminal interaction
 
-- Scrollback history with configurable limits, keyboard/mouse navigation, and
+- **Planned** — Scrollback history with configurable limits, keyboard/mouse navigation, and
   selection beyond the visible viewport.
 - OSC 8 hyperlinks with safe modifier-click opening and an untrusted-target
   confirmation policy.

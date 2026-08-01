@@ -84,6 +84,11 @@ var render_cache_initialized = false;
 var output_trace: frame_trace.Counter = .{};
 var paint_trace: frame_trace.Counter = .{};
 var cache_trace: frame_trace.Counter = .{};
+var output_frame_pending = false;
+
+const cursor_timer_id = 1;
+const output_frame_timer_id = 2;
+const output_frame_interval_ms = 8;
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
@@ -143,6 +148,7 @@ pub fn run(mode: Mode) !void {
     output_trace = .{};
     paint_trace = .{};
     cache_trace = .{};
+    output_frame_pending = false;
     defer {
         render_cache.deinit();
         render_cache_initialized = false;
@@ -218,9 +224,10 @@ pub fn run(mode: Mode) !void {
     try syncNativeTabs();
     if (mode != .smoke_gdi)
         active_renderer.initialize(window);
-    const cursor_timer = user32.SetTimer(window, 1, 500, null);
+    const cursor_timer = user32.SetTimer(window, cursor_timer_id, 500, null);
     defer {
         if (cursor_timer != 0) _ = user32.KillTimer(window, cursor_timer);
+        _ = user32.KillTimer(window, output_frame_timer_id);
     }
 
     terminal_metrics = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
@@ -1255,8 +1262,13 @@ fn windowProc(
             return 0;
         },
         wm.WM_TIMER => {
-            if (wparam == 1) {
+            if (wparam == cursor_timer_id) {
                 model.toggleCursorBlink();
+                invalidateRenderDamage(window);
+            }
+            if (wparam == output_frame_timer_id) {
+                _ = user32.KillTimer(window, output_frame_timer_id);
+                output_frame_pending = false;
                 invalidateRenderDamage(window);
             }
             return 0;
@@ -1469,6 +1481,7 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) bool {
     const bits: usize = @bitCast(lparam);
     const repeated = (bits & (@as(usize, 1) << 30)) != 0;
     const modifiers = currentModifiers();
+    if (handleViewportKey(message, wparam, modifiers)) return true;
     if (shortcut_state.handleKey(message, wparam, repeated, modifiers)) |shortcut| switch (shortcut) {
         .suppress => {},
         .new_tab => if (is_down) {
@@ -1514,6 +1527,32 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) bool {
     return true;
 }
 
+/// Windows navigation shortcuts reserved for local history. Handle both press
+/// and release so terminal applications never see a mismatched key sequence.
+fn handleViewportKey(message: u32, virtual_key: usize, modifiers: input.Mods) bool {
+    const is_key_message = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN or
+        message == wm.WM_KEYUP or message == wm.WM_SYSKEYUP;
+    if (!is_key_message) return false;
+    const behavior: ?enum { page_up, page_down, top, bottom } = switch (virtual_key) {
+        0x21 => if (modifiers.shift) .page_up else null,
+        0x22 => if (modifiers.shift) .page_down else null,
+        0x24 => if (modifiers.ctrl) .top else null,
+        0x23 => if (modifiers.ctrl) .bottom else null,
+        else => null,
+    };
+    const action = behavior orelse return false;
+    if (message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN) {
+        switch (action) {
+            .page_up => model.scrollViewportPage(.up) catch {},
+            .page_down => model.scrollViewportPage(.down) catch {},
+            .top => model.scrollViewportTop() catch {},
+            .bottom => model.scrollViewportBottom() catch {},
+        }
+        if (app_window) |window| invalidateRenderDamage(window);
+    }
+    return true;
+}
+
 const MouseButton = input.MouseButton;
 
 fn queueFocus(event: input.FocusEvent) void {
@@ -1535,6 +1574,9 @@ fn queueOwnedInput(encoded: []u8) void {
         std.heap.smp_allocator.free(encoded);
         return;
     };
+    // Any input sent to the hosted application returns this tab to its live
+    // viewport; output itself deliberately leaves a historical view alone.
+    if (!model.viewportFollowsBottom()) model.scrollViewportBottom() catch {};
     active_session.queueInputOwned(encoded) catch {
         std.heap.smp_allocator.free(encoded);
     };
@@ -1552,6 +1594,19 @@ fn handleMouseMessage(
     if (message == wm.WM_MOUSEWHEEL and
         user32.ScreenToClient(window, &point) == 0) return;
     const cell = pointToCell(point);
+
+    if (message == wm.WM_MOUSEWHEEL and
+        (model.core.flags.mouse_event == .none or currentModifiers().shift))
+    {
+        const wheel_delta: i32 = signedHighWord(wparam);
+        if (wheel_delta != 0) {
+            const lines = wheelScrollLines();
+            const delta: isize = @divTrunc(@as(isize, wheel_delta) * @as(isize, @intCast(lines)), 120);
+            model.scrollViewport(-delta) catch {};
+            invalidateRenderDamage(window);
+        }
+        return;
+    }
 
     if (local_selection) {
         switch (message) {
@@ -1631,6 +1686,15 @@ fn handleMouseMessage(
         pressed_mouse_button != null,
     ) catch return;
     queueOwnedInput(encoded);
+}
+
+fn wheelScrollLines() u32 {
+    var lines: u32 = 3;
+    const param: *anyopaque = @ptrCast(&lines);
+    if (user32.SystemParametersInfoW(wm.SPI_GETWHEELSCROLLLINES, 0, param, .{}) == 0)
+        return 3;
+    // WHEEL_PAGESCROLL is UINT_MAX; a page is the closest native equivalent.
+    return if (lines == std.math.maxInt(u32)) @max(model.rows() -| 1, 1) else lines;
 }
 
 fn messagePoint(lparam: isize) foundation.POINT {
@@ -1781,6 +1845,7 @@ fn encodeAndQueueInput(event: input.NormalizedKey) void {
 
 fn queueEncodedInput(event: input.NormalizedKey) !void {
     const active_session = activeProcess() orelse return;
+    if (!model.viewportFollowsBottom()) try model.scrollViewportBottom();
     const encoded = input.encodeAlloc(
         std.heap.smp_allocator,
         event,
@@ -1909,11 +1974,12 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
 
     const changed = batch.chunks.items.len != 0;
     if (changed) {
-        applyOutputBatchForSession(window, session, batch.chunks.items) catch {
+        applyOutputBatchForSession(window, session, batch.chunks.items, true) catch {
             std.log.err("failed to apply ConPTY output to the terminal model", .{});
             if (isIntegrationMode(active_mode)) _ = user32.DestroyWindow(window);
             return;
         };
+        if (workspace_state.activeSession() == session) scheduleOutputFrame(window);
     } else {
         applyTerminalEffectsForSession(window, session);
     }
@@ -2000,7 +2066,7 @@ fn logDebugCounters() void {
     const renderer_counts = active_renderer.diagnostics();
     std.log.info(
         "performance counters: batches={d} chunks={d} refreshes={d} " ++
-            "dirty_rows={d} rebuilt_rows={d} layout_rebuilds={d} " ++
+            "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} " ++
             "rectangle_requests={d} rectangle_commands={d} " ++
             "frames_requested={d} frames_presented={d} " ++
             "gpu_presents={d} device_recreations={d}",
@@ -2010,6 +2076,9 @@ fn logDebugCounters() void {
             terminal_counts.render_refreshes,
             cache_counts.dirty_rows,
             cache_counts.rebuilt_rows,
+            cache_counts.scroll_reuses,
+            cache_counts.scroll_reused_rows,
+            cache_counts.full_rebuilds,
             renderer_counts.layout_build_count,
             cache_counts.rectangle_requests,
             cache_counts.rectangle_commands,
@@ -2033,7 +2102,7 @@ fn logDebugCounters() void {
         writeTraceLine(
             trace_file,
             "performance counters: batches={d} chunks={d} refreshes={d} " ++
-                "dirty_rows={d} rebuilt_rows={d} layout_rebuilds={d} " ++
+                "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} " ++
                 "rectangle_requests={d} rectangle_commands={d} " ++
                 "frames_requested={d} frames_presented={d} " ++
                 "gpu_presents={d} device_recreations={d}",
@@ -2043,6 +2112,9 @@ fn logDebugCounters() void {
                 terminal_counts.render_refreshes,
                 cache_counts.dirty_rows,
                 cache_counts.rebuilt_rows,
+                cache_counts.scroll_reuses,
+                cache_counts.scroll_reused_rows,
+                cache_counts.full_rebuilds,
                 renderer_counts.layout_build_count,
                 cache_counts.rectangle_requests,
                 cache_counts.rectangle_commands,
@@ -2130,20 +2202,36 @@ fn writeTraceLine(
 }
 
 fn applyOutputBatch(window: foundation.HWND, chunks: []const []const u8) !void {
-    try applyOutputBatchForSession(window, workspace_state.activeSession() orelse return, chunks);
+    try applyOutputBatchForSession(
+        window,
+        workspace_state.activeSession() orelse return,
+        chunks,
+        false,
+    );
 }
 
 fn applyOutputBatchForSession(
     window: foundation.HWND,
     session: *workspace.TerminalSession,
     chunks: []const []const u8,
+    defer_paint: bool,
 ) !void {
     const trace_start = frame_trace.timestamp();
     defer output_trace.recordSince(trace_start);
     try session.model.writeBatch(chunks);
     session.model.resetCursorBlink();
     applyTerminalEffectsForSession(window, session);
-    if (workspace_state.activeSession() == session) invalidateRenderDamage(window);
+    if (workspace_state.activeSession() == session and !defer_paint)
+        invalidateRenderDamage(window);
+}
+
+fn scheduleOutputFrame(window: foundation.HWND) void {
+    if (output_frame_pending) return;
+    output_frame_pending = true;
+    if (user32.SetTimer(window, output_frame_timer_id, output_frame_interval_ms, null) == 0) {
+        output_frame_pending = false;
+        invalidateRenderDamage(window);
+    }
 }
 
 fn applyTerminalEffectsForSession(window: foundation.HWND, session: *workspace.TerminalSession) void {
@@ -2260,19 +2348,21 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     const scroll_chunk = [_][]const u8{"\r\nphase-five-debug-scroll"};
     for (0..scroll_iterations) |_| {
         try applyOutputBatch(window, &scroll_chunk);
-        try paintForTesting(window);
     }
+    // This models a real output burst: terminal state is updated for every
+    // chunk, but only one frame is presented after coalescing the burst.
+    try paintForTesting(window);
     if (kernel32.QueryPerformanceCounter(&scroll_end) == 0)
         return error.PerformanceCounterUnavailable;
     const after_scroll = active_renderer.diagnostics();
     if (after_scroll.gpu_present_count !=
-        before_scroll.gpu_present_count + scroll_iterations)
+        before_scroll.gpu_present_count + 1)
         return error.ScrollingPresentationCountMismatch;
     const scroll_milliseconds = @divTrunc(
         (scroll_end.QuadPart - scroll_start.QuadPart) * 1000,
         frequency.QuadPart,
     );
-    if (scroll_milliseconds > 12_000)
+    if (scroll_milliseconds > 3_000)
         return error.DebugScrollingNotResponsive;
 
     const before_loss = active_renderer.diagnostics();

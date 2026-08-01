@@ -28,6 +28,7 @@ const BrushEntry = struct {
 const RowLayouts = struct {
     row_generation: u64 = 0,
     font_generation: u64 = 0,
+    content_fingerprint: u64 = 0,
     layout: ?*dwrite.IDWriteTextLayout = null,
 
     fn clear(self: *RowLayouts) void {
@@ -35,6 +36,7 @@ const RowLayouts = struct {
         self.layout = null;
         self.row_generation = 0;
         self.font_generation = 0;
+        self.content_fingerprint = 0;
     }
 
     fn deinit(self: *RowLayouts) void {
@@ -344,6 +346,7 @@ pub const DeviceResources = struct {
 
         _ = try self.ensureTextFormat(metrics, dpi);
         try self.resizeRowLayouts(cache.rows.items.len);
+        self.rotateRowLayoutsUp(cache.scroll_up_rows);
         if (!self.scene_valid) {
             try self.drawScene(cache, .full, metrics, dpi);
         } else switch (damage) {
@@ -578,6 +581,17 @@ pub const DeviceResources = struct {
         }
     }
 
+    /// Keep DirectWrite layouts paired with the cached content when a terminal
+    /// line scrolls off the top. The bottom row is rebuilt by the normal
+    /// generation check in ensureRowLayouts.
+    fn rotateRowLayoutsUp(self: *DeviceResources, count: u16) void {
+        const rows = @min(@as(usize, count), self.row_layouts.items.len);
+        for (0..rows) |_| {
+            const moved = self.row_layouts.orderedRemove(0);
+            self.row_layouts.appendAssumeCapacity(moved);
+        }
+    }
+
     fn ensureRowLayouts(
         self: *DeviceResources,
         row_index: usize,
@@ -589,6 +603,25 @@ pub const DeviceResources = struct {
         if (layouts.row_generation == row.generation and
             layouts.font_generation == self.font_generation)
             return layouts;
+
+        // Broad terminal damage can move unchanged rows to new viewport
+        // positions. DirectWrite layouts are position-independent, so transfer
+        // an identical retained layout instead of constructing it again. A
+        // block cursor changes the drawing effect in the row, so that row is
+        // intentionally rebuilt.
+        if (!row.selection_active and !rowHasCursor(row) and !rowHasSelection(row)) {
+            for (self.row_layouts.items, 0..) |candidate, index| {
+                if (index == row_index or candidate.layout == null or
+                    candidate.font_generation != self.font_generation or
+                    candidate.content_fingerprint != row.fingerprint)
+                    continue;
+                layouts.clear();
+                layouts.* = candidate;
+                self.row_layouts.items[index] = .{};
+                layouts.row_generation = row.generation;
+                return layouts;
+            }
+        }
 
         const trace_start = frame_trace.timestamp();
         defer self.layout_trace.recordSince(trace_start);
@@ -669,6 +702,7 @@ pub const DeviceResources = struct {
         if (counters_enabled) self.layout_build_count +|= 1;
         layouts.row_generation = row.generation;
         layouts.font_generation = self.font_generation;
+        layouts.content_fingerprint = row.fingerprint;
         return layouts;
     }
 
@@ -797,6 +831,16 @@ pub const DeviceResources = struct {
         self.scene_valid = false;
     }
 };
+
+fn rowHasCursor(row: *const render_commands.CachedRow) bool {
+    for (row.cells.items) |cell| if (cell.cursor) return true;
+    return false;
+}
+
+fn rowHasSelection(row: *const render_commands.CachedRow) bool {
+    for (row.cells.items) |cell| if (cell.selected) return true;
+    return false;
+}
 
 fn dipScale(dpi: u32) f32 {
     return 96.0 / @as(f32, @floatFromInt(@max(dpi, 1)));
