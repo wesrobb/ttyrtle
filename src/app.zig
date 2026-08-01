@@ -69,6 +69,7 @@ var test_modifiers: ?input.Mods = null;
 var test_context_menu_command: ?usize = null;
 var rename_editor: ?RenameEditor = null;
 var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
+var tab_drag: TabDrag = .{};
 var selection_dragging = false;
 var selection_anchor: ?terminal.Cursor = null;
 var selection_head: ?terminal.Cursor = null;
@@ -110,6 +111,7 @@ pub fn run(mode: Mode) !void {
     test_context_menu_command = null;
     rename_editor = null;
     terminal_metrics = .forDpi(geometry.base_dpi);
+    tab_drag = .{};
     selection_dragging = false;
     selection_anchor = null;
     selection_head = null;
@@ -325,7 +327,14 @@ const RenameEditor = struct {
     tab_id: workspace.TabId,
 };
 
+const TabDrag = struct {
+    candidate_id: ?workspace.TabId = null,
+    anchor: foundation.POINT = .{ .x = 0, .y = 0 },
+    dragging: bool = false,
+};
+
 fn beginRenameTab(id: workspace.TabId) !void {
+    cancelTabDrag();
     if (rename_editor) |editor| {
         if (editor.tab_id == id) return;
         finishRename(true);
@@ -459,6 +468,28 @@ fn tabControlProc(
     _: usize,
     _: usize,
 ) callconv(.winapi) isize {
+    if (message == wm.WM_LBUTTONDOWN) {
+        const hwnd = control orelse return 0;
+        var hit: controls.TCHITTESTINFO = .{
+            .pt = messagePoint(lparam),
+            .flags = controls.TCHT_NOWHERE,
+        };
+        const index = user32.SendMessageW(hwnd, controls.TCM_HITTEST, 0, @bitCast(@intFromPtr(&hit)));
+        if (index >= 0) {
+            if (nativeTabIdAt(@intCast(index))) |id| {
+                tab_drag = .{ .candidate_id = id, .anchor = hit.pt };
+            } else {
+                cancelTabDrag();
+            }
+        } else {
+            cancelTabDrag();
+        }
+        return comctl32.DefSubclassProc(control, message, wparam, lparam);
+    }
+    if (message == wm.WM_MOUSEMOVE) {
+        updateTabDrag(messagePoint(lparam));
+        return comctl32.DefSubclassProc(control, message, wparam, lparam);
+    }
     if (message == wm.WM_CONTEXTMENU) {
         const hwnd = control orelse return 0;
         if (lparam == -1) {
@@ -511,8 +542,13 @@ fn tabControlProc(
     }
     if (message == wm.WM_LBUTTONUP) {
         const result = comctl32.DefSubclassProc(control, message, wparam, lparam);
+        cancelTabDrag();
         if (app_window) |window| _ = user32.SetFocus(window);
         return result;
+    }
+    if (message == wm.WM_CANCELMODE or message == wm.WM_CAPTURECHANGED) {
+        tab_drag = .{};
+        return comctl32.DefSubclassProc(control, message, wparam, lparam);
     }
     return comctl32.DefSubclassProc(control, message, wparam, lparam);
 }
@@ -678,6 +714,7 @@ fn createTerminalTab(window: foundation.HWND) !void {
 }
 
 fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
+    cancelTabDrag();
     if (rename_editor) |editor| if (editor.tab_id == id) cancelRename();
     const tab = workspace_state.tab(id) orelse return;
     tab.root.terminalSession().closeProcess();
@@ -693,6 +730,64 @@ fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
     } else {
         _ = user32.DestroyWindow(window);
     }
+}
+
+fn cancelTabDrag() void {
+    const was_dragging = tab_drag.dragging;
+    tab_drag = .{};
+    if (was_dragging) _ = user32.ReleaseCapture();
+}
+
+fn tabDragExceededThreshold(anchor: foundation.POINT, point: foundation.POINT) bool {
+    const horizontal = @abs(point.x - anchor.x);
+    const vertical = @abs(point.y - anchor.y);
+    const minimum_horizontal: u32 = @intCast(@max(user32.GetSystemMetrics(wm.SM_CXDRAG), 1));
+    const minimum_vertical: u32 = @intCast(@max(user32.GetSystemMetrics(wm.SM_CYDRAG), 1));
+    return horizontal >= minimum_horizontal or vertical >= minimum_vertical;
+}
+
+fn tabDragTargetIndex(point: foundation.POINT) ?usize {
+    const control = tab_control orelse return null;
+    const count = user32.SendMessageW(control, controls.TCM_GETITEMCOUNT, 0, 0);
+    if (count <= 0) return null;
+    const last_index: usize = @intCast(count - 1);
+
+    var first: foundation.RECT = undefined;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, 0, @bitCast(@intFromPtr(&first))) == 0)
+        return null;
+    if (point.x < first.left) return 0;
+
+    var last: foundation.RECT = undefined;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, last_index, @bitCast(@intFromPtr(&last))) == 0)
+        return null;
+    if (point.x >= last.right) return last_index;
+
+    for (0..@as(usize, @intCast(count))) |index| {
+        var bounds: foundation.RECT = undefined;
+        if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, index, @bitCast(@intFromPtr(&bounds))) == 0)
+            return null;
+        if (point.x < bounds.left + @divTrunc(bounds.right - bounds.left, 2)) return index;
+    }
+    return last_index;
+}
+
+fn updateTabDrag(point: foundation.POINT) void {
+    const candidate_id = tab_drag.candidate_id orelse return;
+    if (!tab_drag.dragging) {
+        if (!tabDragExceededThreshold(tab_drag.anchor, point)) return;
+        if (workspace_state.tab(candidate_id) == null) return cancelTabDrag();
+        if (rename_editor != null) cancelRename();
+        tab_drag.dragging = true;
+        _ = user32.SetCapture(tab_control);
+    }
+
+    const target_index = tabDragTargetIndex(point) orelse return;
+    if (workspace_state.indexOfTab(candidate_id) == target_index) return;
+    if (!workspace_state.reorderTab(candidate_id, target_index)) return cancelTabDrag();
+    syncNativeTabs() catch |err| {
+        std.log.err("failed to synchronize reordered tabs: {}", .{err});
+        cancelTabDrag();
+    };
 }
 
 fn nativeIndexForTab(id: workspace.TabId) ?usize {
@@ -989,6 +1084,7 @@ fn windowProc(
             return 0;
         },
         wm.WM_SIZE => {
+            cancelTabDrag();
             if (wparam != wm.SIZE_MINIMIZED) {
                 resizeForClient(window) catch {
                     std.log.err("failed to resize terminal for client area", .{});
@@ -1015,6 +1111,7 @@ fn windowProc(
             return user32.DefWindowProcW(window, message, wparam, lparam);
         },
         wm.WM_DPICHANGED => {
+            cancelTabDrag();
             terminal_metrics = active_renderer.metricsForDpi(@as(u16, @truncate(wparam)));
             model.markFullDamage();
             const suggested: *const foundation.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
@@ -1103,6 +1200,7 @@ fn windowProc(
             return 0;
         },
         wm.WM_CLOSE => {
+            cancelTabDrag();
             if (model_initialized) {
                 for (workspace_state.tabs.items) |*tab| tab.root.terminalSession().closeProcess();
             }
