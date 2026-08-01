@@ -50,6 +50,7 @@ pub const Mode = enum {
     integration,
     integration_input,
     integration_resize,
+    integration_multi_session,
     integration_host_close,
 };
 
@@ -64,6 +65,7 @@ var paint_completed = false;
 var integration_succeeded = false;
 var integration_resize_requested = false;
 var integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 };
+var integration_multi_session: MultiSessionIntegration = .{};
 var input_translator: input.Translator = .{};
 var shortcut_state: ShortcutState = .{};
 var test_modifiers: ?input.Mods = null;
@@ -97,6 +99,21 @@ const integration_host_close_command =
     "cmd.exe /d /q /c " ++
     "\"for /L %i in (1,1,200) do @echo shutdown-output-%i >CON " ++
     "& ping -n 30 127.0.0.1 >nul\"";
+const integration_multi_first_marker = "CONPTY_MULTI_FIRST";
+const integration_multi_first_title = "BACKGROUND_OSC_TITLE";
+const integration_multi_first_command =
+    "cmd.exe /d /q /s /c \"ping -n 2 127.0.0.1 >nul & echo \x1b]0;" ++
+    integration_multi_first_title ++ "\x07" ++ integration_multi_first_marker ++ " > CON\"";
+const integration_multi_second_marker = "CONPTY_MULTI_SECOND";
+const integration_multi_second_command =
+    "cmd.exe /d /q /s /c \"ping -n 3 127.0.0.1 >nul & echo " ++
+    integration_multi_second_marker ++ " > CON\"";
+
+const MultiSessionIntegration = struct {
+    first: ?workspace.SessionId = null,
+    second: ?workspace.SessionId = null,
+    failed: bool = false,
+};
 
 pub fn run(mode: Mode) !void {
     const allocator = std.heap.smp_allocator;
@@ -105,6 +122,7 @@ pub fn run(mode: Mode) !void {
     integration_succeeded = false;
     integration_resize_requested = false;
     integration_resize_target = .{ .columns = 1, .rows = 1 };
+    integration_multi_session = .{};
     tab_control = null;
     input_translator = .{};
     shortcut_state = .{};
@@ -253,6 +271,7 @@ pub fn run(mode: Mode) !void {
                 .integration => integration_command,
                 .integration_input => integration_input_command,
                 .integration_resize => integration_resize_command.?,
+                .integration_multi_session => integration_multi_first_command,
                 .integration_host_close => integration_host_close_command,
                 else => null,
             },
@@ -269,6 +288,11 @@ pub fn run(mode: Mode) !void {
             .write = queueTerminalReply,
         });
         if (mode == .integration_input) try queueIntegrationInput();
+        if (mode == .integration_multi_session) {
+            integration_multi_session.first = workspace_state.activeSession().?.id;
+            try createIntegrationTerminalTab(window, integration_multi_second_command);
+            integration_multi_session.second = workspace_state.activeSession().?.id;
+        }
     }
 
     _ = user32.ShowWindow(
@@ -679,6 +703,7 @@ fn updateWindowCaption(window: foundation.HWND) void {
 const ConptyTabSetup = struct {
     window: foundation.HWND,
     dimensions: geometry.Dimensions,
+    command: ?[]const u8 = null,
 };
 
 fn startConptyTab(session: *workspace.TerminalSession, setup: *const ConptyTabSetup) !void {
@@ -687,7 +712,7 @@ fn startConptyTab(session: *workspace.TerminalSession, setup: *const ConptyTabSe
         setup.window,
         @intFromEnum(session.id),
         setup.dimensions,
-        null,
+        setup.command,
     );
     errdefer process.destroy();
     try session.attachProcess(.{ .context = process, .destroy = destroyConptyProcess });
@@ -713,6 +738,26 @@ fn createTerminalTab(window: foundation.HWND) !void {
     try activateTab(window, id);
     updateWindowCaption(window);
     _ = user32.SetFocus(window);
+}
+
+fn createIntegrationTerminalTab(window: foundation.HWND, command: []const u8) !void {
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(window, &client) == 0) return error.GetClientRectFailed;
+    const dimensions: geometry.Dimensions = terminal_metrics.dimensions(client.right - client.left, client.bottom - client.top) orelse
+        .{ .columns = 80, .rows = 24 };
+    var setup: ConptyTabSetup = .{
+        .window = window,
+        .dimensions = dimensions,
+        .command = command,
+    };
+    const id = try workspace_state.createTabWithSetup(
+        dimensions.rows,
+        dimensions.columns,
+        &setup,
+        startConptyTab,
+    );
+    try syncNativeTabs();
+    try activateTab(window, id);
 }
 
 fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
@@ -1221,6 +1266,11 @@ fn windowProc(
                     _ = process.beginClosing();
                     if (process.childExitCode()) |code|
                         std.log.info("ConPTY child exited with code {d}", .{code});
+                    if (active_mode == .integration_multi_session) {
+                        _ = session.noteChildExit();
+                        finishMultiSessionIntegration(window);
+                        return 0;
+                    }
                     if (session.noteChildExit())
                         closeTerminalTab(window, workspace_state.tabForSession(session.id).?.id);
                 }
@@ -1892,7 +1942,11 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
         }
     }
 
-    if (isIntegrationMode(active_mode) and batch.finished) {
+    if (active_mode == .integration_multi_session and batch.finished) {
+        if (batch.failure != null) integration_multi_session.failed = true;
+        _ = session.noteOutputFinished();
+        finishMultiSessionIntegration(window);
+    } else if (isIntegrationMode(active_mode) and batch.finished) {
         const marker = switch (active_mode) {
             .integration_input => integration_input_marker,
             .integration_resize => integration_resize_marker,
@@ -1905,6 +1959,31 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
         if (session.noteOutputFinished())
             closeTerminalTab(window, workspace_state.tabForSession(session.id).?.id);
     }
+}
+
+fn finishMultiSessionIntegration(window: foundation.HWND) void {
+    const first_id = integration_multi_session.first orelse return;
+    const second_id = integration_multi_session.second orelse return;
+    const first = workspace_state.session(first_id) orelse {
+        integration_multi_session.failed = true;
+        _ = user32.DestroyWindow(window);
+        return;
+    };
+    const second = workspace_state.session(second_id) orelse {
+        integration_multi_session.failed = true;
+        _ = user32.DestroyWindow(window);
+        return;
+    };
+    if (!first.output_finished or !first.child_exited or
+        !second.output_finished or !second.child_exited)
+        return;
+
+    integration_succeeded = !integration_multi_session.failed and
+        workspace_state.activeSession() == second and
+        terminalContainsForSession(first, integration_multi_first_marker) and
+        terminalContainsForSession(second, integration_multi_second_marker) and
+        nativeTabLabelEquals(first_id, integration_multi_first_title);
+    _ = user32.DestroyWindow(window);
 }
 
 fn logDebugCounters() void {
@@ -2225,6 +2304,7 @@ fn isIntegrationMode(mode: Mode) bool {
         .integration,
         .integration_input,
         .integration_resize,
+        .integration_multi_session,
         => true,
         else => false,
     };
@@ -2285,14 +2365,43 @@ fn encodedPowerShellCommand(
 }
 
 fn terminalContains(needle: []const u8) bool {
-    for (0..model.rows()) |row| {
-        for (0..model.columns()) |start| {
-            if (start + needle.len > model.columns()) break;
+    return terminalContainsForSession(workspace_state.activeSession() orelse return false, needle);
+}
+
+fn terminalContainsForSession(session: *workspace.TerminalSession, needle: []const u8) bool {
+    const session_model = &session.model;
+    for (0..session_model.rows()) |row| {
+        for (0..session_model.columns()) |start| {
+            if (start + needle.len > session_model.columns()) break;
             for (needle, start..) |expected, column| {
-                const cell = model.cell(row, column) orelse break;
+                const cell = session_model.cell(row, column) orelse break;
                 if (cell.spacer or cell.codepoint != expected) break;
             } else return true;
         }
     }
     return false;
+}
+
+fn nativeTabLabelEquals(id: workspace.SessionId, expected: []const u8) bool {
+    const tab = workspace_state.tabForSession(id) orelse return false;
+    const index = nativeIndexForTab(tab.id) orelse return false;
+    const control = tab_control orelse return false;
+    var text: [256:0]u16 = std.mem.zeroes([256:0]u16);
+    var item: controls.TCITEMW = .{
+        .mask = .{ .TEXT = 1 },
+        .dwState = controls.TCIS_BUTTONPRESSED,
+        .dwStateMask = controls.TCIS_BUTTONPRESSED,
+        .pszText = text[0.. :0].ptr,
+        .cchTextMax = text.len,
+        .iImage = -1,
+        .lParam = 0,
+    };
+    if (user32.SendMessageW(control, controls.TCM_GETITEMW, index, @bitCast(@intFromPtr(&item))) == 0)
+        return false;
+    const label = std.unicode.utf16LeToUtf8Alloc(
+        std.heap.smp_allocator,
+        std.mem.sliceTo(item.pszText.?, 0),
+    ) catch return false;
+    defer std.heap.smp_allocator.free(label);
+    return std.mem.eql(u8, label, expected);
 }

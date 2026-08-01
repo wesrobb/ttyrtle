@@ -48,6 +48,10 @@ test "hosted ConPTY child observes an exact window resize" {
     try app.run(.integration_resize);
 }
 
+test "inactive ConPTY sessions retain output, OSC tab labels, and asynchronous completion" {
+    try app.run(.integration_multi_session);
+}
+
 test "host close drains and tears down busy ConPTY sessions repeatedly" {
     for (0..3) |_| try app.run(.integration_host_close);
 }
