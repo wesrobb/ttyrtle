@@ -32,6 +32,10 @@ test "tab context menus and middle-click dispatch native actions" {
     try app.run(.smoke_tab_interactions);
 }
 
+test "tab drag reordering preserves native identities and active selection" {
+    try app.run(.smoke_tab_drag);
+}
+
 test "finite ConPTY child output reaches the terminal model" {
     try app.run(.integration);
 }

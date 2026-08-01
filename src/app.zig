@@ -46,6 +46,7 @@ pub const Mode = enum {
     smoke_shortcuts,
     smoke_rename,
     smoke_tab_interactions,
+    smoke_tab_drag,
     integration,
     integration_input,
     integration_resize,
@@ -209,6 +210,7 @@ pub fn run(mode: Mode) !void {
     if (mode == .smoke_shortcuts) try verifyShortcutDispatch(window);
     if (mode == .smoke_rename) try verifyInlineRename(window);
     if (mode == .smoke_tab_interactions) try verifyTabInteractions(window);
+    if (mode == .smoke_tab_drag) try verifyTabDragReordering(window);
 
     var integration_resize_command: ?[]u8 = null;
     defer if (integration_resize_command) |command| allocator.free(command);
@@ -1067,6 +1069,78 @@ fn verifyTabInteractions(window: foundation.HWND) !void {
     if (workspace_state.tabs.items.len != count_before_middle_close - 1)
         return error.MiddleClickDidNotCloseTab;
     if (workspace_state.tab(hit_id) != null) return error.MiddleClickClosedWrongTab;
+}
+
+fn verifyTabDragReordering(window: foundation.HWND) !void {
+    const control = tab_control orelse return error.TabControlUnavailable;
+    try createTerminalTab(window);
+    try createTerminalTab(window);
+    if (workspace_state.tabs.items.len != 3) return error.TabDragDidNotCreateTestTabs;
+
+    const first_id = workspace_state.tabs.items[0].id;
+    const second_id = workspace_state.tabs.items[1].id;
+    const third_id = workspace_state.tabs.items[2].id;
+    try dragNativeTabToPoint(control, first_id, .right);
+    try expectNativeTabOrder(&.{ second_id, third_id, first_id });
+    try expectNativeActiveTab(first_id);
+
+    try dragNativeTabToPoint(control, first_id, .left);
+    try expectNativeTabOrder(&.{ first_id, second_id, third_id });
+    try expectNativeActiveTab(first_id);
+}
+
+const TabDragDirection = enum { left, right };
+
+fn dragNativeTabToPoint(
+    control: foundation.HWND,
+    id: workspace.TabId,
+    direction: TabDragDirection,
+) !void {
+    const source_index = nativeIndexForTab(id) orelse return error.TabDragMissingSource;
+    var source: foundation.RECT = undefined;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, source_index, @bitCast(@intFromPtr(&source))) == 0)
+        return error.GetTabItemRectFailed;
+    const anchor: foundation.POINT = .{
+        .x = source.left + @divTrunc(source.right - source.left, 2),
+        .y = source.top + @divTrunc(source.bottom - source.top, 2),
+    };
+    var boundary: foundation.RECT = undefined;
+    const boundary_index: usize = switch (direction) {
+        .left => 0,
+        .right => @intCast(user32.SendMessageW(control, controls.TCM_GETITEMCOUNT, 0, 0) - 1),
+    };
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, boundary_index, @bitCast(@intFromPtr(&boundary))) == 0)
+        return error.GetTabItemRectFailed;
+    const destination: foundation.POINT = .{
+        .x = switch (direction) {
+            .left => boundary.left - 4,
+            .right => boundary.right + 4,
+        },
+        .y = anchor.y,
+    };
+
+    _ = user32.SendMessageW(control, wm.WM_LBUTTONDOWN, 0, packMessagePoint(anchor));
+    _ = user32.SendMessageW(control, wm.WM_MOUSEMOVE, 0, packMessagePoint(destination));
+    _ = user32.SendMessageW(control, wm.WM_LBUTTONUP, 0, packMessagePoint(destination));
+}
+
+fn expectNativeTabOrder(expected: []const workspace.TabId) !void {
+    const control = tab_control orelse return error.TabControlUnavailable;
+    if (workspace_state.tabs.items.len != expected.len) return error.TabDragWorkspaceCountMismatch;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMCOUNT, 0, 0) != @as(isize, @intCast(expected.len)))
+        return error.TabDragNativeCountMismatch;
+    for (expected, 0..) |id, index| {
+        if (workspace_state.tabs.items[index].id != id) return error.TabDragWorkspaceOrderMismatch;
+        if (nativeTabIdAt(index) != id) return error.TabDragNativeIdentityMismatch;
+    }
+}
+
+fn expectNativeActiveTab(id: workspace.TabId) !void {
+    const control = tab_control orelse return error.TabControlUnavailable;
+    if (workspace_state.active_tab_id != id) return error.TabDragActiveIdentityMismatch;
+    const active_index = nativeIndexForTab(id) orelse return error.TabDragMissingActiveNativeItem;
+    if (user32.SendMessageW(control, controls.TCM_GETCURSEL, 0, 0) != @as(isize, @intCast(active_index)))
+        return error.TabDragNativeSelectionMismatch;
 }
 
 fn windowProc(
@@ -2142,7 +2216,8 @@ fn isSmokeMode(mode: Mode) bool {
         mode == .smoke_tabs or
         mode == .smoke_shortcuts or
         mode == .smoke_rename or
-        mode == .smoke_tab_interactions;
+        mode == .smoke_tab_interactions or
+        mode == .smoke_tab_drag;
 }
 
 fn isIntegrationMode(mode: Mode) bool {
