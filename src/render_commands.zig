@@ -241,6 +241,27 @@ pub const RenderCache = struct {
         metrics: geometry.Metrics,
         row_index: u16,
     ) !void {
+        try self.rebuildRowWithCount(model, metrics, row_index, true);
+    }
+
+    /// Rebuild a row whose cached geometry depends on the cursor, without
+    /// counting it as content damage in the scroll-reuse diagnostics.
+    fn refreshCursorRow(
+        self: *RenderCache,
+        model: *const terminal.TerminalModel,
+        metrics: geometry.Metrics,
+        row_index: u16,
+    ) !void {
+        try self.rebuildRowWithCount(model, metrics, row_index, false);
+    }
+
+    fn rebuildRowWithCount(
+        self: *RenderCache,
+        model: *const terminal.TerminalModel,
+        metrics: geometry.Metrics,
+        row_index: u16,
+        count_rebuild: bool,
+    ) !void {
         const row = &self.rows.items[row_index];
         row.clearRetainingCapacity();
         const cursor = model.cursor();
@@ -369,7 +390,7 @@ pub const RenderCache = struct {
         row.generation +%= 1;
         row.fingerprint = model.rowFingerprint(row_index);
         row.selection_active = model.hasSelection();
-        if (counters_enabled) self.rebuilt_row_count +|= 1;
+        if (counters_enabled and count_rebuild) self.rebuilt_row_count +|= 1;
     }
 
     fn detectScrollUp(self: *const RenderCache, model: *const terminal.TerminalModel) ?usize {
@@ -395,6 +416,20 @@ pub const RenderCache = struct {
         }
     }
 
+    fn rebaseRowGeometry(row: *CachedRow, delta_y: i32) void {
+        for (row.text_runs.items) |*text_run| text_run.y += delta_y;
+        for (row.rectangles.items) |*rectangle| {
+            rectangle.top += delta_y;
+            rectangle.bottom += delta_y;
+        }
+    }
+
+    fn rowHasCursor(row: *const CachedRow) bool {
+        for (row.cells.items) |cell|
+            if (cell.cursor) return true;
+        return false;
+    }
+
     fn reuseScrolledRows(
         self: *RenderCache,
         model: *const terminal.TerminalModel,
@@ -404,6 +439,17 @@ pub const RenderCache = struct {
         const rows = self.detectScrollUp(model) orelse return false;
         self.rotateRowsUp(rows);
         const start = self.rows.items.len - rows;
+        const delta_y: i32 = -@as(i32, @intCast(rows * metrics.cell_height));
+        for (self.rows.items[0..start]) |*row| rebaseRowGeometry(row, delta_y);
+
+        // Retained rows still contain absolute drawing commands and the prior
+        // cursor marker. Rebuild only the rows affected by cursor movement;
+        // all other rows retain their rebased geometry.
+        const cursor = model.cursor();
+        for (self.rows.items[0..start], 0..) |*row, index| {
+            if (rowHasCursor(row) or (cursor.visible and cursor.row == index))
+                try self.refreshCursorRow(model, metrics, @intCast(index));
+        }
         for (start..self.rows.items.len) |row|
             try self.rebuildRow(model, metrics, @intCast(row));
         self.scroll_up_rows = @intCast(rows);
@@ -550,6 +596,56 @@ test "cache reuses retained rows when live output scrolls a full viewport" {
     try std.testing.expectEqual(old_second_generation, cache.rows.items[0].generation);
     const after = cache.diagnostics();
     try std.testing.expectEqual(before.rebuilt_rows + 1, after.rebuilt_rows);
+}
+
+test "reused scroll rows update absolute drawing coordinates" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    try model.write("zero\r\n\x1b[41mone\x1b[0m\r\ntwo\r\nthree");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    model.acknowledgeDamage();
+
+    try model.write("\r\nfour");
+    try cache.update(&model, metrics, model.damage());
+
+    const first_row = &cache.rows.items[0];
+    try std.testing.expect(first_row.text_runs.items.len != 0);
+    for (first_row.text_runs.items) |text_run|
+        try std.testing.expectEqual(@as(i32, @intCast(metrics.margin_y)), text_run.y);
+    try std.testing.expect(first_row.rectangles.items.len != 0);
+    for (first_row.rectangles.items) |rectangle| {
+        try std.testing.expect(rectangle.top >= metrics.margin_y);
+        try std.testing.expect(rectangle.bottom <= metrics.margin_y + metrics.cell_height);
+    }
+}
+
+test "scroll reuse leaves exactly one cursor at the model cursor" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    try model.write("zero\r\none\r\ntwo\r\nthree");
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    model.acknowledgeDamage();
+
+    try model.write("\r\nfour");
+    try cache.update(&model, metrics, model.damage());
+
+    var cursor_count: usize = 0;
+    for (cache.rows.items) |row| {
+        for (row.cells.items) |cell| {
+            cursor_count += @intFromBool(cell.cursor);
+        }
+    }
+    const cursor = model.cursor();
+    try std.testing.expect(cache.rows.items[cursor.row].cells.items[cursor.column].cursor);
+    try std.testing.expectEqual(@as(usize, 1), cursor_count);
 }
 
 test "cache reuses retained rows for a coalesced multi-line scroll burst" {

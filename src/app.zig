@@ -1527,21 +1527,38 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) bool {
     return true;
 }
 
+const ViewportShortcut = enum(u2) { page_up, page_down, top, bottom };
+
+var held_viewport_shortcuts: std.EnumSet(ViewportShortcut) = .initEmpty();
+
 /// Windows navigation shortcuts reserved for local history. Handle both press
 /// and release so terminal applications never see a mismatched key sequence.
 fn handleViewportKey(message: u32, virtual_key: usize, modifiers: input.Mods) bool {
     const is_key_message = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN or
         message == wm.WM_KEYUP or message == wm.WM_SYSKEYUP;
     if (!is_key_message) return false;
-    const behavior: ?enum { page_up, page_down, top, bottom } = switch (virtual_key) {
-        0x21 => if (modifiers.shift) .page_up else null,
-        0x22 => if (modifiers.shift) .page_down else null,
-        0x24 => if (modifiers.ctrl) .top else null,
-        0x23 => if (modifiers.ctrl) .bottom else null,
+    const shortcut: ?ViewportShortcut = switch (virtual_key) {
+        0x21 => .page_up,
+        0x22 => .page_down,
+        0x24 => .top,
+        0x23 => .bottom,
         else => null,
     };
-    const action = behavior orelse return false;
-    if (message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN) {
+    const is_down = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN;
+    if (!is_down) {
+        const action = shortcut orelse return false;
+        if (!held_viewport_shortcuts.contains(action)) return false;
+        held_viewport_shortcuts.remove(action);
+        return true;
+    }
+    const action = shortcut orelse return false;
+    const modifier_matches = switch (action) {
+        .page_up, .page_down => modifiers.shift,
+        .top, .bottom => modifiers.ctrl,
+    };
+    if (!modifier_matches) return false;
+    held_viewport_shortcuts.insert(action);
+    {
         switch (action) {
             .page_up => model.scrollViewportPage(.up) catch {},
             .page_down => model.scrollViewportPage(.down) catch {},
@@ -1551,6 +1568,26 @@ fn handleViewportKey(message: u32, virtual_key: usize, modifiers: input.Mods) bo
         if (app_window) |window| invalidateRenderDamage(window);
     }
     return true;
+}
+
+test "viewport shortcuts consume release after modifier is released first" {
+    var test_model: terminal.TerminalModel = undefined;
+    try test_model.init(std.testing.allocator, 4, 16);
+    defer test_model.deinit();
+    try test_model.write("zero\r\none\r\ntwo\r\nthree\r\nfour");
+
+    model = &test_model;
+    defer model = undefined;
+    const previous_window = app_window;
+    app_window = null;
+    defer app_window = previous_window;
+
+    try std.testing.expect(handleViewportKey(
+        wm.WM_KEYDOWN,
+        0x21,
+        .{ .shift = true },
+    ));
+    try std.testing.expect(handleViewportKey(wm.WM_KEYUP, 0x21, .{}));
 }
 
 const MouseButton = input.MouseButton;
@@ -1601,7 +1638,7 @@ fn handleMouseMessage(
         const wheel_delta: i32 = signedHighWord(wparam);
         if (wheel_delta != 0) {
             const lines = wheelScrollLines();
-            const delta: isize = @divTrunc(@as(isize, wheel_delta) * @as(isize, @intCast(lines)), 120);
+            const delta = wheel_scroll_accumulator.consume(wheel_delta, lines);
             model.scrollViewport(-delta) catch {};
             invalidateRenderDamage(window);
         }
@@ -1695,6 +1732,26 @@ fn wheelScrollLines() u32 {
         return 3;
     // WHEEL_PAGESCROLL is UINT_MAX; a page is the closest native equivalent.
     return if (lines == std.math.maxInt(u32)) @max(model.rows() -| 1, 1) else lines;
+}
+
+const WheelScrollAccumulator = struct {
+    remainder: isize = 0,
+
+    fn consume(self: *WheelScrollAccumulator, wheel_delta: i32, lines: u32) isize {
+        const accumulated = self.remainder + @as(isize, wheel_delta);
+        const detents = @divTrunc(accumulated, 120);
+        self.remainder = accumulated - detents * 120;
+        return detents * @as(isize, @intCast(lines));
+    }
+};
+
+var wheel_scroll_accumulator: WheelScrollAccumulator = .{};
+
+test "precision wheel deltas accumulate into complete scroll lines" {
+    var accumulator: WheelScrollAccumulator = .{};
+    var scrolled_lines: isize = 0;
+    for (0..4) |_| scrolled_lines += accumulator.consume(30, 1);
+    try std.testing.expectEqual(@as(isize, 1), scrolled_lines);
 }
 
 fn messagePoint(lparam: isize) foundation.POINT {

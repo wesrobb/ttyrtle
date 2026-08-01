@@ -38,6 +38,13 @@ pub fn build(b: *std.Build) void {
         .ghostty_optimize = .ReleaseSafe,
         .include_win32 = true,
     });
+    const app_tests = b.addTest(.{
+        .name = "app-tests",
+        .root_module = app_module,
+        .use_llvm = true,
+    });
+    const run_app_tests = b.addRunArtifact(app_tests);
+    test_step.dependOn(&run_app_tests.step);
     const integration_root = b.createModule(.{
         .root_source_file = b.path("test/integration.zig"),
         .target = target,
