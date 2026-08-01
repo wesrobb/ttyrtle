@@ -25,6 +25,7 @@ const class_name = std.unicode.utf8ToUtf16LeStringLiteral("Ttyrtle");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle");
 const tab_control_class =
     std.unicode.utf8ToUtf16LeStringLiteral("SysTabControl32");
+const edit_control_class = std.unicode.utf8ToUtf16LeStringLiteral("EDIT");
 const trace_file_name =
     std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle-frame-trace.log");
 const tab_control_id = 100;
@@ -37,6 +38,7 @@ pub const Mode = enum {
     smoke_phase5,
     smoke_tabs,
     smoke_shortcuts,
+    smoke_rename,
     integration,
     integration_input,
     integration_resize,
@@ -57,6 +59,7 @@ var integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 
 var input_translator: input.Translator = .{};
 var shortcut_state: ShortcutState = .{};
 var test_modifiers: ?input.Mods = null;
+var rename_editor: ?RenameEditor = null;
 var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
 var selection_dragging = false;
 var selection_anchor: ?terminal.Cursor = null;
@@ -96,6 +99,7 @@ pub fn run(mode: Mode) !void {
     input_translator = .{};
     shortcut_state = .{};
     test_modifiers = null;
+    rename_editor = null;
     terminal_metrics = .forDpi(geometry.base_dpi);
     selection_dragging = false;
     selection_anchor = null;
@@ -192,6 +196,7 @@ pub fn run(mode: Mode) !void {
     try resizeForClient(window);
     if (mode == .smoke_tabs) try verifyNativeTabControl(window);
     if (mode == .smoke_shortcuts) try verifyShortcutDispatch(window);
+    if (mode == .smoke_rename) try verifyInlineRename(window);
 
     var integration_resize_command: ?[]u8 = null;
     defer if (integration_resize_command) |command| allocator.free(command);
@@ -305,6 +310,137 @@ fn createTabControl(
     ) orelse error.CreateTabControlFailed;
 }
 
+const RenameEditor = struct {
+    window: foundation.HWND,
+    tab_id: workspace.TabId,
+};
+
+fn beginRenameTab(id: workspace.TabId) !void {
+    if (rename_editor) |editor| {
+        if (editor.tab_id == id) return;
+        finishRename(true);
+    }
+    const control = tab_control orelse return error.TabControlUnavailable;
+    const index = nativeIndexForTab(id) orelse return error.UnknownTab;
+    var bounds: foundation.RECT = undefined;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, index, @bitCast(@intFromPtr(&bounds))) == 0)
+        return error.GetTabItemRectFailed;
+    const tab = workspace_state.tab(id) orelse return error.UnknownTab;
+    const label = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.smp_allocator, tab.effectiveLabel());
+    defer std.heap.smp_allocator.free(label);
+    const instance = kernel32.GetModuleHandleW(null) orelse return error.GetModuleHandleFailed;
+    const editor = user32.CreateWindowExW(
+        wm.WS_EX_CLIENTEDGE,
+        edit_control_class,
+        label,
+        .{ .CHILD = 1, .VISIBLE = 1, .TABSTOP = 1 },
+        bounds.left + 1,
+        bounds.top + 1,
+        @max(bounds.right - bounds.left - 2, 1),
+        @max(bounds.bottom - bounds.top - 2, 1),
+        control,
+        null,
+        instance,
+        null,
+    ) orelse return error.CreateRenameEditorFailed;
+    rename_editor = .{ .window = editor, .tab_id = id };
+    if (comctl32.SetWindowSubclass(editor, renameEditorProc, 1, 0) == 0) {
+        rename_editor = null;
+        _ = user32.DestroyWindow(editor);
+        return error.SubclassRenameEditorFailed;
+    }
+    const tab_font = user32.SendMessageW(control, wm.WM_GETFONT, 0, 0);
+    if (tab_font != 0) _ = user32.SendMessageW(editor, wm.WM_SETFONT, @bitCast(tab_font), 1);
+    _ = user32.SendMessageW(
+        editor,
+        controls.EM_SETMARGINS,
+        wm.EC_LEFTMARGIN | wm.EC_RIGHTMARGIN,
+        (@as(isize, 3) << 16) | 3,
+    );
+    _ = user32.SetFocus(editor);
+    _ = user32.SendMessageW(editor, controls.EM_SETSEL, 0, -1);
+}
+
+fn repositionRenameEditor() void {
+    const editor = rename_editor orelse return;
+    const control = tab_control orelse return cancelRename();
+    const index = nativeIndexForTab(editor.tab_id) orelse return cancelRename();
+    var bounds: foundation.RECT = undefined;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, index, @bitCast(@intFromPtr(&bounds))) == 0)
+        return cancelRename();
+    _ = user32.SetWindowPos(
+        editor.window,
+        null,
+        bounds.left + 1,
+        bounds.top + 1,
+        @max(bounds.right - bounds.left - 2, 1),
+        @max(bounds.bottom - bounds.top - 2, 1),
+        .{ .NOZORDER = 1, .NOACTIVATE = 1 },
+    );
+}
+
+fn finishRename(commit: bool) void {
+    const editor = rename_editor orelse return;
+    rename_editor = null;
+    defer _ = user32.DestroyWindow(editor.window);
+    if (commit) {
+        const length = user32.GetWindowTextLengthW(editor.window);
+        if (length < 0) return;
+        const wide = std.heap.smp_allocator.allocSentinel(u16, @intCast(length), 0) catch return;
+        defer std.heap.smp_allocator.free(wide);
+        _ = user32.GetWindowTextW(editor.window, wide, length + 1);
+        const utf8 = std.unicode.utf16LeToUtf8Alloc(
+            std.heap.smp_allocator,
+            wide[0..@intCast(length)],
+        ) catch return;
+        defer std.heap.smp_allocator.free(utf8);
+        const title = std.mem.trim(u8, utf8, " \t\r\n");
+        _ = workspace_state.renameTab(editor.tab_id, if (title.len == 0) null else title) catch return;
+        updateNativeTabLabel(editor.tab_id) catch {};
+        if (workspace_state.active_tab_id == editor.tab_id) if (app_window) |window|
+            updateWindowCaption(window);
+    }
+    if (app_window) |window| _ = user32.SetFocus(window);
+}
+
+fn cancelRename() void {
+    finishRename(false);
+}
+
+fn renameEditorProc(
+    control: ?foundation.HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    _: usize,
+    _: usize,
+) callconv(.winapi) isize {
+    switch (message) {
+        wm.WM_KEYDOWN => switch (wparam) {
+            0x0d => {
+                finishRename(true);
+                return 0;
+            },
+            0x1b => {
+                cancelRename();
+                return 0;
+            },
+            else => {},
+        },
+        wm.WM_KILLFOCUS => {
+            finishRename(true);
+            return 0;
+        },
+        wm.WM_NCDESTROY => {
+            if (rename_editor) |editor| {
+                if (editor.window == control) rename_editor = null;
+            }
+        },
+        else => {},
+    }
+    return comctl32.DefSubclassProc(control, message, wparam, lparam);
+}
+
 fn tabControlProc(
     control: ?foundation.HWND,
     message: u32,
@@ -313,6 +449,18 @@ fn tabControlProc(
     _: usize,
     _: usize,
 ) callconv(.winapi) isize {
+    if (message == wm.WM_LBUTTONDBLCLK) {
+        const hwnd = control orelse return 0;
+        var hit: controls.TCHITTESTINFO = .{
+            .pt = messagePoint(lparam),
+            .flags = controls.TCHT_NOWHERE,
+        };
+        const index = user32.SendMessageW(hwnd, controls.TCM_HITTEST, 0, @bitCast(@intFromPtr(&hit)));
+        if (index >= 0) if (nativeTabIdAt(@intCast(index))) |id| {
+            beginRenameTab(id) catch |err| std.log.err("failed to begin tab rename: {}", .{err});
+            return 0;
+        };
+    }
     if (message == wm.WM_MBUTTONDOWN) {
         const hwnd = control orelse return 0;
         var hit: controls.TCHITTESTINFO = .{
@@ -340,6 +488,9 @@ fn tabControlProc(
 }
 
 fn syncNativeTabs() !void {
+    // Rebuilding item indices invalidates an editor's placement. This also
+    // keeps future reorder operations from leaving an orphaned overlay.
+    if (rename_editor != null) cancelRename();
     const control = tab_control orelse return error.TabControlUnavailable;
     _ = user32.SendMessageW(control, controls.TCM_DELETEALLITEMS, 0, 0);
 
@@ -445,6 +596,7 @@ fn createTerminalTab(window: foundation.HWND) !void {
 }
 
 fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
+    if (rename_editor) |editor| if (editor.tab_id == id) cancelRename();
     const tab = workspace_state.tab(id) orelse return;
     tab.root.terminalSession().closeProcess();
     _ = workspace_state.closeTab(id);
@@ -651,6 +803,50 @@ fn verifyShortcutDispatch(window: foundation.HWND) !void {
     _ = user32.SendMessageW(window, wm.WM_KEYUP, 'W', @as(isize, 1) << 31);
     if (workspace_state.tabs.items.len != count_before)
         return error.ShortcutCloseDidNotSynchronizeTabs;
+}
+
+fn verifyInlineRename(window: foundation.HWND) !void {
+    const id = workspace_state.active_tab_id orelse return error.RenameMissingActiveTab;
+    const control = tab_control orelse return error.TabControlUnavailable;
+    var bounds: foundation.RECT = undefined;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, 0, @bitCast(@intFromPtr(&bounds))) == 0)
+        return error.GetTabItemRectFailed;
+    const x: u16 = @intCast(bounds.left + 4);
+    const y: u16 = @intCast(bounds.top + 4);
+    const point = @as(isize, x) | (@as(isize, y) << 16);
+    _ = user32.SendMessageW(control, wm.WM_LBUTTONDBLCLK, 0, point);
+    const editor = rename_editor orelse return error.RenameEditorWasNotCreated;
+    const committed = std.unicode.utf8ToUtf16LeStringLiteral("  Build  ");
+    _ = user32.SetWindowTextW(editor.window, committed);
+    _ = user32.SendMessageW(editor.window, wm.WM_KEYDOWN, 0x0d, 1);
+    if (rename_editor != null) return error.RenameEditorDidNotCommit;
+    if (!std.mem.eql(u8, workspace_state.tab(id).?.title_override.?, "Build"))
+        return error.RenameDidNotTrimAndCommit;
+
+    try beginRenameTab(id);
+    const cancelled = rename_editor orelse return error.RenameEditorWasNotRecreated;
+    _ = user32.SetWindowTextW(cancelled.window, std.unicode.utf8ToUtf16LeStringLiteral("Discard"));
+    _ = user32.SendMessageW(cancelled.window, wm.WM_KEYDOWN, 0x1b, 1);
+    if (!std.mem.eql(u8, workspace_state.tab(id).?.title_override.?, "Build"))
+        return error.RenameEscapeDidNotCancel;
+
+    try beginRenameTab(id);
+    const cleared = rename_editor orelse return error.RenameEditorWasNotRecreated;
+    _ = user32.SetWindowTextW(cleared.window, std.unicode.utf8ToUtf16LeStringLiteral("   "));
+    _ = user32.SetFocus(window);
+    if (workspace_state.tab(id).?.title_override != null)
+        return error.EmptyRenameDidNotClearOverride;
+
+    try beginRenameTab(id);
+    _ = user32.SendMessageW(window, wm.WM_SIZE, wm.SIZE_RESTORED, 0);
+    if (rename_editor == null) return error.RenameEditorDidNotSurviveResize;
+    cancelRename();
+
+    try createTerminalTab(window);
+    const created = workspace_state.active_tab_id orelse return error.RenameCreateDidNotActivate;
+    try beginRenameTab(created);
+    closeTerminalTab(window, created);
+    if (rename_editor != null) return error.RenameEditorDidNotCancelForClose;
 }
 
 fn windowProc(
@@ -1303,6 +1499,7 @@ fn resizeForClient(window: foundation.HWND) !void {
     if (user32.GetClientRect(window, &client) == 0)
         return error.GetClientRectFailed;
     try layoutTabControl(window);
+    repositionRenameEditor();
     if (active_renderer.resize(
         @intCast(@max(client.right - client.left, 0)),
         @intCast(@max(client.bottom - client.top, 0)),
@@ -1700,7 +1897,8 @@ fn isSmokeMode(mode: Mode) bool {
         mode == .smoke_gdi or
         mode == .smoke_phase5 or
         mode == .smoke_tabs or
-        mode == .smoke_shortcuts;
+        mode == .smoke_shortcuts or
+        mode == .smoke_rename;
 }
 
 fn isIntegrationMode(mode: Mode) bool {

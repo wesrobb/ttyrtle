@@ -24,6 +24,10 @@ test "tab shortcuts consume matching key release and character messages" {
     try app.run(.smoke_shortcuts);
 }
 
+test "inline tab rename commits cancels clears and survives resize" {
+    try app.run(.smoke_rename);
+}
+
 test "finite ConPTY child output reaches the terminal model" {
     try app.run(.integration);
 }

@@ -67,10 +67,10 @@ same-window tab work.
   `"ttyrtle"`.
 - [x] Subclass the native tab control while retaining standard control
   painting, selection, focus, overflow, and accessibility behavior.
-- [ ] On double-click, create a temporary Unicode `EDIT` over the tab label.
-- [ ] Commit Enter/focus-loss edits, cancel Escape, trim whitespace, clear an
+- [x] On double-click, create a temporary Unicode `EDIT` over the tab label.
+- [x] Commit Enter/focus-loss edits, cancel Escape, trim whitespace, clear an
   empty override, update the item/caption, and restore terminal focus.
-- [ ] Cancel or reposition an active editor safely for close, reorder, resize,
+- [x] Cancel or reposition an active editor safely for close, reorder, resize,
   and DPI changes.
 
 ### 4. Native interactions and shortcuts
