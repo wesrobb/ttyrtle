@@ -30,6 +30,12 @@ const trace_file_name =
     std.unicode.utf8ToUtf16LeStringLiteral("ttyrtle-frame-trace.log");
 const tab_control_id = 100;
 const tcn_selchange: u32 = @bitCast(@as(i32, -551));
+const context_menu_new_tab = 1;
+const context_menu_rename_tab = 2;
+const context_menu_close_tab = 3;
+const context_menu_new_tab_label = std.unicode.utf8ToUtf16LeStringLiteral("New Tab");
+const context_menu_rename_tab_label = std.unicode.utf8ToUtf16LeStringLiteral("Rename");
+const context_menu_close_tab_label = std.unicode.utf8ToUtf16LeStringLiteral("Close");
 
 pub const Mode = enum {
     normal,
@@ -449,6 +455,26 @@ fn tabControlProc(
     _: usize,
     _: usize,
 ) callconv(.winapi) isize {
+    if (message == wm.WM_CONTEXTMENU) {
+        const hwnd = control orelse return 0;
+        if (lparam == -1) {
+            showActiveTabContextMenu() catch |err|
+                std.log.err("failed to show tab context menu: {}", .{err});
+            return 0;
+        }
+        var point = messagePoint(lparam);
+        if (user32.ScreenToClient(hwnd, &point) == 0) return 0;
+        var hit: controls.TCHITTESTINFO = .{
+            .pt = point,
+            .flags = controls.TCHT_NOWHERE,
+        };
+        const index = user32.SendMessageW(hwnd, controls.TCM_HITTEST, 0, @bitCast(@intFromPtr(&hit)));
+        if (index >= 0) if (nativeTabIdAt(@intCast(index))) |id| {
+            showTabContextMenu(id, messagePoint(lparam)) catch |err|
+                std.log.err("failed to show tab context menu: {}", .{err});
+        };
+        return 0;
+    }
     if (message == wm.WM_LBUTTONDBLCLK) {
         const hwnd = control orelse return 0;
         var hit: controls.TCHITTESTINFO = .{
@@ -485,6 +511,49 @@ fn tabControlProc(
         return result;
     }
     return comctl32.DefSubclassProc(control, message, wparam, lparam);
+}
+
+fn showActiveTabContextMenu() !void {
+    const id = workspace_state.active_tab_id orelse return;
+    const control = tab_control orelse return error.TabControlUnavailable;
+    const index = nativeIndexForTab(id) orelse return error.ActiveTabNotSynchronized;
+    var bounds: foundation.RECT = undefined;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, index, @bitCast(@intFromPtr(&bounds))) == 0)
+        return error.GetTabItemRectFailed;
+    var point: foundation.POINT = .{ .x = bounds.left, .y = bounds.bottom };
+    if (user32.ClientToScreen(control, &point) == 0) return error.ClientToScreenFailed;
+    try showTabContextMenu(id, point);
+}
+
+fn showTabContextMenu(id: workspace.TabId, point: foundation.POINT) !void {
+    const window = app_window orelse return error.AppWindowUnavailable;
+    try activateTab(window, id);
+    const menu = user32.CreatePopupMenu() orelse return error.CreateContextMenuFailed;
+    defer _ = user32.DestroyMenu(menu);
+    if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_new_tab, context_menu_new_tab_label) == 0)
+        return error.AppendContextMenuItemFailed;
+    if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_rename_tab, context_menu_rename_tab_label) == 0)
+        return error.AppendContextMenuItemFailed;
+    if (user32.AppendMenuW(menu, wm.MF_SEPARATOR, 0, null) == 0)
+        return error.AppendContextMenuItemFailed;
+    if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_close_tab, context_menu_close_tab_label) == 0)
+        return error.AppendContextMenuItemFailed;
+    _ = user32.SetForegroundWindow(window);
+    _ = user32.TrackPopupMenu(menu, wm.TPM_RIGHTBUTTON, point.x, point.y, 0, window, null);
+}
+
+fn handleContextMenuCommand(window: foundation.HWND, command: usize) bool {
+    switch (command) {
+        context_menu_new_tab => createTerminalTab(window) catch |err|
+            std.log.err("failed to create terminal tab from context menu: {}", .{err}),
+        context_menu_rename_tab => if (workspace_state.active_tab_id) |id|
+            beginRenameTab(id) catch |err|
+                std.log.err("failed to rename terminal tab from context menu: {}", .{err}),
+        context_menu_close_tab => if (workspace_state.active_tab_id) |id|
+            closeTerminalTab(window, id),
+        else => return false,
+    }
+    return true;
 }
 
 fn syncNativeTabs() !void {
@@ -878,6 +947,20 @@ fn windowProc(
         },
         wm.WM_NOTIFY => {
             if (handleTabNotification(window, lparam)) return 0;
+            return user32.DefWindowProcW(window, message, wparam, lparam);
+        },
+        wm.WM_COMMAND => {
+            if (lparam == 0 and handleContextMenuCommand(window, wparam & 0xffff)) return 0;
+            return user32.DefWindowProcW(window, message, wparam, lparam);
+        },
+        wm.WM_CONTEXTMENU => {
+            // The keyboard context-menu gesture is delivered to the focused
+            // terminal window, so anchor it to the active native tab.
+            if (lparam == -1) {
+                showActiveTabContextMenu() catch |err|
+                    std.log.err("failed to show tab context menu: {}", .{err});
+                return 0;
+            }
             return user32.DefWindowProcW(window, message, wparam, lparam);
         },
         wm.WM_DPICHANGED => {

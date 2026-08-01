@@ -82,7 +82,7 @@ same-window tab work.
 - [x] Consume both press/release messages for handled shortcuts and suppress
   matching `WM_CHAR` messages so shortcut input cannot reach ConPTY.
 - [x] Prevent held-key repeats for create/close while allowing repeat cycling.
-- [ ] Right-click: select the hit tab and show a native `New Tab`, `Rename`,
+- [x] Right-click: select the hit tab and show a native `New Tab`, `Rename`,
   `Close` popup; support keyboard invocation anchored to the active tab.
 - [ ] Left-button drag: record a stable-ID candidate, begin after the system
   drag threshold, capture the mouse, reorder on tab-boundary crossings, allow

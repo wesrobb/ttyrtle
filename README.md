@@ -36,6 +36,8 @@ sound.
 - `Ctrl+Shift+W` closes the active tab. Closing the final tab closes the window.
 - `Ctrl+Tab` and `Ctrl+Shift+Tab` cycle tabs; `Alt+1` through `Alt+9` select a
   one-based tab position.
+- Right-click a tab, or invoke the keyboard context menu, for New Tab, Rename,
+  and Close actions.
 - Terminal output continues to be parsed while its tab is inactive. OSC titles
   label the corresponding tab and window; an explicit tab name takes priority.
 - `Ctrl+Shift+C` copies the current selection as Unicode text.
@@ -120,8 +122,9 @@ font face at the active DPI.
 
 Font selection and size are not configurable yet. The internal workspace owns
 each tab's pane root, terminal model, and ConPTY process. Same-window tabs
-support creation, closing, switching, and dynamic OSC labels while inactive
-tabs continue to process output. Cross-window movement, panes, inline
-renaming, visible close buttons, configurable hotkeys, shell working-directory
-integration, and large-tab stress testing remain future work. Configuration,
+support creation, closing, switching, inline renaming, context-menu actions,
+and dynamic OSC labels while inactive tabs continue to process output.
+Cross-window movement, panes, drag reordering, visible close buttons,
+configurable hotkeys, shell working-directory integration, and large-tab stress
+testing remain future work. Configuration,
 profiles, accessibility, and session persistence remain separate future work.

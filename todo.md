@@ -31,8 +31,8 @@
   - [x] Keep inactive tabs processing output, update their OSC labels, and
     safely drain final output before automatic close.
   - [x] Support middle-click close and keep terminal focus after tab actions.
-  - [ ] Add inline naming, drag reordering, context-menu commands, and useful
-    process or working-directory status.
+  - [x] Add inline naming and context-menu commands.
+  - [ ] Add drag reordering and useful process or working-directory status.
 - [ ] Add panes: support horizontal and vertical splits, focus movement,
   resizing, closing, and a clear ownership model for the terminal sessions in
   each pane. Define how pane layouts interact with tabs.
