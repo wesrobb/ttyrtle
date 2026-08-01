@@ -378,6 +378,13 @@ pub const DeviceResources = struct {
         self.scene_valid = false;
     }
 
+    /// Cached DirectWrite layouts are keyed by row generation. Generations are
+    /// local to a terminal model, so a tab switch must discard them as well.
+    pub fn invalidateTerminalContent(self: *DeviceResources) void {
+        self.scene_valid = false;
+        for (self.row_layouts.items) |*layouts| layouts.clear();
+    }
+
     pub fn simulateDeviceLossForTesting(self: *DeviceResources) void {
         self.simulate_device_loss = true;
     }

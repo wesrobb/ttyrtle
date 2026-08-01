@@ -32,6 +32,12 @@ sound.
 
 ## Interaction
 
+- `Ctrl+Shift+T` opens a new terminal tab.
+- `Ctrl+Shift+W` closes the active tab. Closing the final tab closes the window.
+- `Ctrl+Tab` and `Ctrl+Shift+Tab` cycle tabs; `Alt+1` through `Alt+9` select a
+  one-based tab position.
+- Terminal output continues to be parsed while its tab is inactive. OSC titles
+  label the corresponding tab and window; an explicit tab name takes priority.
 - `Ctrl+Shift+C` copies the current selection as Unicode text.
 - `Ctrl+Shift+V` pastes Unicode clipboard text.
 - Drag with the left mouse button to select text.
@@ -113,8 +119,9 @@ metrics, baseline, and underline geometry come from the configured DirectWrite
 font face at the active DPI.
 
 Font selection and size are not configurable yet. The internal workspace owns
-the initial tab, pane root, terminal model, and ConPTY process. A native tab
-strip presents that initial tab, but runtime tab creation, closing, switching,
-and naming commands are not implemented yet. Configuration, profiles,
-accessibility, shell integration, and session persistence remain separate
-future work.
+each tab's pane root, terminal model, and ConPTY process. Same-window tabs
+support creation, closing, switching, and dynamic OSC labels while inactive
+tabs continue to process output. Cross-window movement, panes, inline
+renaming, visible close buttons, configurable hotkeys, shell working-directory
+integration, and large-tab stress testing remain future work. Configuration,
+profiles, accessibility, and session persistence remain separate future work.

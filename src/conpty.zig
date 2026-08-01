@@ -19,6 +19,7 @@ pub const input_failure_message = win32.ui.windows_and_messaging.WM_APP + 3;
 pub const Session = struct {
     allocator: std.mem.Allocator,
     window: foundation.HWND,
+    notification_token: usize,
     pseudo_console: ?console.HPCON,
     input_write: ?foundation.HANDLE,
     output_read: ?foundation.HANDLE,
@@ -40,6 +41,7 @@ pub const Session = struct {
     pub fn create(
         allocator: std.mem.Allocator,
         window: foundation.HWND,
+        notification_token: usize,
         dimensions: geometry.Dimensions,
         command_line_override: ?[]const u8,
     ) !*Session {
@@ -189,6 +191,7 @@ pub const Session = struct {
         self.* = .{
             .allocator = allocator,
             .window = window,
+            .notification_token = notification_token,
             .pseudo_console = pseudo_console,
             .input_write = input_write,
             .output_read = output_read,
@@ -387,7 +390,7 @@ pub const Session = struct {
                         _ = user32.PostMessageW(
                             self.window,
                             input_failure_message,
-                            0,
+                            self.notification_token,
                             0,
                         );
                     }
@@ -447,7 +450,12 @@ pub const Session = struct {
     }
 
     fn postOutputMessage(self: *Session) bool {
-        return user32.PostMessageW(self.window, output_message, 0, 0) != 0;
+        return user32.PostMessageW(
+            self.window,
+            output_message,
+            self.notification_token,
+            0,
+        ) != 0;
     }
 
     fn processWaiterMain(self: *Session) void {
@@ -466,7 +474,12 @@ pub const Session = struct {
                     .{@intFromEnum(kernel32.GetLastError())},
                 );
             }
-            _ = user32.PostMessageW(self.window, child_exit_message, 0, 0);
+            _ = user32.PostMessageW(
+                self.window,
+                child_exit_message,
+                self.notification_token,
+                0,
+            );
         }
     }
 

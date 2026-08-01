@@ -30,6 +30,9 @@ pub const TerminalSession = struct {
     id: SessionId,
     model: terminal.TerminalModel,
     process: ?OwnedProcess = null,
+    /// EOF is independent from process exit: ConPTY can still have final
+    /// bytes buffered after its child has exited.
+    output_finished: bool = false,
 
     fn init(
         self: *TerminalSession,
@@ -101,6 +104,13 @@ pub const Tab = struct {
         if (self.title_override) |title| allocator.free(title);
         self.root.deinit(allocator);
     }
+
+    pub fn effectiveLabel(self: *const Tab) []const u8 {
+        if (self.title_override) |title| if (title.len != 0) return title;
+        if (self.root.terminalSessionConst().model.core.getTitle()) |title|
+            if (title.len != 0) return title;
+        return "Terminal";
+    }
 };
 
 pub const Workspace = struct {
@@ -128,18 +138,18 @@ pub const Workspace = struct {
         columns: u16,
     ) !TabId {
         const tab_id = self.ids.tab();
-        const session = try self.allocator.create(TerminalSession);
-        errdefer self.allocator.destroy(session);
-        try session.init(
+        const terminal_session = try self.allocator.create(TerminalSession);
+        errdefer self.allocator.destroy(terminal_session);
+        try terminal_session.init(
             self.allocator,
             self.ids.session(),
             rows,
             columns,
         );
-        errdefer session.deinit();
+        errdefer terminal_session.deinit();
         try self.tabs.append(self.allocator, .{
             .id = tab_id,
-            .root = .{ .terminal = session },
+            .root = .{ .terminal = terminal_session },
         });
         if (self.active_tab_id == null) self.active_tab_id = tab_id;
         return tab_id;
@@ -198,6 +208,22 @@ pub const Workspace = struct {
     pub fn activeSession(self: *Workspace) ?*TerminalSession {
         const active = self.activeTab() orelse return null;
         return active.root.terminalSession();
+    }
+
+    pub fn tabForSession(self: *Workspace, session_id: SessionId) ?*Tab {
+        for (self.tabs.items) |*item| {
+            if (item.root.terminalSession().id == session_id) return item;
+        }
+        return null;
+    }
+
+    pub fn session(self: *Workspace, session_id: SessionId) ?*TerminalSession {
+        const item = self.tabForSession(session_id) orelse return null;
+        return item.root.terminalSession();
+    }
+
+    pub fn indexOfTab(self: *const Workspace, id: TabId) ?usize {
+        return self.indexOf(id);
     }
 
     fn indexOf(self: *const Workspace, id: TabId) ?usize {
@@ -303,4 +329,50 @@ test "tabs can be renamed, selected, and reordered by stable id" {
     try std.testing.expectEqual(second, workspace.activeTab().?.id);
     try std.testing.expect(!workspace.setActive(@enumFromInt(999)));
     try std.testing.expect(!workspace.reorderTab(first, 99));
+}
+
+test "sessions resolve their owning tabs and removed sessions no longer resolve" {
+    var ids: IdSource = .{};
+    var value = Workspace.init(std.testing.allocator, &ids);
+    defer value.deinit();
+    const first = try value.createTab(24, 80);
+    const second = try value.createTab(24, 80);
+    const first_session = value.tab(first).?.root.terminalSession().id;
+    const second_session = value.tab(second).?.root.terminalSession().id;
+    try std.testing.expectEqual(first, value.tabForSession(first_session).?.id);
+    try std.testing.expectEqual(second, value.tabForSession(second_session).?.id);
+    try std.testing.expect(value.session(@enumFromInt(999)) == null);
+    try std.testing.expect(value.closeTab(first));
+    try std.testing.expect(value.tabForSession(first_session) == null);
+    try std.testing.expectEqual(second, value.tabForSession(second_session).?.id);
+}
+
+test "effective labels prefer explicit names and restore terminal titles" {
+    var ids: IdSource = .{};
+    var value = Workspace.init(std.testing.allocator, &ids);
+    defer value.deinit();
+    const id = try value.createTab(24, 80);
+    const item = value.tab(id).?;
+    try std.testing.expectEqualStrings("Terminal", item.effectiveLabel());
+    try item.root.terminalSession().model.write("\x1b]2;build\x07");
+    try std.testing.expectEqualStrings("build", item.effectiveLabel());
+    try std.testing.expect(try value.renameTab(id, "Pinned"));
+    try std.testing.expectEqualStrings("Pinned", item.effectiveLabel());
+    try std.testing.expect(try value.renameTab(id, null));
+    try std.testing.expectEqualStrings("build", item.effectiveLabel());
+}
+
+test "reordering preserves session identity and completion state" {
+    var ids: IdSource = .{};
+    var value = Workspace.init(std.testing.allocator, &ids);
+    defer value.deinit();
+    const first = try value.createTab(24, 80);
+    const second = try value.createTab(24, 80);
+    const session_id = value.tab(second).?.root.terminalSession().id;
+    value.tab(second).?.root.terminalSession().output_finished = true;
+    try std.testing.expect(value.reorderTab(second, 0));
+    try std.testing.expectEqual(second, value.tabs.items[0].id);
+    try std.testing.expectEqual(session_id, value.tabs.items[0].root.terminalSession().id);
+    try std.testing.expect(value.tabs.items[0].root.terminalSession().output_finished);
+    try std.testing.expectEqual(first, value.active_tab_id.?);
 }

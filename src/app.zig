@@ -47,12 +47,12 @@ var workspace_state: workspace.Workspace = undefined;
 var model: *terminal.TerminalModel = undefined;
 var model_initialized = false;
 var tab_control: ?foundation.HWND = null;
+var app_window: ?foundation.HWND = null;
 var active_mode: Mode = .normal;
 var paint_completed = false;
 var integration_succeeded = false;
 var integration_resize_requested = false;
 var integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 };
-var output_finished = false;
 var input_translator: input.Translator = .{};
 var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
 var selection_dragging = false;
@@ -89,7 +89,6 @@ pub fn run(mode: Mode) !void {
     integration_succeeded = false;
     integration_resize_requested = false;
     integration_resize_target = .{ .columns = 1, .rows = 1 };
-    output_finished = false;
     tab_control = null;
     input_translator = .{};
     terminal_metrics = .forDpi(geometry.base_dpi);
@@ -167,11 +166,15 @@ pub fn run(mode: Mode) !void {
         instance,
         null,
     ) orelse return error.CreateWindowFailed;
+    app_window = window;
+    defer app_window = null;
     defer if (user32.IsWindow(window) != 0) {
         _ = user32.DestroyWindow(window);
     };
     tab_control = try createTabControl(instance, window);
     defer tab_control = null;
+    if (comctl32.SetWindowSubclass(tab_control, tabControlProc, 1, 0) == 0)
+        return error.SubclassTabControlFailed;
     try syncNativeTabs();
     if (mode != .smoke_gdi)
         active_renderer.initialize(window);
@@ -219,6 +222,7 @@ pub fn run(mode: Mode) !void {
         const process = try conpty.Session.create(
             allocator,
             window,
+            @intFromEnum(workspace_state.activeSession().?.id),
             .{ .columns = model.columns(), .rows = model.rows() },
             switch (mode) {
                 .integration => integration_command,
@@ -295,12 +299,46 @@ fn createTabControl(
     ) orelse error.CreateTabControlFailed;
 }
 
+fn tabControlProc(
+    control: ?foundation.HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    _: usize,
+    _: usize,
+) callconv(.winapi) isize {
+    if (message == wm.WM_MBUTTONDOWN) {
+        const hwnd = control orelse return 0;
+        var hit: controls.TCHITTESTINFO = .{
+            .pt = messagePoint(lparam),
+            .flags = controls.TCHT_NOWHERE,
+        };
+        const index = user32.SendMessageW(
+            hwnd,
+            controls.TCM_HITTEST,
+            0,
+            @bitCast(@intFromPtr(&hit)),
+        );
+        if (index >= 0) if (nativeTabIdAt(@intCast(index))) |id| {
+            if (app_window) |window| closeTerminalTab(window, id);
+            return 0;
+        };
+        return 0;
+    }
+    if (message == wm.WM_LBUTTONUP) {
+        const result = comctl32.DefSubclassProc(control, message, wparam, lparam);
+        if (app_window) |window| _ = user32.SetFocus(window);
+        return result;
+    }
+    return comctl32.DefSubclassProc(control, message, wparam, lparam);
+}
+
 fn syncNativeTabs() !void {
     const control = tab_control orelse return error.TabControlUnavailable;
     _ = user32.SendMessageW(control, controls.TCM_DELETEALLITEMS, 0, 0);
 
     for (workspace_state.tabs.items, 0..) |tab, index| {
-        const label = tab.title_override orelse "Terminal";
+        const label = tab.effectiveLabel();
         const wide = try std.unicode.utf8ToUtf16LeAllocZ(
             std.heap.smp_allocator,
             label,
@@ -333,6 +371,88 @@ fn syncNativeTabs() !void {
         active_index,
         0,
     );
+}
+
+fn updateNativeTabLabel(id: workspace.TabId) !void {
+    const control = tab_control orelse return error.TabControlUnavailable;
+    const tab = workspace_state.tab(id) orelse return;
+    const index = nativeIndexForTab(id) orelse return;
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.smp_allocator, tab.effectiveLabel());
+    defer std.heap.smp_allocator.free(wide);
+    var item: controls.TCITEMW = .{
+        .mask = .{ .TEXT = 1 },
+        .dwState = controls.TCIS_BUTTONPRESSED,
+        .dwStateMask = controls.TCIS_BUTTONPRESSED,
+        .pszText = wide.ptr,
+        .cchTextMax = @intCast(wide.len),
+        .iImage = -1,
+        .lParam = 0,
+    };
+    if (user32.SendMessageW(control, controls.TCM_SETITEMW, index, @bitCast(@intFromPtr(&item))) == 0)
+        return error.UpdateTabItemFailed;
+}
+
+fn updateWindowCaption(window: foundation.HWND) void {
+    const tab = workspace_state.activeTab() orelse return;
+    const session = tab.root.terminalSession();
+    const caption = if (tab.title_override) |title|
+        if (title.len != 0) title else session.model.core.getTitle() orelse "ttyrtle"
+    else
+        session.model.core.getTitle() orelse "ttyrtle";
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.smp_allocator, caption) catch return;
+    defer std.heap.smp_allocator.free(wide);
+    _ = user32.SetWindowTextW(window, wide);
+}
+
+fn createTerminalTab(window: foundation.HWND) !void {
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(window, &client) == 0) return error.GetClientRectFailed;
+    const dimensions: geometry.Dimensions = terminal_metrics.dimensions(client.right - client.left, client.bottom - client.top) orelse
+        .{ .columns = 80, .rows = 24 };
+    const previous = workspace_state.active_tab_id;
+    const id = try workspace_state.createTab(dimensions.rows, dimensions.columns);
+    const session = workspace_state.session(workspace_state.tab(id).?.root.terminalSession().id).?;
+    if (!isSmokeMode(active_mode)) {
+        const process = conpty.Session.create(
+            std.heap.smp_allocator,
+            window,
+            @intFromEnum(session.id),
+            dimensions,
+            null,
+        ) catch |err| {
+            _ = workspace_state.closeTab(id);
+            workspace_state.active_tab_id = previous;
+            return err;
+        };
+        session.attachProcess(.{ .context = process, .destroy = destroyConptyProcess }) catch |err| {
+            process.destroy();
+            _ = workspace_state.closeTab(id);
+            workspace_state.active_tab_id = previous;
+            return err;
+        };
+        session.model.setReplySink(.{ .context = process, .write = queueTerminalReply });
+    }
+    try syncNativeTabs();
+    try activateTab(window, id);
+    updateWindowCaption(window);
+    _ = user32.SetFocus(window);
+}
+
+fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
+    const tab = workspace_state.tab(id) orelse return;
+    tab.root.terminalSession().closeProcess();
+    _ = workspace_state.closeTab(id);
+    if (workspace_state.activeTab()) |next| {
+        model = &next.root.terminalSession().model;
+        input_translator = .{};
+        selection_dragging = false;
+        syncNativeTabs() catch {};
+        updateWindowCaption(window);
+        model.markFullDamage();
+        invalidateRenderDamage(window);
+    } else {
+        _ = user32.DestroyWindow(window);
+    }
 }
 
 fn nativeIndexForTab(id: workspace.TabId) ?usize {
@@ -386,6 +506,10 @@ fn handleTabNotification(window: foundation.HWND, lparam: isize) bool {
 fn activateTab(window: foundation.HWND, id: workspace.TabId) !void {
     if (workspace_state.active_tab_id == id) return;
     if (!workspace_state.setActive(id)) return error.UnknownTab;
+    if (tab_control) |control| {
+        const native_index = nativeIndexForTab(id) orelse return error.ActiveTabNotSynchronized;
+        _ = user32.SendMessageW(control, controls.TCM_SETCURSEL, native_index, 0);
+    }
     model = &workspace_state.activeSession().?.model;
     input_translator = .{};
     selection_dragging = false;
@@ -394,9 +518,14 @@ fn activateTab(window: foundation.HWND, id: workspace.TabId) !void {
     pressed_mouse_button = null;
     render_cache.deinit();
     render_cache = .init(std.heap.smp_allocator);
+    // Row generations are model-local; retained GPU text layouts must not be
+    // reused for a different terminal merely because their numbers match.
+    active_renderer.invalidateTerminalContent();
     model.markFullDamage();
     try resizeForClient(window);
+    updateWindowCaption(window);
     invalidateRenderDamage(window);
+    _ = user32.SetFocus(window);
 }
 
 fn layoutTabControl(window: foundation.HWND) !void {
@@ -461,6 +590,27 @@ fn verifyNativeTabControl(window: foundation.HWND) !void {
     );
     if (workspace_state.active_tab_id != first_id)
         return error.NativeTabSelectionDidNotRestoreWorkspaceTab;
+
+    // Runtime creation must insert the native item before activation tries to
+    // synchronize its selection. This covers the Ctrl+Shift+T lifecycle
+    // without requiring physical modifier-key state in a hidden test window.
+    const count_before_create = workspace_state.tabs.items.len;
+    try createTerminalTab(window);
+    if (workspace_state.tabs.items.len != count_before_create + 1)
+        return error.RuntimeTabCreationDidNotAddWorkspaceTab;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMCOUNT, 0, 0) !=
+        @as(isize, @intCast(workspace_state.tabs.items.len)))
+        return error.RuntimeTabCreationDidNotSynchronizeNativeItem;
+    const created = workspace_state.active_tab_id orelse
+        return error.RuntimeTabCreationDidNotActivateTab;
+    const created_index = nativeIndexForTab(created) orelse
+        return error.RuntimeTabCreationMissingNativeIdentity;
+    if (user32.SendMessageW(control, controls.TCM_GETCURSEL, 0, 0) !=
+        @as(isize, @intCast(created_index)))
+        return error.RuntimeTabCreationDidNotSelectNativeItem;
+    closeTerminalTab(window, created);
+    if (workspace_state.tabs.items.len != count_before_create)
+        return error.RuntimeTabCloseDidNotRemoveWorkspaceTab;
 }
 
 fn windowProc(
@@ -516,21 +666,23 @@ fn windowProc(
             return 0;
         },
         conpty.output_message => {
-            handleConptyOutput(window);
+            handleConptyOutput(window, @enumFromInt(@as(u64, @intCast(wparam))));
             return 0;
         },
         conpty.child_exit_message => {
-            if (activeProcess()) |active_session| {
-                _ = active_session.beginClosing();
-                if (active_session.childExitCode()) |code|
-                    std.log.info("ConPTY child exited with code {d}", .{code});
-                if (output_finished) _ = user32.DestroyWindow(window);
+            if (workspace_state.session(@enumFromInt(@as(u64, @intCast(wparam))))) |session| {
+                if (session.processAs(conpty.Session)) |process| {
+                    _ = process.beginClosing();
+                    if (process.childExitCode()) |code|
+                        std.log.info("ConPTY child exited with code {d}", .{code});
+                    if (session.output_finished) closeTerminalTab(window, workspace_state.tabForSession(session.id).?.id);
+                }
             }
             return 0;
         },
         conpty.input_failure_message => {
-            if (activeProcess()) |active_session| {
-                if (active_session.inputFailureCode()) |code|
+            if (workspace_state.session(@enumFromInt(@as(u64, @intCast(wparam))))) |session| {
+                if (session.processAs(conpty.Session)) |process| if (process.inputFailureCode()) |code|
                     std.log.err(
                         "WriteFile for ConPTY input failed with Win32 error {d}",
                         .{code},
@@ -575,7 +727,9 @@ fn windowProc(
             return 0;
         },
         wm.WM_CLOSE => {
-            if (model_initialized) workspace_state.activeSession().?.closeProcess();
+            if (model_initialized) {
+                for (workspace_state.tabs.items) |*tab| tab.root.terminalSession().closeProcess();
+            }
             _ = user32.DestroyWindow(window);
             return 0;
         },
@@ -588,9 +742,36 @@ fn windowProc(
 }
 
 fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
+    const is_down = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN;
+    const bits: usize = @bitCast(lparam);
+    const repeated = (bits & (@as(usize, 1) << 30)) != 0;
+    if (is_down and currentModifiers().ctrl and currentModifiers().shift) {
+        switch (wparam) {
+            'T' => {
+                if (!repeated) createTerminalTab(app_window orelse return) catch |err| std.log.err("failed to create terminal tab: {}", .{err});
+                return;
+            },
+            'W' => {
+                if (!repeated) if (workspace_state.active_tab_id) |id| closeTerminalTab(app_window orelse return, id);
+                return;
+            },
+            else => {},
+        }
+    }
+    if (is_down and currentModifiers().ctrl and (wparam == 0x09)) {
+        const current = workspace_state.indexOfTab(workspace_state.active_tab_id orelse return) orelse return;
+        const count = workspace_state.tabs.items.len;
+        const next = if (currentModifiers().shift) (current + count - 1) % count else (current + 1) % count;
+        activateTab(app_window orelse return, workspace_state.tabs.items[next].id) catch {};
+        return;
+    }
+    if (is_down and currentModifiers().alt and wparam >= '1' and wparam <= '9') {
+        const index: usize = @intCast(wparam - '1');
+        if (index < workspace_state.tabs.items.len) activateTab(app_window orelse return, workspace_state.tabs.items[index].id) catch {};
+        return;
+    }
     if (isSmokeMode(active_mode) or activeProcess() == null) return;
 
-    const is_down = message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN;
     if (is_down and currentModifiers().ctrl and currentModifiers().shift) {
         switch (wparam) {
             'V' => {
@@ -604,7 +785,6 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) void {
             else => {},
         }
     }
-    const bits: usize = @bitCast(lparam);
     const action: input.Action = if (!is_down)
         .release
     else if ((bits & (@as(usize, 1) << 30)) != 0)
@@ -982,47 +1162,43 @@ fn resizeForClient(window: foundation.HWND) !void {
         client.right - client.left,
         client.bottom - client.top,
     ) orelse return;
-    if (dimensions.rows == model.rows() and dimensions.columns == model.columns())
-        return;
-
-    const old_dimensions: geometry.Dimensions = .{
-        .columns = model.columns(),
-        .rows = model.rows(),
-    };
-    try model.resize(
-        dimensions.rows,
-        dimensions.columns,
-        terminal_metrics.cell_width,
-        terminal_metrics.cell_height,
-    );
-    errdefer model.resize(
-        old_dimensions.rows,
-        old_dimensions.columns,
-        terminal_metrics.cell_width,
-        terminal_metrics.cell_height,
-    ) catch {};
-
-    if (activeProcess()) |active_session| _ = try active_session.resize(dimensions);
+    for (workspace_state.tabs.items) |*tab| {
+        const session = tab.root.terminalSession();
+        if (dimensions.rows == session.model.rows() and dimensions.columns == session.model.columns())
+            continue;
+        try session.model.resize(
+            dimensions.rows,
+            dimensions.columns,
+            terminal_metrics.cell_width,
+            terminal_metrics.cell_height,
+        );
+        if (session.processAs(conpty.Session)) |process|
+            _ = process.resize(dimensions) catch |err| switch (err) {
+                error.SessionClosing => {},
+                else => return err,
+            };
+    }
     invalidateRenderDamage(window);
 }
 
-fn handleConptyOutput(window: foundation.HWND) void {
-    const active_session = activeProcess() orelse return;
-    var batch = active_session.drainOutput();
+fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) void {
+    const session = workspace_state.session(session_id) orelse return;
+    const process = session.processAs(conpty.Session) orelse return;
+    var batch = process.drainOutput();
     defer batch.deinit();
 
     const changed = batch.chunks.items.len != 0;
     if (changed) {
-        applyOutputBatch(window, batch.chunks.items) catch {
+        applyOutputBatchForSession(window, session, batch.chunks.items) catch {
             std.log.err("failed to apply ConPTY output to the terminal model", .{});
             if (isIntegrationMode(active_mode)) _ = user32.DestroyWindow(window);
             return;
         };
     } else {
-        applyTerminalEffects(window);
+        applyTerminalEffectsForSession(window, session);
     }
 
-    if (active_mode == .integration_resize and
+    if (workspace_state.activeSession() == session and active_mode == .integration_resize and
         !integration_resize_requested and
         terminalContains(integration_resize_ready))
     {
@@ -1061,9 +1237,9 @@ fn handleConptyOutput(window: foundation.HWND) void {
             terminalContains(marker);
         _ = user32.DestroyWindow(window);
     } else if (batch.finished) {
-        output_finished = true;
-        if (active_session.childExitCode() != null)
-            _ = user32.DestroyWindow(window);
+        session.output_finished = true;
+        if (process.childExitCode() != null)
+            closeTerminalTab(window, workspace_state.tabForSession(session.id).?.id);
     }
 }
 
@@ -1206,17 +1382,28 @@ fn writeTraceLine(
 }
 
 fn applyOutputBatch(window: foundation.HWND, chunks: []const []const u8) !void {
-    const trace_start = frame_trace.timestamp();
-    defer output_trace.recordSince(trace_start);
-    try model.writeBatch(chunks);
-    model.resetCursorBlink();
-    applyTerminalEffects(window);
-    invalidateRenderDamage(window);
+    try applyOutputBatchForSession(window, workspace_state.activeSession() orelse return, chunks);
 }
 
-fn applyTerminalEffects(window: foundation.HWND) void {
-    if (model.takeTitleChanged()) {
-        const title = model.core.getTitle() orelse "";
+fn applyOutputBatchForSession(
+    window: foundation.HWND,
+    session: *workspace.TerminalSession,
+    chunks: []const []const u8,
+) !void {
+    const trace_start = frame_trace.timestamp();
+    defer output_trace.recordSince(trace_start);
+    try session.model.writeBatch(chunks);
+    session.model.resetCursorBlink();
+    applyTerminalEffectsForSession(window, session);
+    if (workspace_state.activeSession() == session) invalidateRenderDamage(window);
+}
+
+fn applyTerminalEffectsForSession(window: foundation.HWND, session: *workspace.TerminalSession) void {
+    if (session.model.takeTitleChanged()) {
+        const tab = workspace_state.tabForSession(session.id) orelse return;
+        updateNativeTabLabel(tab.id) catch {};
+        if (workspace_state.activeSession() != session) return;
+        const title = tab.effectiveLabel();
         const wide = std.unicode.utf8ToUtf16LeAllocZ(
             std.heap.smp_allocator,
             title,
@@ -1227,7 +1414,7 @@ fn applyTerminalEffects(window: foundation.HWND) void {
         }
     }
 
-    if (model.takeBellCount() > 0) _ = user32.MessageBeep(.{});
+    if (session.model.takeBellCount() > 0) _ = user32.MessageBeep(.{});
 }
 
 fn runPhase5Smoke(window: foundation.HWND) !void {

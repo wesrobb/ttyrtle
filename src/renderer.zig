@@ -150,6 +150,10 @@ pub const Renderer = struct {
         if (counters_enabled) self.frame_request_count +|= 1;
     }
 
+    pub fn invalidateTerminalContent(self: *Renderer) void {
+        if (self.gpu) |*resources| resources.invalidateTerminalContent();
+    }
+
     pub fn diagnostics(self: *const Renderer) Diagnostics {
         if (!counters_enabled) return .{
             .frames_requested = 0,
