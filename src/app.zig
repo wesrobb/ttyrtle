@@ -477,12 +477,7 @@ pub fn run(mode: Mode) !void {
     try resizeForClient(window);
     if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
     if (mode == .smoke_multi_window) {
-        const second = try createVisibleWindow(&application, instance);
-        const second_window = second.hwnd orelse return error.SecondWindowMissingHandle;
-        beginWindowClose(second_window);
-        if (state.model_window.lifecycle != .live or user32.IsWindow(window) == 0)
-            return error.ClosingSecondWindowClosedFirst;
-        bindWindowState(state);
+        try verifyIndependentNativeWindows(state, window);
     }
     if (mode == .smoke_transfer_hardening) try verifyTransferHardening(state, instance);
     if (mode == .smoke_tabs) try verifyNativeTabControl(window);
@@ -647,6 +642,14 @@ fn createTabControl(
 }
 
 fn createVisibleWindow(application: *Application, instance: foundation.HINSTANCE) !*WindowState {
+    // A new native window synchronously receives creation, sizing, and focus
+    // callbacks. Those callbacks bind the compatibility view to the new
+    // WindowState. When this is invoked from a command handled by an existing
+    // window, restore that caller before returning: its outer callback will
+    // persist the compatibility view after the command completes.
+    const caller = if (app_window) |window| windowStateFromHwnd(window) else null;
+    defer if (caller) |state| bindWindowState(state);
+
     const model_window = try application.model.createWindow();
     const state = try application.allocator.create(WindowState);
     errdefer application.allocator.destroy(state);
@@ -693,6 +696,53 @@ fn createVisibleWindow(application: *Application, instance: foundation.HINSTANCE
     _ = user32.ShowWindow(window, if (active_mode == .normal) wm.SW_SHOWDEFAULT else wm.SW_HIDE);
     _ = user32.UpdateWindow(window);
     return state;
+}
+
+/// Exercise Ctrl+Shift+N through the parent window procedure. Creating the
+/// second HWND sends nested messages, so this specifically guards the point at
+/// which an outer callback would otherwise store the child's compatibility
+/// view into the source WindowState.
+fn verifyIndependentNativeWindows(source: *WindowState, source_window: foundation.HWND) !void {
+    bindWindowState(source);
+    try createTerminalTab(source_window);
+    try createTerminalTab(source_window);
+    const source_active = source.active_model orelse return error.SourceWindowMissingActiveModel;
+    const source_tabs = source.ownedWorkspace().tabs.items.len;
+    if (source_tabs != 3) return error.SourceWindowTabSetupFailed;
+
+    setTestModifiers(source_window, .{ .ctrl = true, .shift = true });
+    defer setTestModifiers(source_window, null);
+    _ = user32.SendMessageW(source_window, wm.WM_KEYDOWN, 'N', 1);
+    _ = user32.SendMessageW(source_window, wm.WM_CHAR, 'n', 1);
+    _ = user32.SendMessageW(source_window, wm.WM_KEYUP, 'N', @as(isize, 1) << 31);
+
+    if (source.application.liveWindowCount() != 2)
+        return error.NewWindowShortcutDidNotCreateSibling;
+    const destination = source.application.windows.items[source.application.windows.items.len - 1];
+    const destination_window = destination.hwnd orelse return error.SecondWindowMissingHandle;
+    if (destination == source or destination.model_window == source.model_window)
+        return error.NewWindowSharedWindowState;
+    if (source.ownedWorkspace().tabs.items.len != source_tabs or
+        source.active_model != source_active or
+        source.model() != source_active)
+        return error.NewWindowOverwroteSourcePresentation;
+    if (destination.ownedWorkspace().tabs.items.len != 1 or
+        destination.active_model != &destination.ownedWorkspace().activeSession().?.model)
+        return error.NewWindowDidNotInitializeOwnPresentation;
+
+    try verifyNativeTabPresentation(source);
+    try verifyNativeTabPresentation(destination);
+    try paintForTesting(source_window);
+    try paintForTesting(destination_window);
+
+    bindWindowState(destination);
+    beginWindowClose(destination_window);
+    if (source.model_window.lifecycle != .live or user32.IsWindow(source_window) == 0)
+        return error.ClosingSecondWindowClosedFirst;
+    bindWindowState(source);
+    if (source.ownedWorkspace().tabs.items.len != source_tabs or source.active_model != source_active)
+        return error.ClosingSiblingChangedSourcePresentation;
+    try verifyNativeTabPresentation(source);
 }
 
 const RenameEditor = struct {
@@ -1198,6 +1248,9 @@ fn refreshTransferredPresentation(state: *WindowState, window: foundation.HWND) 
     const active = state.ownedWorkspace().activeSession() orelse return;
     model = &active.model;
     model_initialized = true;
+    // Rebuilding native items synchronously re-enters the tab subclass. Keep
+    // its durable view current before that callback binds and stores it.
+    state.active_model = model;
     input_translator.* = .{};
     selection_dragging = false;
     selection_anchor = null;
