@@ -1732,7 +1732,10 @@ fn notificationTarget(window: foundation.HWND, id: workspace.SessionId) ?foundat
     if (notification_window) |receiver| {
         if (window == receiver) {
             const application = active_application orelse return null;
-            return application.stateForSession(id).?.hwnd;
+            const state = application.stateForSession(id) orelse return null;
+            if (state.model_window.lifecycle != .live) return null;
+            const target = state.hwnd orelse return null;
+            return if (user32.IsWindow(target) != 0) target else null;
         }
     }
     return window;
@@ -3076,13 +3079,16 @@ fn exerciseStaleSessionNotifications(window: foundation.HWND) !void {
     closeTerminalTab(window, stale_tab_id);
     if (workspace_state.session(stale_session_id) != null)
         return error.StaleNotificationSessionWasNotRemoved;
+    if (active_application) |application|
+        _ = application.model.session_owners.remove(stale_session_id);
+    const receiver = notification_window orelse return error.StaleNotificationReceiverUnavailable;
 
     inline for ([_]u32{
         conpty.output_message,
         conpty.child_exit_message,
         conpty.input_failure_message,
     }) |message| {
-        _ = user32.SendMessageW(window, message, @intFromEnum(stale_session_id), 0);
+        _ = user32.SendMessageW(receiver, message, @intFromEnum(stale_session_id), 0);
     }
     if (workspace_state.tabs.items.len != 1)
         return error.StaleNotificationChangedWorkspace;
