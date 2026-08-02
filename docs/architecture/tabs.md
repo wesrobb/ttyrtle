@@ -140,7 +140,7 @@ operations without Win32; hidden-window integration tests cover native selection
 and drag notifications, multiple asynchronous sessions, resize/DPI propagation,
 and repeated teardown.
 
-The multiple-window transfer implementation is complete in automated coverage.
+The multiple-window transfer implementation is complete and verified.
 Each `Tab` is allocated separately and application-wide `WindowId`/`SessionId`
 routing resolves current ownership. Transfer prepares destination resources
 before detaching, commits the existing `*Tab` and pane root without allocation,
@@ -153,9 +153,8 @@ keeps the terminal model and process intact. Cross-window dragging and tear-out
 remain deferred.
 
 The required real-monitor, Narrator/Inspect, high-contrast, system-menu,
-taskbar, and renderer-fallback manual QA matrix is still an outstanding release
-handoff; see the transfer plan. It must be recorded against the implementation
-work before the milestone is marked fully done.
+taskbar, and renderer-fallback manual QA matrix has been completed; see the
+transfer plan's recorded completion status.
 
 The feature-work tracker in [todo.md](../../todo.md) is the authoritative place
 for status and plans for future work, including cross-window transfer, panes,

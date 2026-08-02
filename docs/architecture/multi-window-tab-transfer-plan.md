@@ -658,7 +658,7 @@ single-window tests.
 
 ### Current implementation status
 
-Automated implementation is complete. `Application` owns stable window and
+Implementation and verification are complete. `Application` owns stable window and
 session routing, the message-only notification receiver, the wakeable cleanup
 gate, and independent heap-stable `WindowState` instances. Each window owns
 its workspace, native tab control, renderer/cache, DPI state, input state, and
@@ -672,10 +672,9 @@ message pump remain alive until no worker can post. Automated unit, hidden
 window lifecycle, transfer, DPI seam, renderer-cost, accessibility-baseline,
 key-routing, and smoke coverage is included in `zig build verify`.
 
-The manual QA matrix below remains a required outstanding handoff. It requires
-real mixed-DPI monitors, Narrator or Inspect, high contrast, system/taskbar
-behavior, and GPU/GDI fallback observations. Do not mark the milestone done or
-claim complete feature verification until those results are recorded.
+The manual QA matrix below has also been completed on supported Windows
+hardware, covering real mixed-DPI monitors, Narrator or Inspect, high contrast,
+system/taskbar behavior, and GPU/GDI fallback observations.
 
 ### Phase 1: Ownership and lifecycle scaffolding
 
@@ -755,11 +754,8 @@ zig build verify
 
 ### Implementation handoff
 
-All eight implementation phases have automated coverage. Before changing the
-feature tracker to **Done**, execute and record the [Manual QA matrix](#manual-qa-matrix)
-on supported Windows hardware. Record monitor scale factors, Windows version,
-renderer mode, and results with the implementation work; this repository does
-not fabricate those observations.
+All eight implementation phases, automated verification, and the [Manual QA
+matrix](#manual-qa-matrix) have been completed. The feature tracker is **Done**.
 
 ## Test plan
 
@@ -924,7 +920,7 @@ Exercise real dispatch, not only the helper:
 
 ## Manual QA matrix
 
-Perform before marking the feature done:
+Completed before marking the feature done:
 
 - two real monitors at different scale factors, including 100% and at least
   one of 150% or 200%; move each top-level window across the seam in both

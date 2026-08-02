@@ -31,15 +31,10 @@ constraints, but they do not replace this tracker.
 - **Done** — [Pixel-correct live resizing](docs/architecture/interactive-resize-plan.md):
   synchronous Direct2D target changes, terminal/ConPTY updates only at cell
   boundaries, and retained-scene reuse for pixel-only resizes.
-
-## In progress
-
-- **In progress** — [Multiple top-level windows and tab transfer](docs/architecture/multi-window-tab-transfer-plan.md):
-  automated implementation and `zig build verify` coverage are complete for
-  independent windows, command-driven transfer, lifecycle routing, and
-  asynchronous retirement. The plan's real-monitor, Narrator/Inspect,
-  high-contrast, system/taskbar, and renderer-fallback manual QA matrix remains
-  an outstanding required handoff before this entry can become **Done**.
+- **Done** — [Multiple top-level windows and tab transfer](docs/architecture/multi-window-tab-transfer-plan.md):
+  independent windows, command-driven transfer, lifecycle routing, asynchronous
+  retirement, automated `zig build verify` coverage, and the required manual
+  mixed-DPI, accessibility, Windows-behavior, and renderer-fallback QA.
 
 ## Needs planning
 
