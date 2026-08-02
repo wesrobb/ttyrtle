@@ -1363,6 +1363,10 @@ fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
     _ = workspace_state.detachTab(id);
     if (workspace_state.activeTab()) |next| {
         model = &next.root.terminalSession().model;
+        // Closing an active tab can also re-enter through resize/focus work
+        // below. Do not allow that nested callback to restore the retired
+        // tab's model from WindowState.
+        if (windowStateFromHwnd(window)) |state| state.active_model = model;
         input_translator.* = .{};
         selection_dragging = false;
         syncNativeTabs() catch {};
@@ -1488,6 +1492,11 @@ fn activateTab(window: foundation.HWND, id: workspace.TabId) !void {
         _ = user32.SendMessageW(control, controls.TCM_SETCURSEL, native_index, 0);
     }
     model = &workspace_state.activeSession().?.model;
+    // Set the durable per-window view before any of the work below can
+    // synchronously re-enter the window procedure (notably SetFocus).  A
+    // nested message binds from WindowState, so leaving the previous model
+    // there would restore it while the workspace has already selected `id`.
+    if (windowStateFromHwnd(window)) |state| state.active_model = model;
     input_translator.* = .{};
     selection_dragging = false;
     selection_anchor = null;
@@ -1580,6 +1589,13 @@ fn verifyNativeTabControl(window: foundation.HWND) !void {
         return error.RuntimeTabCreationDidNotSynchronizeNativeItem;
     const created = workspace_state.active_tab_id orelse
         return error.RuntimeTabCreationDidNotActivateTab;
+    // Tab creation activates the new session before returning to the parent
+    // window procedure. Keep the durable WindowState in sync at that point:
+    // focus changes may synchronously bind it again before the outer callback
+    // has a chance to persist its compatibility globals.
+    const state = windowStateFromHwnd(window) orelse return error.RuntimeTabCreationMissingWindowState;
+    if (state.active_model != &workspace_state.activeSession().?.model)
+        return error.RuntimeTabCreationDidNotActivateInputModel;
     const created_index = nativeIndexForTab(created) orelse
         return error.RuntimeTabCreationMissingNativeIdentity;
     if (user32.SendMessageW(control, controls.TCM_GETCURSEL, 0, 0) !=
