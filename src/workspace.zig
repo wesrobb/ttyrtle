@@ -129,6 +129,15 @@ pub const PaneNode = union(enum) {
         const session = self.terminalSession();
         return if (session.id == id) session else null;
     }
+
+    /// Kept alongside traversal so a future split-pane node only needs to
+    /// extend this pair of helpers. Transfer preflight uses the count to
+    /// reserve its complete session snapshot before it starts collecting.
+    pub fn terminalSessionCount(self: *const PaneNode) usize {
+        return switch (self.*) {
+            .terminal => 1,
+        };
+    }
 };
 
 pub const Tab = struct {
@@ -158,6 +167,10 @@ pub const Tab = struct {
         comptime visit: fn (*TerminalSession, @TypeOf(context)) void,
     ) void {
         self.root.forEachTerminalSession(context, visit);
+    }
+
+    pub fn terminalSessionCount(self: *const Tab) usize {
+        return self.root.terminalSessionCount();
     }
 };
 
@@ -468,10 +481,17 @@ pub const Application = struct {
             .destination = destination,
             .tab_id = tab_id,
             .destination_index = destination_index,
+            .snapshot = .{
+                .source_index = source.workspace.indexOfTab(tab_id).?,
+                .source_active_tab_id = source.workspace.active_tab_id,
+                .destination_active_tab_id = destination.workspace.active_tab_id,
+                .source_tab_count = source.workspace.tabs.items.len,
+                .destination_tab_count = destination.workspace.tabs.items.len,
+            },
         };
         errdefer transaction.deinit();
         try destination.workspace.ensureUnusedCapacity(1);
-        try transaction.sessions.ensureUnusedCapacity(self.allocator, 1);
+        try transaction.sessions.ensureUnusedCapacity(self.allocator, item.terminalSessionCount());
         const Collect = struct {
             sessions: *std.ArrayListUnmanaged(SessionId),
             fn append(session: *TerminalSession, context: *@This()) void {
@@ -480,6 +500,7 @@ pub const Application = struct {
         };
         var collect: Collect = .{ .sessions = &transaction.sessions };
         item.forEachTerminalSession(&collect, Collect.append);
+        std.debug.assert(transaction.sessions.items.len == item.terminalSessionCount());
         for (transaction.sessions.items) |session_id| {
             const owner = self.session_owners.get(session_id) orelse return error.UnroutedSession;
             if (owner != .attached or owner.attached != source.id)
@@ -498,7 +519,20 @@ pub const TransferTransaction = struct {
     destination: *Window,
     tab_id: TabId,
     destination_index: usize,
+    snapshot: Snapshot,
     sessions: std.ArrayListUnmanaged(SessionId) = .empty,
+    committed: bool = false,
+
+    /// Semantic state captured after every fallible preflight step. It gives
+    /// callers a stable description for diagnostics and tests without holding
+    /// pointers into either workspace list across a transfer boundary.
+    pub const Snapshot = struct {
+        source_index: usize,
+        source_active_tab_id: ?TabId,
+        destination_active_tab_id: ?TabId,
+        source_tab_count: usize,
+        destination_tab_count: usize,
+    };
 
     pub fn deinit(self: *TransferTransaction) void {
         self.sessions.deinit(self.application.allocator);
@@ -510,6 +544,10 @@ pub const TransferTransaction = struct {
         // hold both lifecycle guards before they can reenter native code.
         std.debug.assert(self.source.lifecycle == .live);
         std.debug.assert(self.destination.lifecycle == .live);
+        std.debug.assert(!self.committed);
+        std.debug.assert(self.source.workspace.tabs.items.len == self.snapshot.source_tab_count);
+        std.debug.assert(self.destination.workspace.tabs.items.len == self.snapshot.destination_tab_count);
+        std.debug.assert(self.source.workspace.indexOfTab(self.tab_id) == self.snapshot.source_index);
         self.source.lifecycle = .transferring;
         self.destination.lifecycle = .transferring;
         for (self.sessions.items) |session_id| {
@@ -524,6 +562,7 @@ pub const TransferTransaction = struct {
         }
         self.source.lifecycle = .live;
         self.destination.lifecycle = .live;
+        self.committed = true;
         return item;
     }
 };
@@ -814,4 +853,67 @@ test "transfer preflight failures leave workspace membership and routing unchang
         SessionOwner{ .attached = source.id },
         application.sessionOwner(session_id).?,
     );
+}
+
+test "transfer snapshots membership and selects correct neighbors at each insertion point" {
+    var application = Application.init(std.testing.allocator);
+    defer application.deinit();
+    const source = try application.createWindow();
+    const destination = try application.createWindow();
+    try std.testing.expect(application.markLive(source.id));
+    try std.testing.expect(application.markLive(destination.id));
+
+    const first = try application.createTab(source.id, 24, 80);
+    const middle = try application.createTab(source.id, 24, 80);
+    const last = try application.createTab(source.id, 24, 80);
+    const destination_first = try application.createTab(destination.id, 24, 80);
+    const destination_last = try application.createTab(destination.id, 24, 80);
+    try std.testing.expect(source.workspace.setActive(middle));
+
+    var transaction = try application.prepareTransfer(
+        source.id,
+        destination.id,
+        middle,
+        1,
+    );
+    defer transaction.deinit();
+    try std.testing.expectEqual(@as(usize, 1), transaction.snapshot.source_index);
+    try std.testing.expectEqual(@as(?TabId, middle), transaction.snapshot.source_active_tab_id);
+    try std.testing.expectEqual(@as(?TabId, destination_first), transaction.snapshot.destination_active_tab_id);
+    try std.testing.expectEqual(@as(usize, 3), transaction.snapshot.source_tab_count);
+    try std.testing.expectEqual(@as(usize, 2), transaction.snapshot.destination_tab_count);
+
+    _ = transaction.commit();
+    try std.testing.expectEqual(@as(?TabId, last), source.workspace.active_tab_id);
+    try std.testing.expectEqual(@as(?TabId, middle), destination.workspace.active_tab_id);
+    try std.testing.expectEqual(first, source.workspace.tabs.items[0].id);
+    try std.testing.expectEqual(last, source.workspace.tabs.items[1].id);
+    try std.testing.expectEqual(destination_first, destination.workspace.tabs.items[0].id);
+    try std.testing.expectEqual(middle, destination.workspace.tabs.items[1].id);
+    try std.testing.expectEqual(destination_last, destination.workspace.tabs.items[2].id);
+}
+
+test "moving the only source tab keeps every session routed and leaves no detached owner" {
+    var application = Application.init(std.testing.allocator);
+    defer application.deinit();
+    const source = try application.createWindow();
+    const destination = try application.createWindow();
+    try std.testing.expect(application.markLive(source.id));
+    try std.testing.expect(application.markLive(destination.id));
+    const moved = try application.createTab(source.id, 24, 80);
+    const session_id = source.workspace.tab(moved).?.root.terminalSession().id;
+
+    var transaction = try application.prepareTransfer(source.id, destination.id, moved, 0);
+    defer transaction.deinit();
+    const item = transaction.commit();
+
+    try std.testing.expectEqual(@as(usize, 0), source.workspace.tabs.items.len);
+    try std.testing.expect(source.workspace.active_tab_id == null);
+    try std.testing.expectEqual(item, destination.workspace.activeTab().?);
+    try std.testing.expectEqual(
+        SessionOwner{ .attached = destination.id },
+        application.sessionOwner(session_id).?,
+    );
+    try std.testing.expectEqual(WindowLifecycle.live, source.lifecycle);
+    try std.testing.expectEqual(WindowLifecycle.live, destination.lifecycle);
 }
