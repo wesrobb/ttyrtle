@@ -40,6 +40,10 @@ test "closing one native top-level window leaves its sibling live" {
     try app.run(.smoke_multi_window);
 }
 
+test "keyboard tab moves preserve DPI seams, accessibility, and renderer cost" {
+    try app.run(.smoke_transfer_hardening);
+}
+
 test "finite ConPTY child output reaches the terminal model" {
     try app.run(.integration);
 }

@@ -56,6 +56,7 @@ pub const Mode = enum {
     smoke_tab_interactions,
     smoke_tab_drag,
     smoke_multi_window,
+    smoke_transfer_hardening,
     integration,
     integration_input,
     integration_resize,
@@ -232,6 +233,7 @@ const WindowState = struct {
     test_context_menu_command: ?usize = null,
     rename_editor: ?RenameEditor = null,
     terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi),
+    dpi: u32 = geometry.base_dpi,
     tab_drag: TabDrag = .{},
     selection_dragging: bool = false,
     selection_anchor: ?terminal.Cursor = null,
@@ -471,6 +473,7 @@ pub fn run(mode: Mode) !void {
     }
 
     terminal_metrics.* = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
+    state.dpi = user32.GetDpiForWindow(window);
     try resizeForClient(window);
     if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
     if (mode == .smoke_multi_window) {
@@ -481,6 +484,7 @@ pub fn run(mode: Mode) !void {
             return error.ClosingSecondWindowClosedFirst;
         bindWindowState(state);
     }
+    if (mode == .smoke_transfer_hardening) try verifyTransferHardening(state, instance);
     if (mode == .smoke_tabs) try verifyNativeTabControl(window);
     if (mode == .smoke_shortcuts) try verifyShortcutDispatch(window);
     if (mode == .smoke_rename) try verifyInlineRename(window);
@@ -676,9 +680,14 @@ fn createVisibleWindow(application: *Application, instance: foundation.HINSTANCE
     bindWindowState(state);
     if (active_mode != .smoke_gdi) state.renderer.initialize(window);
     state.terminal_metrics = state.renderer.metricsForDpi(user32.GetDpiForWindow(window));
+    state.dpi = user32.GetDpiForWindow(window);
     _ = user32.SetTimer(window, cursor_timer_id, 500, null);
     try createTerminalTab(window);
     state.active_model = &state.ownedWorkspace().activeSession().?.model;
+    // Native tab creation can synchronously reenter the callback before the
+    // active model exists. Rebind after assigning it so the persisted view is
+    // never overwritten with that transient empty state.
+    bindWindowState(state);
     if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
     storeWindowState(state);
     _ = user32.ShowWindow(window, if (active_mode == .normal) wm.SW_SHOWDEFAULT else wm.SW_HIDE);
@@ -989,7 +998,17 @@ fn showTabContextMenu(id: workspace.TabId, point: foundation.POINT) !void {
     if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_close_tab, context_menu_close_tab_label) == 0)
         return error.AppendContextMenuItemFailed;
     if (test_context_menu_command) |command| {
-        _ = user32.SendMessageW(window, wm.WM_COMMAND, command, 0);
+        if (command >= context_menu_move_tab_to_window_first) {
+            const index = command - context_menu_move_tab_to_window_first;
+            if (index < destinations.items.len)
+                try moveTabToWindow(
+                    windowStateFromHwnd(window) orelse return error.WindowStateUnavailable,
+                    id,
+                    destinations.items[index],
+                );
+        } else {
+            _ = user32.SendMessageW(window, wm.WM_COMMAND, command, 0);
+        }
         return;
     }
     _ = user32.SetForegroundWindow(window);
@@ -1678,6 +1697,92 @@ fn verifyTabInteractions(window: foundation.HWND) !void {
     if (workspace_state.tab(hit_id) != null) return error.MiddleClickClosedWrongTab;
 }
 
+/// Exercise the same keyboard context-menu path used by Shift+F10.  The
+/// standard SysTabControl32 remains the accessibility provider; this checks
+/// its native item identity, labels, selection, and focusable menu route on
+/// both sides of a cross-window transfer.
+fn verifyTransferHardening(source: *WindowState, instance: foundation.HINSTANCE) !void {
+    const source_window = source.hwnd orelse return error.SourceWindowUnavailable;
+    bindWindowState(source);
+    try createTerminalTab(source_window);
+    storeWindowState(source);
+    const moved_id = source.ownedWorkspace().active_tab_id orelse return error.TransferMissingActiveTab;
+    const moved_tab = source.ownedWorkspace().tab(moved_id) orelse return error.TransferMissingTab;
+    const moved_session = moved_tab.root.terminalSession();
+    const moved_tab_address = @intFromPtr(moved_tab);
+    const moved_session_address = @intFromPtr(moved_session);
+
+    const destination = try createVisibleWindow(source.application, instance);
+    const destination_window = destination.hwnd orelse return error.DestinationWindowUnavailable;
+
+    try sendSyntheticDpi(source_window, 96);
+    try sendSyntheticDpi(destination_window, 144);
+    if (source.dpi != 96 or destination.dpi != 144)
+        return error.IndependentWindowDpiMetricsMismatch;
+
+    try verifyNativeTabPresentation(source);
+    try verifyNativeTabPresentation(destination);
+    const source_before = source.renderer.diagnostics();
+    const destination_before = destination.renderer.diagnostics();
+
+    // Keyboard invocation reaches the standard tab control's WM_CONTEXTMENU
+    // path; the selected dynamic command uses the exact production backend.
+    source.test_context_menu_command = context_menu_move_tab_to_window_first;
+    bindWindowState(source);
+    _ = user32.SetFocus(source.tab_control);
+    _ = user32.SendMessageW(source.tab_control.?, wm.WM_CONTEXTMENU, 0, -1);
+    source.test_context_menu_command = null;
+
+    const moved_destination_tab = destination.ownedWorkspace().tab(moved_id) orelse
+        return error.KeyboardMoveDidNotReachDestination;
+    if (@intFromPtr(moved_destination_tab) != moved_tab_address or
+        @intFromPtr(moved_destination_tab.root.terminalSession()) != moved_session_address)
+        return error.KeyboardMoveChangedTerminalIdentity;
+    if (source.ownedWorkspace().tab(moved_id) != null or
+        source.ownedWorkspace().tabs.items.len != 1 or destination.ownedWorkspace().tabs.items.len != 2)
+        return error.KeyboardMoveDidNotPreserveWorkspaceOwnership;
+
+    try verifyNativeTabPresentation(source);
+    try verifyNativeTabPresentation(destination);
+    const source_after = source.renderer.diagnostics();
+    const destination_after = destination.renderer.diagnostics();
+    if (source_after.gpu_recreation_count != source_before.gpu_recreation_count or
+        destination_after.gpu_recreation_count != destination_before.gpu_recreation_count)
+        return error.TransferRecreatedExistingRenderer;
+    if (source_after.layout_build_count > source_before.layout_build_count + source.model().?.rows() or
+        destination_after.layout_build_count > destination_before.layout_build_count + destination.model().?.rows())
+        return error.TransferRebuiltMoreThanVisibleRows;
+
+    beginWindowClose(destination_window);
+}
+
+fn sendSyntheticDpi(window: foundation.HWND, dpi: u16) !void {
+    var suggested: foundation.RECT = undefined;
+    if (user32.GetWindowRect(window, &suggested) == 0) return error.GetWindowRectFailed;
+    _ = user32.SendMessageW(
+        window,
+        wm.WM_DPICHANGED,
+        @as(usize, dpi) | (@as(usize, dpi) << 16),
+        @bitCast(@intFromPtr(&suggested)),
+    );
+}
+
+fn verifyNativeTabPresentation(state: *WindowState) !void {
+    const control = state.tab_control orelse return error.TabControlUnavailable;
+    const workspace_view = state.ownedWorkspace();
+    if (user32.SendMessageW(control, controls.TCM_GETITEMCOUNT, 0, 0) !=
+        @as(isize, @intCast(workspace_view.tabs.items.len)))
+        return error.NativeTabAccessibilityCountMismatch;
+    const active_id = workspace_view.active_tab_id orelse return error.NativeTabAccessibilityMissingSelection;
+    const active_index = workspace_view.indexOfTab(active_id) orelse return error.NativeTabAccessibilityMissingSelection;
+    if (user32.SendMessageW(control, controls.TCM_GETCURSEL, 0, 0) != @as(isize, @intCast(active_index)))
+        return error.NativeTabAccessibilitySelectionMismatch;
+    for (workspace_view.tabs.items, 0..) |tab, index| {
+        bindWindowState(state);
+        if (nativeTabIdAt(index) != tab.id) return error.NativeTabAccessibilityIdentityMismatch;
+    }
+}
+
 fn verifyTabDragReordering(window: foundation.HWND) !void {
     const control = tab_control orelse return error.TabControlUnavailable;
     try createTerminalTab(window);
@@ -1831,7 +1936,9 @@ fn windowProcImpl(
         },
         wm.WM_DPICHANGED => {
             cancelTabDrag();
-            terminal_metrics.* = active_renderer.metricsForDpi(@as(u16, @truncate(wparam)));
+            const dpi: u16 = @truncate(wparam);
+            if (state) |value| value.dpi = dpi;
+            terminal_metrics.* = active_renderer.metricsForDpi(dpi);
             model.markFullDamage();
             const suggested: *const foundation.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
             _ = user32.SetWindowPos(
@@ -2752,7 +2859,7 @@ fn surfaceForClient(window: foundation.HWND) !SurfaceSize {
     return .{
         .width = @intCast(@max(client.right - client.left, 0)),
         .height = @intCast(@max(client.bottom - client.top, 0)),
-        .dpi = user32.GetDpiForWindow(window),
+        .dpi = if (windowStateFromHwnd(window)) |state| state.dpi else user32.GetDpiForWindow(window),
     };
 }
 
@@ -3341,7 +3448,8 @@ fn isSmokeMode(mode: Mode) bool {
         mode == .smoke_rename or
         mode == .smoke_tab_interactions or
         mode == .smoke_tab_drag or
-        mode == .smoke_multi_window;
+        mode == .smoke_multi_window or
+        mode == .smoke_transfer_hardening;
 }
 
 fn isIntegrationMode(mode: Mode) bool {
