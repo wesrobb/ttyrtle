@@ -36,6 +36,10 @@ test "tab drag reordering preserves native identities and active selection" {
     try app.run(.smoke_tab_drag);
 }
 
+test "closing one native top-level window leaves its sibling live" {
+    try app.run(.smoke_multi_window);
+}
+
 test "finite ConPTY child output reaches the terminal model" {
     try app.run(.integration);
 }

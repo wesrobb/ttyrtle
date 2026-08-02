@@ -34,9 +34,11 @@ const tcn_selchange: u32 = @bitCast(@as(i32, -551));
 const context_menu_new_tab = 1;
 const context_menu_rename_tab = 2;
 const context_menu_close_tab = 3;
+const context_menu_new_window = 4;
 const context_menu_new_tab_label = std.unicode.utf8ToUtf16LeStringLiteral("New Tab");
 const context_menu_rename_tab_label = std.unicode.utf8ToUtf16LeStringLiteral("Rename");
 const context_menu_close_tab_label = std.unicode.utf8ToUtf16LeStringLiteral("Close");
+const context_menu_new_window_label = std.unicode.utf8ToUtf16LeStringLiteral("New Window");
 
 pub const Mode = enum {
     normal,
@@ -48,6 +50,7 @@ pub const Mode = enum {
     smoke_rename,
     smoke_tab_interactions,
     smoke_tab_drag,
+    smoke_multi_window,
     integration,
     integration_input,
     integration_resize,
@@ -237,6 +240,58 @@ const WindowState = struct {
     }
 };
 
+/// Compatibility helpers still use these views while the callback conversion
+/// is completed.  Bind them at every HWND boundary, rather than letting one
+/// top-level window's presentation state leak into another.
+fn bindWindowState(state: *WindowState) void {
+    workspace_state = state.ownedWorkspace();
+    model = state.active_model orelse if (workspace_state.activeSession()) |session| &session.model else undefined;
+    model_initialized = state.active_model != null;
+    tab_control = state.tab_control;
+    app_window = state.hwnd;
+    input_translator = &state.input_translator;
+    shortcut_state = &state.shortcut_state;
+    test_modifiers = state.test_modifiers;
+    test_context_menu_command = state.test_context_menu_command;
+    rename_editor = state.rename_editor;
+    terminal_metrics = &state.terminal_metrics;
+    tab_drag = &state.tab_drag;
+    selection_dragging = state.selection_dragging;
+    selection_anchor = state.selection_anchor;
+    selection_head = state.selection_head;
+    pressed_mouse_button = state.pressed_mouse_button;
+    wheel_scroll_accumulator = state.wheel_scroll_accumulator;
+    held_viewport_shortcuts = state.held_viewport_shortcuts;
+    active_renderer = &state.renderer;
+    render_cache = &state.render_cache;
+    render_cache_initialized = true;
+    output_trace = state.output_trace;
+    paint_trace = state.paint_trace;
+    cache_trace = state.cache_trace;
+    output_frame_pending = state.output_frame_pending;
+    resize_message_count = state.resize_message_count;
+}
+
+fn storeWindowState(state: *WindowState) void {
+    state.active_model = if (model_initialized) model else null;
+    state.tab_control = tab_control;
+    state.hwnd = app_window;
+    state.test_modifiers = test_modifiers;
+    state.test_context_menu_command = test_context_menu_command;
+    state.rename_editor = rename_editor;
+    state.selection_dragging = selection_dragging;
+    state.selection_anchor = selection_anchor;
+    state.selection_head = selection_head;
+    state.pressed_mouse_button = pressed_mouse_button;
+    state.wheel_scroll_accumulator = wheel_scroll_accumulator;
+    state.held_viewport_shortcuts = held_viewport_shortcuts;
+    state.output_trace = output_trace;
+    state.paint_trace = paint_trace;
+    state.cache_trace = cache_trace;
+    state.output_frame_pending = output_frame_pending;
+    state.resize_message_count = resize_message_count;
+}
+
 pub fn run(mode: Mode) !void {
     const allocator = std.heap.smp_allocator;
     var application = Application.init(allocator, mode);
@@ -388,6 +443,14 @@ pub fn run(mode: Mode) !void {
     terminal_metrics.* = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
     try resizeForClient(window);
     if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
+    if (mode == .smoke_multi_window) {
+        const second = try createVisibleWindow(&application, instance);
+        const second_window = second.hwnd orelse return error.SecondWindowMissingHandle;
+        beginWindowClose(second_window);
+        if (state.model_window.lifecycle != .live or user32.IsWindow(window) == 0)
+            return error.ClosingSecondWindowClosedFirst;
+        bindWindowState(state);
+    }
     if (mode == .smoke_tabs) try verifyNativeTabControl(window);
     if (mode == .smoke_shortcuts) try verifyShortcutDispatch(window);
     if (mode == .smoke_rename) try verifyInlineRename(window);
@@ -517,6 +580,50 @@ fn createTabControl(
         instance,
         null,
     ) orelse error.CreateTabControlFailed;
+}
+
+fn createVisibleWindow(application: *Application, instance: foundation.HINSTANCE) !*WindowState {
+    const model_window = try application.model.createWindow();
+    const state = try application.allocator.create(WindowState);
+    errdefer application.allocator.destroy(state);
+    state.* = .init(application, model_window);
+    try application.windows.append(application.allocator, state);
+
+    var style = wm.WS_OVERLAPPEDWINDOW;
+    style.CLIPCHILDREN = 1;
+    const window = user32.CreateWindowExW(
+        .{},
+        class_name,
+        window_title,
+        style,
+        wm.CW_USEDEFAULT,
+        wm.CW_USEDEFAULT,
+        900,
+        560,
+        null,
+        null,
+        instance,
+        state,
+    ) orelse return error.CreateWindowFailed;
+    errdefer {
+        if (user32.IsWindow(window) != 0) _ = user32.DestroyWindow(window);
+    }
+
+    state.hwnd = window;
+    state.tab_control = try createTabControl(instance, window);
+    if (comctl32.SetWindowSubclass(state.tab_control, tabControlProc, 1, @intFromPtr(state)) == 0)
+        return error.SubclassTabControlFailed;
+    bindWindowState(state);
+    if (active_mode != .smoke_gdi) state.renderer.initialize(window);
+    state.terminal_metrics = state.renderer.metricsForDpi(user32.GetDpiForWindow(window));
+    _ = user32.SetTimer(window, cursor_timer_id, 500, null);
+    try createTerminalTab(window);
+    state.active_model = &state.ownedWorkspace().activeSession().?.model;
+    if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
+    storeWindowState(state);
+    _ = user32.ShowWindow(window, if (active_mode == .normal) wm.SW_SHOWDEFAULT else wm.SW_HIDE);
+    _ = user32.UpdateWindow(window);
+    return state;
 }
 
 const RenameEditor = struct {
@@ -667,6 +774,8 @@ fn tabControlProc(
 ) callconv(.winapi) isize {
     if (reference_data != 0) {
         const state: *WindowState = @ptrFromInt(reference_data);
+        bindWindowState(state);
+        defer storeWindowState(state);
         if (state.model_window.lifecycle == .closing or state.model_window.lifecycle == .destroyed)
             return comctl32.DefSubclassProc(control, message, wparam, lparam);
     }
@@ -774,6 +883,8 @@ fn showTabContextMenu(id: workspace.TabId, point: foundation.POINT) !void {
     defer _ = user32.DestroyMenu(menu);
     if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_new_tab, context_menu_new_tab_label) == 0)
         return error.AppendContextMenuItemFailed;
+    if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_new_window, context_menu_new_window_label) == 0)
+        return error.AppendContextMenuItemFailed;
     if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_rename_tab, context_menu_rename_tab_label) == 0)
         return error.AppendContextMenuItemFailed;
     if (user32.AppendMenuW(menu, wm.MF_SEPARATOR, 0, null) == 0)
@@ -792,6 +903,8 @@ fn handleContextMenuCommand(window: foundation.HWND, command: usize) bool {
     switch (command) {
         context_menu_new_tab => createTerminalTab(window) catch |err|
             std.log.err("failed to create terminal tab from context menu: {}", .{err}),
+        context_menu_new_window => createNewWindow() catch |err|
+            std.log.err("failed to create terminal window from context menu: {}", .{err}),
         context_menu_rename_tab => if (workspace_state.active_tab_id) |id|
             beginRenameTab(id) catch |err|
                 std.log.err("failed to rename terminal tab from context menu: {}", .{err}),
@@ -800,6 +913,12 @@ fn handleContextMenuCommand(window: foundation.HWND, command: usize) bool {
         else => return false,
     }
     return true;
+}
+
+fn createNewWindow() !void {
+    const application = active_application orelse return error.ApplicationUnavailable;
+    const instance = kernel32.GetModuleHandleW(null) orelse return error.GetModuleHandleFailed;
+    _ = try createVisibleWindow(application, instance);
 }
 
 fn syncNativeTabs() !void {
@@ -913,6 +1032,8 @@ fn createTerminalTab(window: foundation.HWND) !void {
             &setup,
             startConptyTab,
         );
+    if (windowStateFromHwnd(window)) |state|
+        try state.application.model.routeTab(state.model_window.id, workspace_state.tab(id).?);
     try syncNativeTabs();
     try activateTab(window, id);
     updateWindowCaption(window);
@@ -935,6 +1056,8 @@ fn createIntegrationTerminalTab(window: foundation.HWND, command: []const u8) !v
         &setup,
         startConptyTab,
     );
+    if (windowStateFromHwnd(window)) |state|
+        try state.application.model.routeTab(state.model_window.id, workspace_state.tab(id).?);
     try syncNativeTabs();
     try activateTab(window, id);
 }
@@ -1373,6 +1496,17 @@ fn windowProc(
     wparam: usize,
     lparam: isize,
 ) callconv(.winapi) isize {
+    const result = windowProcImpl(window, message, wparam, lparam);
+    if (windowStateFromHwnd(window)) |state| storeWindowState(state);
+    return result;
+}
+
+fn windowProcImpl(
+    window: foundation.HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) callconv(.winapi) isize {
     if (message == wm.WM_NCCREATE) {
         const create: *const wm.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
         if (create.lpCreateParams) |parameter| {
@@ -1383,11 +1517,13 @@ fn windowProc(
                 @intFromEnum(wm.GWLP_USERDATA),
                 @intFromPtr(state),
             );
+            bindWindowState(state);
         }
         return user32.DefWindowProcW(window, message, wparam, lparam);
     }
 
     const state = windowStateFromHwnd(window);
+    if (state) |value| bindWindowState(value);
     if (state) |value| if (value.model_window.lifecycle == .destroyed)
         return user32.DefWindowProcW(window, message, wparam, lparam);
 
@@ -1466,13 +1602,19 @@ fn windowProc(
             return 0;
         },
         conpty.output_message => {
-            const target = notificationTarget(window) orelse return 0;
-            handleConptyOutput(target, @enumFromInt(@as(u64, @intCast(wparam))));
+            const id: workspace.SessionId = @enumFromInt(@as(u64, @intCast(wparam)));
+            const target = notificationTarget(window, id) orelse return 0;
+            const target_state = windowStateFromHwnd(target) orelse return 0;
+            bindWindowState(target_state);
+            handleConptyOutput(target, id);
+            storeWindowState(target_state);
             return 0;
         },
         conpty.child_exit_message => {
-            const target = notificationTarget(window) orelse return 0;
-            if (workspace_state.session(@enumFromInt(@as(u64, @intCast(wparam))))) |session| {
+            const id: workspace.SessionId = @enumFromInt(@as(u64, @intCast(wparam)));
+            const target = notificationTarget(window, id) orelse return 0;
+            if (windowStateFromHwnd(target)) |target_state| bindWindowState(target_state);
+            if (workspace_state.session(id)) |session| {
                 if (session.processAs(conpty.Session)) |process| {
                     _ = process.beginClosing();
                     if (process.childExitCode()) |code|
@@ -1489,7 +1631,10 @@ fn windowProc(
             return 0;
         },
         conpty.input_failure_message => {
-            if (workspace_state.session(@enumFromInt(@as(u64, @intCast(wparam))))) |session| {
+            const id: workspace.SessionId = @enumFromInt(@as(u64, @intCast(wparam)));
+            const target = notificationTarget(window, id) orelse return 0;
+            if (windowStateFromHwnd(target)) |target_state| bindWindowState(target_state);
+            if (workspace_state.session(id)) |session| {
                 if (session.processAs(conpty.Session)) |process| if (process.inputFailureCode()) |code|
                     std.log.err(
                         "WriteFile for ConPTY input failed with Win32 error {d}",
@@ -1583,9 +1728,12 @@ fn beginWindowClose(window: foundation.HWND) void {
     _ = user32.DestroyWindow(window);
 }
 
-fn notificationTarget(window: foundation.HWND) ?foundation.HWND {
+fn notificationTarget(window: foundation.HWND, id: workspace.SessionId) ?foundation.HWND {
     if (notification_window) |receiver| {
-        if (window == receiver) return app_window;
+        if (window == receiver) {
+            const application = active_application orelse return null;
+            return application.stateForSession(id).?.hwnd;
+        }
     }
     return window;
 }
@@ -1593,6 +1741,7 @@ fn notificationTarget(window: foundation.HWND) ?foundation.HWND {
 const Shortcut = enum {
     suppress,
     new_tab,
+    new_window,
     close_tab,
     cycle_forward,
     cycle_backward,
@@ -1647,6 +1796,7 @@ const ShortcutState = struct {
 fn shortcutForKey(virtual_key: usize, mods: input.Mods) ?Shortcut {
     if (mods.ctrl and mods.shift) return switch (virtual_key) {
         'T' => .new_tab,
+        'N' => if (mods.shift) .new_window else null,
         'W' => .close_tab,
         'V' => .paste,
         'C' => .copy,
@@ -1662,6 +1812,7 @@ fn shortcutVirtualKey(shortcut: Shortcut, virtual_key: usize) bool {
     return switch (shortcut) {
         .suppress => false,
         .new_tab => virtual_key == 'T',
+        .new_window => virtual_key == 'N',
         .close_tab => virtual_key == 'W',
         .cycle_forward, .cycle_backward => virtual_key == 0x09,
         .select_tab => virtual_key >= '1' and virtual_key <= '9',
@@ -1721,6 +1872,9 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) bool {
         .new_tab => if (is_down) {
             const window = app_window orelse return true;
             createTerminalTab(window) catch |err| std.log.err("failed to create terminal tab: {}", .{err});
+        },
+        .new_window => if (is_down) {
+            createNewWindow() catch |err| std.log.err("failed to create terminal window: {}", .{err});
         },
         .close_tab => if (is_down) if (workspace_state.active_tab_id) |id| {
             closeTerminalTab(app_window orelse return true, id);
@@ -2855,7 +3009,8 @@ fn isSmokeMode(mode: Mode) bool {
         mode == .smoke_shortcuts or
         mode == .smoke_rename or
         mode == .smoke_tab_interactions or
-        mode == .smoke_tab_drag;
+        mode == .smoke_tab_drag or
+        mode == .smoke_multi_window;
 }
 
 fn isIntegrationMode(mode: Mode) bool {
