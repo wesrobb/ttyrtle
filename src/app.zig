@@ -1559,8 +1559,8 @@ fn verifyNativeTabControl(window: foundation.HWND) !void {
 
 fn verifyShortcutDispatch(window: foundation.HWND) !void {
     const count_before = workspace_state.tabs.items.len;
-    test_modifiers = .{ .ctrl = true, .shift = true };
-    defer test_modifiers = null;
+    setTestModifiers(window, .{ .ctrl = true, .shift = true });
+    defer setTestModifiers(window, null);
 
     _ = user32.SendMessageW(window, wm.WM_KEYDOWN, 'T', 1);
     _ = user32.SendMessageW(window, wm.WM_CHAR, 't', 1);
@@ -1574,7 +1574,7 @@ fn verifyShortcutDispatch(window: foundation.HWND) !void {
 
     const first_id = workspace_state.tabs.items[0].id;
     const created_id = workspace_state.active_tab_id orelse return error.ShortcutCreateDidNotActivateTab;
-    test_modifiers = .{ .ctrl = true };
+    setTestModifiers(window, .{ .ctrl = true });
     _ = user32.SendMessageW(window, wm.WM_KEYDOWN, 0x09, 1);
     if (workspace_state.active_tab_id != first_id)
         return error.ShortcutCycleDidNotAdvance;
@@ -1583,7 +1583,7 @@ fn verifyShortcutDispatch(window: foundation.HWND) !void {
         return error.ShortcutCycleDidNotRepeat;
     _ = user32.SendMessageW(window, wm.WM_KEYUP, 0x09, @as(isize, 1) << 31);
 
-    test_modifiers = .{ .ctrl = true, .shift = true };
+    setTestModifiers(window, .{ .ctrl = true, .shift = true });
     _ = user32.SendMessageW(window, wm.WM_KEYDOWN, 'W', 1);
     _ = user32.SendMessageW(window, wm.WM_CHAR, 'w', 1);
     _ = user32.SendMessageW(window, wm.WM_KEYUP, 'W', @as(isize, 1) << 31);
@@ -1907,7 +1907,7 @@ fn windowProcImpl(
             // Do not turn the real Windows system gestures into terminal
             // input.  In particular DefWindowProc owns Alt+F4 and Alt+Space;
             // unbound Alt combinations remain terminal input below.
-            if (keyRoute(message, wparam, currentModifiers()) == .system)
+            if (keyRoute(message, wparam) == .system)
                 return user32.DefWindowProcW(window, message, wparam, lparam);
             _ = handleKeyMessage(message, wparam, lparam);
             return 0;
@@ -1918,7 +1918,7 @@ fn windowProcImpl(
             // ordinary Alt text is intentionally delivered to the terminal.
             if (!shortcut_state.consumeCharacter()) handleCharacterMessage(@truncate(wparam));
             return if (message == wm.WM_SYSCHAR and
-                keyRoute(message, wparam, currentModifiers()) == .system)
+                keyRoute(message, wparam) == .system)
                 user32.DefWindowProcW(window, message, wparam, lparam)
             else
                 0;
@@ -2049,7 +2049,7 @@ const Shortcut = enum {
 /// stays on the terminal route.
 const KeyRoute = enum { terminal, system };
 
-fn keyRoute(message: u32, virtual_key: usize, _: input.Mods) KeyRoute {
+fn keyRoute(message: u32, virtual_key: usize) KeyRoute {
     return switch (message) {
         wm.WM_SYSKEYDOWN, wm.WM_SYSKEYUP => switch (virtual_key) {
             0x73, // VK_F4
@@ -2065,13 +2065,12 @@ fn keyRoute(message: u32, virtual_key: usize, _: input.Mods) KeyRoute {
 }
 
 test "key routing reserves system gestures but keeps terminal Alt input" {
-    const alt: input.Mods = .{ .alt = true };
-    try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSKEYDOWN, 0x73, alt));
-    try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSKEYUP, 0x20, alt));
-    try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSCHAR, 0x20, alt));
-    try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_SYSKEYDOWN, 'A', alt));
-    try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_SYSCHAR, 'a', alt));
-    try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_KEYDOWN, 0x79, .{})); // VK_F10
+    try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSKEYDOWN, 0x73));
+    try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSKEYUP, 0x20));
+    try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSCHAR, 0x20));
+    try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_SYSKEYDOWN, 'A'));
+    try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_SYSCHAR, 'a'));
+    try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_KEYDOWN, 0x79)); // VK_F10
 }
 
 const ShortcutState = struct {
@@ -2656,6 +2655,14 @@ fn currentModifiers() input.Mods {
         .caps_lock = keyIsToggled(0x14),
         .num_lock = keyIsToggled(0x90),
     };
+}
+
+/// Hidden-window dispatch binds the receiving WindowState before every
+/// message. Keep synthetic modifier state there too so a test key sequence
+/// sees the same modifiers on its press, repeat, and release messages.
+fn setTestModifiers(window: foundation.HWND, modifiers: ?input.Mods) void {
+    test_modifiers = modifiers;
+    if (windowStateFromHwnd(window)) |state| state.test_modifiers = modifiers;
 }
 
 fn keyIsDown(virtual_key: i32) bool {
