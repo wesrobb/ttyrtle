@@ -7,6 +7,7 @@ const geometry = @import("geometry.zig");
 const input = @import("input.zig");
 const render_commands = @import("render_commands.zig");
 const renderer = @import("renderer.zig");
+const retirement = @import("retirement.zig");
 const terminal = @import("terminal.zig");
 const workspace = @import("workspace.zig");
 
@@ -142,6 +143,8 @@ const Application = struct {
     /// This message-only HWND outlives every terminal session. ConPTY workers
     /// post stable SessionId tokens here; it resolves their current WindowId.
     notification_window: ?foundation.HWND = null,
+    retirement_event: ?foundation.HANDLE = null,
+    retirement_manager: ?*retirement.Manager = null,
     windows: std.ArrayListUnmanaged(*WindowState) = .empty,
     mode: Mode,
     paint_completed: bool = false,
@@ -155,6 +158,11 @@ const Application = struct {
     }
 
     fn deinit(self: *Application) void {
+        if (self.retirement_manager) |manager| {
+            manager.deinit();
+            self.allocator.destroy(manager);
+        }
+        if (self.retirement_event) |event| _ = kernel32.CloseHandle(event);
         for (self.windows.items) |state| {
             state.deinit();
             self.allocator.destroy(state);
@@ -162,6 +170,21 @@ const Application = struct {
         self.windows.deinit(self.allocator);
         self.model.deinit();
         self.* = undefined;
+    }
+
+    fn startRetirement(self: *Application) !void {
+        const event = kernel32.CreateEventW(null, 1, 0, null) orelse
+            return error.CreateRetirementCompletionEventFailed;
+        errdefer _ = kernel32.CloseHandle(event);
+        const manager = try self.allocator.create(retirement.Manager);
+        errdefer self.allocator.destroy(manager);
+        try manager.init(self.allocator, event);
+        self.retirement_manager = manager;
+        self.retirement_event = event;
+    }
+
+    fn retirementPending(self: *Application) usize {
+        return if (self.retirement_manager) |manager| manager.pendingCount() else 0;
     }
 
     fn stateForWindow(self: *Application, hwnd: foundation.HWND) ?*WindowState {
@@ -295,6 +318,7 @@ fn storeWindowState(state: *WindowState) void {
 pub fn run(mode: Mode) !void {
     const allocator = std.heap.smp_allocator;
     var application = Application.init(allocator, mode);
+    try application.startRetirement();
     active_application = &application;
     defer {
         active_application = null;
@@ -545,11 +569,29 @@ pub fn run(mode: Mode) !void {
 
     var message: wm.MSG = undefined;
     while (true) {
-        const result = user32.GetMessageW(&message, null, 0, 0);
-        if (result == 0) break;
-        if (result < 0) return error.GetMessageFailed;
-        _ = user32.TranslateMessage(&message);
-        _ = user32.DispatchMessageW(&message);
+        if (application.liveWindowCount() == 0 and application.retirementPending() == 0)
+            break;
+        const event = application.retirement_event orelse return error.RetirementEventUnavailable;
+        const handles = [_]?foundation.HANDLE{event};
+        const result = user32.MsgWaitForMultipleObjectsEx(
+            handles.len,
+            &handles,
+            std.math.maxInt(u32),
+            wm.QS_ALLINPUT,
+            wm.MWMO_INPUTAVAILABLE,
+        );
+        if (result == @intFromEnum(foundation.WAIT_OBJECT_0)) {
+            _ = kernel32.ResetEvent(event);
+            continue;
+        }
+        if (result != @intFromEnum(foundation.WAIT_OBJECT_0) + handles.len)
+            return error.MessageWaitFailed;
+        while (user32.PeekMessageW(&message, null, 0, 0, wm.PM_REMOVE) != 0) {
+            if (message.message == wm.WM_QUIT) break;
+            _ = user32.TranslateMessage(&message);
+            _ = user32.DispatchMessageW(&message);
+        }
+        if (message.message == wm.WM_QUIT) break;
     }
 
     if (isSmokeMode(mode) and !paint_completed) return error.SmokePaintFailed;
@@ -1066,8 +1108,8 @@ fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
     cancelTabDrag();
     if (rename_editor) |editor| if (editor.tab_id == id) cancelRename();
     const tab = workspace_state.tab(id) orelse return;
-    tab.root.terminalSession().closeProcess();
-    _ = workspace_state.closeTab(id);
+    retireTab(tab);
+    _ = workspace_state.detachTab(id);
     if (workspace_state.activeTab()) |next| {
         model = &next.root.terminalSession().model;
         input_translator.* = .{};
@@ -1684,8 +1726,6 @@ fn windowProcImpl(
             return 0;
         },
         wm.WM_DESTROY => {
-            if (state) |value| if (value.application.liveWindowCount() == 0)
-                user32.PostQuitMessage(0);
             return 0;
         },
         wm.WM_NCDESTROY => {
@@ -1722,10 +1762,27 @@ fn beginWindowClose(window: foundation.HWND) void {
         }
     }
     cancelTabDrag();
-    if (model_initialized) {
-        for (workspace_state.tabs.items) |tab| tab.root.terminalSession().closeProcess();
-    }
+    if (model_initialized) while (workspace_state.active_tab_id) |id| {
+        const tab = workspace_state.tab(id) orelse break;
+        retireTab(tab);
+        _ = workspace_state.detachTab(id);
+    };
+    model_initialized = false;
+    if (windowStateFromHwnd(window)) |state| state.active_model = null;
     _ = user32.DestroyWindow(window);
+}
+
+/// Establish the session boundary before the tab leaves visible ownership.
+/// `beginClosing` only initiates ConPTY shutdown; all waits happen in the
+/// retirement worker after the tab is detached.
+fn retireTab(tab: *workspace.Tab) void {
+    const application = active_application orelse return;
+    const session = tab.root.terminalSession();
+    session.model.setReplySink(null);
+    if (session.processAs(conpty.Session)) |process| _ = process.beginClosing();
+    if (application.model.session_owners.getPtr(session.id)) |owner|
+        owner.* = .retiring;
+    if (application.retirement_manager) |manager| _ = manager.enqueue(tab);
 }
 
 fn notificationTarget(window: foundation.HWND, id: workspace.SessionId) ?foundation.HWND {

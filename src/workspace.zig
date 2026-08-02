@@ -135,8 +135,12 @@ pub const Tab = struct {
     id: TabId,
     title_override: ?[]u8 = null,
     root: PaneNode,
+    /// Retirement queue linkage belongs to the stable tab allocation. This
+    /// lets close detach and enqueue without allocating on the UI thread.
+    retirement_next: ?*Tab = null,
+    retiring: bool = false,
 
-    fn deinit(self: *Tab, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Tab, allocator: std.mem.Allocator) void {
         if (self.title_override) |title| allocator.free(title);
         self.root.deinit(allocator);
     }
@@ -700,6 +704,24 @@ test "a session closes only after child exit and output EOF in either order" {
     const second = value.tab(second_id).?.root.terminalSession();
     try std.testing.expect(!second.noteOutputFinished());
     try std.testing.expect(second.noteChildExit());
+}
+
+test "detached tabs retain their intrusive retirement ownership" {
+    var ids: IdSource = .{};
+    var value = Workspace.init(std.testing.allocator, &ids);
+    defer value.deinit();
+    const id = try value.createTab(24, 80);
+    const item = value.detachTab(id).?;
+    defer {
+        item.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(item);
+    }
+
+    try std.testing.expect(value.activeTab() == null);
+    try std.testing.expect(!item.retiring);
+    item.retiring = true;
+    try std.testing.expect(item.retiring);
+    try std.testing.expect(item.retirement_next == null);
 }
 
 test "tab setup rollback restores the prior active tab after startup failure" {
