@@ -1904,12 +1904,24 @@ fn windowProcImpl(
             return 0;
         },
         wm.WM_KEYDOWN, wm.WM_SYSKEYDOWN, wm.WM_KEYUP, wm.WM_SYSKEYUP => {
+            // Do not turn the real Windows system gestures into terminal
+            // input.  In particular DefWindowProc owns Alt+F4 and Alt+Space;
+            // unbound Alt combinations remain terminal input below.
+            if (keyRoute(message, wparam, currentModifiers()) == .system)
+                return user32.DefWindowProcW(window, message, wparam, lparam);
             _ = handleKeyMessage(message, wparam, lparam);
             return 0;
         },
         wm.WM_CHAR, wm.WM_SYSCHAR => {
+            // WM_SYSCHAR is generated for system-menu mnemonics. Application
+            // shortcuts have already accounted for their generated character;
+            // ordinary Alt text is intentionally delivered to the terminal.
             if (!shortcut_state.consumeCharacter()) handleCharacterMessage(@truncate(wparam));
-            return 0;
+            return if (message == wm.WM_SYSCHAR and
+                keyRoute(message, wparam, currentModifiers()) == .system)
+                user32.DefWindowProcW(window, message, wparam, lparam)
+            else
+                0;
         },
         wm.WM_DEADCHAR, wm.WM_SYSDEADCHAR => {
             input_translator.deadCharacter();
@@ -2031,6 +2043,36 @@ const Shortcut = enum {
     paste,
     copy,
 };
+
+/// Windows reserves a small set of Alt gestures for the non-client/system
+/// surface. Everything else, including ordinary Alt-modified terminal input,
+/// stays on the terminal route.
+const KeyRoute = enum { terminal, system };
+
+fn keyRoute(message: u32, virtual_key: usize, _: input.Mods) KeyRoute {
+    return switch (message) {
+        wm.WM_SYSKEYDOWN, wm.WM_SYSKEYUP => switch (virtual_key) {
+            0x73, // VK_F4
+            0x20, // VK_SPACE
+            => .system,
+            else => .terminal,
+        },
+        // Alt+Space can produce a WM_SYSCHAR while DefWindowProc is opening
+        // the system menu. Do not feed that character to ConPTY.
+        wm.WM_SYSCHAR => if (virtual_key == 0x20) .system else .terminal,
+        else => .terminal,
+    };
+}
+
+test "key routing reserves system gestures but keeps terminal Alt input" {
+    const alt: input.Mods = .{ .alt = true };
+    try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSKEYDOWN, 0x73, alt));
+    try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSKEYUP, 0x20, alt));
+    try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSCHAR, 0x20, alt));
+    try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_SYSKEYDOWN, 'A', alt));
+    try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_SYSCHAR, 'a', alt));
+    try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_KEYDOWN, 0x79, .{})); // VK_F10
+}
 
 const ShortcutState = struct {
     held: std.EnumSet(Shortcut) = .{},
