@@ -61,6 +61,10 @@ pub const DeviceResources = struct {
     font_fallback: *dwrite.IDWriteFontFallback,
     typography: *dwrite.IDWriteTypography,
     target_bitmap: ?*d2d.ID2D1Bitmap1,
+    /// The currently displayed scene is never modified by a live-resize
+    /// build.  Rows are drawn into this second target and exchanged only when
+    /// the complete generation is ready.
+    building_scene_bitmap: ?*d2d.ID2D1Bitmap1,
     scene_bitmap: ?*d2d.ID2D1Bitmap1,
     target_width: u32,
     target_height: u32,
@@ -69,6 +73,10 @@ pub const DeviceResources = struct {
     scene_height: u32,
     scene_dpi: u32,
     scene_valid: bool,
+    build_width: u32,
+    build_height: u32,
+    build_dpi: u32,
+    build_next_row: ?usize,
     text_format: ?*dwrite.IDWriteTextFormat,
     font_state: resource_cache.FontState,
     font_generation: u64,
@@ -96,6 +104,7 @@ pub const DeviceResources = struct {
     pub fn create(window: foundation.HWND) !DeviceResources {
         var resources: DeviceResources = undefined;
         resources.target_bitmap = null;
+        resources.building_scene_bitmap = null;
         resources.scene_bitmap = null;
         resources.target_width = 0;
         resources.target_height = 0;
@@ -104,6 +113,10 @@ pub const DeviceResources = struct {
         resources.scene_height = 0;
         resources.scene_dpi = 0;
         resources.scene_valid = false;
+        resources.build_width = 0;
+        resources.build_height = 0;
+        resources.build_dpi = 0;
+        resources.build_next_row = null;
         resources.text_format = null;
         resources.font_state = .{};
         resources.font_generation = 0;
@@ -375,6 +388,74 @@ pub const DeviceResources = struct {
         try self.presentScene(cache.background);
     }
 
+    /// Starts an off-screen full scene build.  This deliberately leaves the
+    /// front bitmap and its dimensions alone, so presentation cannot expose a
+    /// half-reflowed terminal.
+    pub fn beginSceneBuild(
+        self: *DeviceResources,
+        cache: *const render_commands.RenderCache,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !void {
+        _ = try self.ensureTextFormat(metrics, dpi);
+        try self.resizeRowLayouts(cache.rows.items.len);
+        try self.ensureBuildingSceneBitmap(cache, metrics, dpi);
+        const scene = self.building_scene_bitmap orelse return error.TargetUnavailable;
+        self.d2d_context.SetTarget(@ptrCast(scene));
+        const target = &self.d2d_context.ID2D1RenderTarget;
+        target.BeginDraw();
+        const background = toColor(cache.background);
+        target.Clear(&background);
+        try checkDrawResult(target.EndDraw(null, null));
+        self.build_next_row = 0;
+    }
+
+    /// Draw a bounded number of already-cached rows.  Completion atomically
+    /// swaps front and back bitmaps; callers therefore never present mixed
+    /// terminal generations.
+    pub fn advanceSceneBuild(
+        self: *DeviceResources,
+        cache: *const render_commands.RenderCache,
+        metrics: geometry.Metrics,
+        dpi: u32,
+        row_budget: usize,
+    ) !bool {
+        const next = self.build_next_row orelse return true;
+        const scene = self.building_scene_bitmap orelse return error.TargetUnavailable;
+        const end = @min(cache.rows.items.len, next + @max(row_budget, 1));
+        const trace_start = frame_trace.timestamp();
+        defer self.scene_trace.recordSince(trace_start);
+        self.d2d_context.SetTarget(@ptrCast(scene));
+        const target = &self.d2d_context.ID2D1RenderTarget;
+        target.BeginDraw();
+        var drawing = true;
+        errdefer {
+            if (drawing) _ = target.EndDraw(null, null);
+        }
+        for (next..end) |row_index|
+            try self.drawCachedRow(row_index, &cache.rows.items[row_index], metrics, dpi);
+        try checkDrawResult(target.EndDraw(null, null));
+        drawing = false;
+        if (counters_enabled) self.scene_redraw_count +|= 1;
+        if (end != cache.rows.items.len) {
+            self.build_next_row = end;
+            return false;
+        }
+        const previous = self.scene_bitmap;
+        self.scene_bitmap = self.building_scene_bitmap;
+        self.building_scene_bitmap = previous;
+        self.scene_width = self.build_width;
+        self.scene_height = self.build_height;
+        self.scene_dpi = self.build_dpi;
+        self.scene_valid = true;
+        self.build_next_row = null;
+        return true;
+    }
+
+    pub fn cancelSceneBuild(self: *DeviceResources) void {
+        self.build_next_row = null;
+    }
+
     pub fn deinit(self: *DeviceResources) void {
         self.releaseTargetResources();
         self.releaseRowLayouts();
@@ -485,6 +566,45 @@ pub const DeviceResources = struct {
         self.scene_height = height;
         self.scene_dpi = dpi;
         self.scene_valid = false;
+        if (counters_enabled) self.scene_recreation_count +|= 1;
+    }
+
+    fn ensureBuildingSceneBitmap(
+        self: *DeviceResources,
+        cache: *const render_commands.RenderCache,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !void {
+        const width = metrics.margin_x + @as(u32, cache.columns) * metrics.cell_width;
+        const height = metrics.margin_y + @as(u32, @intCast(cache.rows.items.len)) * metrics.cell_height;
+        if (self.building_scene_bitmap != null and self.build_width == width and
+            self.build_height == height and self.build_dpi == dpi)
+            return;
+        if (self.building_scene_bitmap) |bitmap| release(bitmap);
+        self.building_scene_bitmap = null;
+        const pixels_per_inch: f32 = @floatFromInt(dpi);
+        const properties: d2d.D2D1_BITMAP_PROPERTIES1 = .{
+            .pixelFormat = .{
+                .format = dxgi_common.DXGI_FORMAT_B8G8R8A8_UNORM,
+                .alphaMode = d2d_common.D2D1_ALPHA_MODE_IGNORE,
+            },
+            .dpiX = pixels_per_inch,
+            .dpiY = pixels_per_inch,
+            .bitmapOptions = d2d.D2D1_BITMAP_OPTIONS_TARGET,
+            .colorContext = null,
+        };
+        var bitmap: *d2d.ID2D1Bitmap1 = undefined;
+        if (self.d2d_context.CreateBitmap(
+            .{ .width = width, .height = height },
+            null,
+            0,
+            &properties,
+            &bitmap,
+        ).failed) return error.CreateSceneBitmapFailed;
+        self.building_scene_bitmap = bitmap;
+        self.build_width = width;
+        self.build_height = height;
+        self.build_dpi = dpi;
         if (counters_enabled) self.scene_recreation_count +|= 1;
     }
 
@@ -796,18 +916,39 @@ pub const DeviceResources = struct {
         target.BeginDraw();
         const background = toColor(background_rgb);
         target.Clear(&background);
+        // Do not rely on DrawBitmap's null-destination shorthand: after a
+        // swap-chain resize it may round through DIPs and shift the terminal
+        // by a pixel.  Source and destination are exactly the committed scene
+        // pixels, anchored at the terminal margin.
+        const scale = dipScale(self.target_dpi);
+        const destination: d2d_common.D2D_RECT_F = .{
+            .left = 0,
+            .top = 0,
+            .right = @as(f32, @floatFromInt(self.scene_width)) * scale,
+            .bottom = @as(f32, @floatFromInt(self.scene_height)) * scale,
+        };
+        const source: d2d_common.D2D_RECT_F = .{
+            .left = 0,
+            .top = 0,
+            .right = @floatFromInt(self.scene_width),
+            .bottom = @floatFromInt(self.scene_height),
+        };
         target.DrawBitmap(
             @ptrCast(scene),
-            null,
+            &destination,
             1.0,
-            d2d.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-            null,
+            d2d.D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+            &source,
         );
         try checkDrawResult(target.EndDraw(null, null));
         self.copy_trace.recordSince(copy_start);
 
         const present_start = frame_trace.timestamp();
-        const result = self.swap_chain.IDXGISwapChain.Present(1, 0);
+        // The DWM owns the display cadence for a windowed swap chain. Waiting
+        // for v-sync here stalls the window procedure during live resizing;
+        // that turns each WM_SIZE into a GPU round trip. A zero sync interval
+        // lets DWM select the newest completed frame, as it does for GDI apps.
+        const result = self.swap_chain.IDXGISwapChain.Present(0, 0);
         self.present_trace.recordSince(present_start);
         if (!result.failed) return;
         if (isDeviceLoss(result)) return error.DeviceLost;
@@ -907,11 +1048,14 @@ pub const DeviceResources = struct {
     fn releaseTargetResources(self: *DeviceResources) void {
         self.releaseSwapChainTarget();
         if (self.scene_bitmap) |bitmap| release(bitmap);
+        if (self.building_scene_bitmap) |bitmap| release(bitmap);
+        self.building_scene_bitmap = null;
         self.scene_bitmap = null;
         self.scene_width = 0;
         self.scene_height = 0;
         self.scene_dpi = 0;
         self.scene_valid = false;
+        self.build_next_row = null;
     }
 
     fn releaseSwapChainTarget(self: *DeviceResources) void {

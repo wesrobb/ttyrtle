@@ -97,6 +97,9 @@ pub const RenderCache = struct {
         rectangle_commands: u64,
     };
     allocator: std.mem.Allocator,
+    /// A full cache may be built in bounded slices while another cache remains
+    /// on screen.  `build_next_row == null` means this cache is committed.
+    build_next_row: ?u16 = null,
     background: terminal.Rgb = .{ .red = 12, .green = 16, .blue = 20 },
     rows: std.ArrayListUnmanaged(CachedRow) = .empty,
     columns: u16 = 0,
@@ -134,6 +137,40 @@ pub const RenderCache = struct {
         self.* = undefined;
     }
 
+    /// Prepare an empty, self-contained cache for a new terminal geometry.
+    /// No existing cache is touched; callers may continue presenting it until
+    /// `advanceFullBuild` reports completion.
+    pub fn beginFullBuild(
+        self: *RenderCache,
+        model: *const terminal.TerminalModel,
+        metrics: geometry.Metrics,
+    ) !void {
+        try self.resize(model.rows(), model.columns());
+        self.metrics = metrics;
+        self.background = model.background();
+        self.scroll_up_rows = 0;
+        self.scroll_down_rows = 0;
+        self.build_next_row = 0;
+    }
+
+    /// Rebuild at most `row_budget` rows and return true once every row is
+    /// present.  The model must not change during a generation; the app
+    /// cancels and restarts this cache whenever it receives model output.
+    pub fn advanceFullBuild(
+        self: *RenderCache,
+        model: *const terminal.TerminalModel,
+        metrics: geometry.Metrics,
+        row_budget: u16,
+    ) !bool {
+        var next = self.build_next_row orelse return true;
+        const end = @min(model.rows(), next +| @max(row_budget, 1));
+        while (next < end) : (next += 1) try self.rebuildRow(model, metrics, next);
+        self.recordDirtyRows(end - self.build_next_row.?);
+        self.build_next_row = if (end == model.rows()) null else end;
+        if (self.build_next_row == null and counters_enabled) self.full_rebuild_count +|= 1;
+        return self.build_next_row == null;
+    }
+
     /// Copies all pending model damage into application-owned retained rows.
     /// The caller may acknowledge model damage after this returns successfully.
     pub fn update(
@@ -148,6 +185,7 @@ pub const RenderCache = struct {
             !std.meta.eql(self.metrics.?, metrics);
 
         if (dimensions_changed) try self.resize(model.rows(), model.columns());
+        self.build_next_row = null;
         self.metrics = metrics;
         self.background = model.background();
         self.scroll_up_rows = 0;
@@ -624,6 +662,28 @@ fn shapeFingerprint(row: *const CachedRow) u64 {
 
 fn fingerprintMix(hash: u64, value: anytype) u64 {
     return (hash ^ @as(u64, @intCast(value))) *% 0x100000001b3;
+}
+
+test "staged full build exposes rows only after deterministic completion" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+    try model.write("staged cache");
+    const metrics: geometry.Metrics = .forDpi(96);
+    var front = RenderCache.init(std.testing.allocator);
+    defer front.deinit();
+    try front.update(&model, metrics, model.damage());
+    const front_generation = front.rows.items[0].generation;
+
+    var back = RenderCache.init(std.testing.allocator);
+    defer back.deinit();
+    try back.beginFullBuild(&model, metrics);
+    try std.testing.expect(!(try back.advanceFullBuild(&model, metrics, 1)));
+    try std.testing.expect(back.build_next_row != null);
+    try std.testing.expectEqual(front_generation, front.rows.items[0].generation);
+    while (!(try back.advanceFullBuild(&model, metrics, 1))) {}
+    try std.testing.expect(back.build_next_row == null);
+    try std.testing.expectEqual(model.rows(), @as(u16, @intCast(back.rows.items.len)));
 }
 
 test "cache rebuilds only dirty rows" {

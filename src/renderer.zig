@@ -156,6 +156,38 @@ pub const Renderer = struct {
         if (counters_enabled) self.frame_request_count +|= 1;
     }
 
+    pub fn beginRetainedBuild(
+        self: *Renderer,
+        cache: *const render_commands.RenderCache,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) bool {
+        const resources = &(self.gpu orelse return false);
+        resources.beginSceneBuild(cache, metrics, dpi) catch |err| {
+            std.log.warn("GPU resize scene build failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        return true;
+    }
+
+    pub fn advanceRetainedBuild(
+        self: *Renderer,
+        cache: *const render_commands.RenderCache,
+        metrics: geometry.Metrics,
+        dpi: u32,
+        row_budget: usize,
+    ) ?bool {
+        const resources = &(self.gpu orelse return null);
+        return resources.advanceSceneBuild(cache, metrics, dpi, row_budget) catch |err| {
+            std.log.warn("GPU resize scene advance failed: {s}", .{@errorName(err)});
+            return null;
+        };
+    }
+
+    pub fn cancelRetainedBuild(self: *Renderer) void {
+        if (self.gpu) |*resources| resources.cancelSceneBuild();
+    }
+
     pub fn invalidateTerminalContent(self: *Renderer) void {
         if (self.gpu) |*resources| resources.invalidateTerminalContent();
     }
