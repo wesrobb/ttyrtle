@@ -736,8 +736,17 @@ fn beginRenameTab(id: workspace.TabId) !void {
         null,
     ) orelse return error.CreateRenameEditorFailed;
     rename_editor = .{ .window = editor, .tab_id = id };
+    // Creating and focusing the edit child can synchronously re-enter the tab
+    // subclass. Persist this compatibility view before either operation so a
+    // nested callback does not restore the previous null editor state.
+    if (app_window) |window| {
+        if (windowStateFromHwnd(window)) |state| state.rename_editor = rename_editor;
+    }
     if (comctl32.SetWindowSubclass(editor, renameEditorProc, 1, 0) == 0) {
         rename_editor = null;
+        if (app_window) |window| {
+            if (windowStateFromHwnd(window)) |state| state.rename_editor = null;
+        }
         _ = user32.DestroyWindow(editor);
         return error.SubclassRenameEditorFailed;
     }
@@ -774,6 +783,11 @@ fn repositionRenameEditor() void {
 fn finishRename(commit: bool) void {
     const editor = rename_editor orelse return;
     rename_editor = null;
+    // DestroyWindow and focus restoration can re-enter the tab callback. Keep
+    // the owning WindowState in sync before that reentrancy observes it.
+    if (app_window) |window| {
+        if (windowStateFromHwnd(window)) |state| state.rename_editor = null;
+    }
     defer _ = user32.DestroyWindow(editor.window);
     if (commit) {
         const length = user32.GetWindowTextLengthW(editor.window);
@@ -1619,6 +1633,13 @@ fn verifyInlineRename(window: foundation.HWND) !void {
     const x: u16 = @intCast(bounds.left + 4);
     const y: u16 = @intCast(bounds.top + 4);
     const point = @as(isize, x) | (@as(isize, y) << 16);
+    var hit: controls.TCHITTESTINFO = .{
+        .pt = messagePoint(point),
+        .flags = controls.TCHT_NOWHERE,
+    };
+    const hit_index = user32.SendMessageW(control, controls.TCM_HITTEST, 0, @bitCast(@intFromPtr(&hit)));
+    if (hit_index != 0) return error.RenameDoubleClickDidNotHitActiveTab;
+    if (nativeTabIdAt(0) != id) return error.RenameNativeTabIdentityMismatch;
     _ = user32.SendMessageW(control, wm.WM_LBUTTONDBLCLK, 0, point);
     const editor = rename_editor orelse return error.RenameEditorWasNotCreated;
     const committed = std.unicode.utf8ToUtf16LeStringLiteral("  Build  ");
@@ -1665,22 +1686,22 @@ fn verifyTabInteractions(window: foundation.HWND) !void {
     var screen_point: foundation.POINT = .{ .x = bounds.left + 4, .y = bounds.top + 4 };
     if (user32.ClientToScreen(control, &screen_point) == 0) return error.ClientToScreenFailed;
 
-    test_context_menu_command = context_menu_rename_tab;
-    defer test_context_menu_command = null;
+    setTestContextMenuCommand(window, context_menu_rename_tab);
+    defer setTestContextMenuCommand(window, null);
     _ = user32.SendMessageW(control, wm.WM_CONTEXTMENU, 0, packMessagePoint(screen_point));
     const editor = rename_editor orelse return error.ContextMenuRenameDidNotOpenEditor;
     if (editor.tab_id != hit_id) return error.ContextMenuDidNotSelectHitTab;
     cancelRename();
 
     const count_before_create = workspace_state.tabs.items.len;
-    test_context_menu_command = context_menu_new_tab;
+    setTestContextMenuCommand(window, context_menu_new_tab);
     _ = user32.SendMessageW(window, wm.WM_CONTEXTMENU, 0, -1);
     if (workspace_state.tabs.items.len != count_before_create + 1)
         return error.KeyboardContextMenuDidNotCreateTab;
     const created = workspace_state.active_tab_id orelse return error.ContextMenuCreateDidNotActivateTab;
     if (created == hit_id) return error.ContextMenuCreateDidNotSelectNewTab;
 
-    test_context_menu_command = context_menu_close_tab;
+    setTestContextMenuCommand(window, context_menu_close_tab);
     _ = user32.SendMessageW(window, wm.WM_CONTEXTMENU, 0, -1);
     if (workspace_state.tabs.items.len != count_before_create)
         return error.KeyboardContextMenuDidNotCloseTab;
@@ -2770,6 +2791,11 @@ fn currentModifiers() input.Mods {
 fn setTestModifiers(window: foundation.HWND, modifiers: ?input.Mods) void {
     test_modifiers = modifiers;
     if (windowStateFromHwnd(window)) |state| state.test_modifiers = modifiers;
+}
+
+fn setTestContextMenuCommand(window: foundation.HWND, command: ?usize) void {
+    test_context_menu_command = command;
+    if (windowStateFromHwnd(window)) |state| state.test_context_menu_command = command;
 }
 
 fn keyIsDown(virtual_key: i32) bool {

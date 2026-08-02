@@ -30,6 +30,8 @@ The intended ownership hierarchy is:
 
 ```text
 Application
+├── message-only notification receiver
+├── WindowId/SessionId routing and retirement manager
 └── Window
     ├── native tab-control HWND
     ├── renderer
@@ -43,7 +45,8 @@ Application
 Each top-level window owns one workspace and one tab-control child window. A
 tab owns a pane-layout root from the beginning, even while only a single
 terminal pane is supported. This avoids changing tab ownership when split panes
-are introduced.
+are introduced. The application owns notification routing and delayed session
+retirement, so no HWND is used as a session's identity or lifetime owner.
 
 Terminal panes do not need individual child windows. The application can divide
 the terminal client area into pane rectangles and render them through the
@@ -137,13 +140,22 @@ operations without Win32; hidden-window integration tests cover native selection
 and drag notifications, multiple asynchronous sessions, resize/DPI propagation,
 and repeated teardown.
 
-The multiple-window transfer milestone is in progress. The model now allocates
-each `Tab` separately, uses application-wide `WindowId`/`SessionId` routing,
-and prepares every destination allocation before detaching a tab. Its commit
-moves the existing `*Tab` and pane root without allocation, then updates the
-existing session routes. The application also creates a message-only ConPTY
-notification receiver before it starts a session. Cross-window dragging and
-tear-out remain deferred.
+The multiple-window transfer implementation is complete in automated coverage.
+Each `Tab` is allocated separately and application-wide `WindowId`/`SessionId`
+routing resolves current ownership. Transfer prepares destination resources
+before detaching, commits the existing `*Tab` and pane root without allocation,
+then updates the existing session routes and both native views. The message-only
+ConPTY notification receiver is created before sessions and outlives retiring
+workers. A close removes its visible UI immediately and retires terminal work
+asynchronously. `Ctrl+Shift+N`, **New Window**, **Move Tab to New Window**, and
+the keyboard-accessible **Move Tab to Window** submenu are available; transfer
+keeps the terminal model and process intact. Cross-window dragging and tear-out
+remain deferred.
+
+The required real-monitor, Narrator/Inspect, high-contrast, system-menu,
+taskbar, and renderer-fallback manual QA matrix is still an outstanding release
+handoff; see the transfer plan. It must be recorded against the implementation
+work before the milestone is marked fully done.
 
 The feature-work tracker in [todo.md](../../todo.md) is the authoritative place
 for status and plans for future work, including cross-window transfer, panes,

@@ -35,9 +35,11 @@ constraints, but they do not replace this tracker.
 ## In progress
 
 - **In progress** — [Multiple top-level windows and tab transfer](docs/architecture/multi-window-tab-transfer-plan.md):
-  verified transfer-model, notification-receiver, Per-Monitor V2, and
-  `Application`/`WindowState` foundations; native multi-window commands,
-  asynchronous retirement, and their lifecycle coverage remain.
+  automated implementation and `zig build verify` coverage are complete for
+  independent windows, command-driven transfer, lifecycle routing, and
+  asynchronous retirement. The plan's real-monitor, Narrator/Inspect,
+  high-contrast, system/taskbar, and renderer-fallback manual QA matrix remains
+  an outstanding required handoff before this entry can become **Done**.
 
 ## Needs planning
 

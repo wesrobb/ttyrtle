@@ -658,19 +658,24 @@ single-window tests.
 
 ### Current implementation status
 
-The verified foundation is in place: tabs are heap-stable; the workspace has
-an allocation-free transfer transaction; ConPTY notifications use an
-application-lifetime receiver; and Per-Monitor V2 is enabled before HWND
-creation. `Application`/`WindowState` now own the initial window's workspace,
-renderer, cache, DPI metrics, input translation/shortcut state, and stable
-`GWLP_USERDATA` identity. Window destruction now consistently enters the
-`closing` lifecycle before destroying the HWND, restoring message-loop shutdown
-for ConPTY completion and error paths.
+Automated implementation is complete. `Application` owns stable window and
+session routing, the message-only notification receiver, the wakeable cleanup
+gate, and independent heap-stable `WindowState` instances. Each window owns
+its workspace, native tab control, renderer/cache, DPI state, input state, and
+callbacks through `GWLP_USERDATA`. `Ctrl+Shift+N` and the tab context menu
+create windows and move tabs to new or existing windows without recreating the
+tab's pane root, terminal, ConPTY, or child process.
 
-`zig build verify` passed after this work. The native ownership conversion is
-still incomplete: single-window callback helpers retain compatibility views,
-and native new-window/move commands and asynchronous retirement remain
-disabled until that conversion is complete.
+Tab removal and window close retire sessions asynchronously. The visible HWND
+can disappear while worker cleanup finishes; the notification receiver and
+message pump remain alive until no worker can post. Automated unit, hidden
+window lifecycle, transfer, DPI seam, renderer-cost, accessibility-baseline,
+key-routing, and smoke coverage is included in `zig build verify`.
+
+The manual QA matrix below remains a required outstanding handoff. It requires
+real mixed-DPI monitors, Narrator or Inspect, high contrast, system/taskbar
+behavior, and GPU/GDI fallback observations. Do not mark the milestone done or
+claim complete feature verification until those results are recorded.
 
 ### Phase 1: Ownership and lifecycle scaffolding
 
@@ -747,6 +752,14 @@ disabled until that conversion is complete.
 zig fmt build.zig src test
 zig build verify
 ```
+
+### Implementation handoff
+
+All eight implementation phases have automated coverage. Before changing the
+feature tracker to **Done**, execute and record the [Manual QA matrix](#manual-qa-matrix)
+on supported Windows hardware. Record monitor scale factors, Windows version,
+renderer mode, and results with the implementation work; this repository does
+not fabricate those observations.
 
 ## Test plan
 
