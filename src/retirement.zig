@@ -24,7 +24,10 @@ pub const Manager = struct {
         self.* = .{
             .allocator = allocator,
             .completion_event = completion_event,
-            .work_event = kernel32.CreateEventW(null, 0, 0, null) orelse
+            // Manual reset wakes the whole bounded worker pool during final
+            // shutdown. `take` resets it only while holding the queue lock,
+            // so an enqueue cannot lose a wakeup between empty-check and wait.
+            .work_event = kernel32.CreateEventW(null, 1, 0, null) orelse
                 return error.CreateRetirementWorkEventFailed,
         };
         errdefer _ = kernel32.CloseHandle(self.work_event);
@@ -69,7 +72,7 @@ pub const Manager = struct {
         self.lock();
         self.stopping = true;
         self.mutex.unlock();
-        for (0..worker_count) |_| _ = kernel32.SetEvent(self.work_event);
+        _ = kernel32.SetEvent(self.work_event);
         for (&self.workers) |*slot| if (slot.*) |thread| {
             thread.join();
             slot.* = null;
@@ -89,6 +92,7 @@ pub const Manager = struct {
                 return item;
             }
             const stopping = self.stopping;
+            if (!stopping) _ = kernel32.ResetEvent(self.work_event);
             self.mutex.unlock();
             if (stopping) return null;
             _ = kernel32.WaitForSingleObject(self.work_event, std.math.maxInt(u32));

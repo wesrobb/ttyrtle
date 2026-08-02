@@ -58,6 +58,7 @@ pub const Mode = enum {
     integration_multi_session,
     integration_multi_resize,
     integration_host_close,
+    integration_final_retirement,
 };
 
 var dpi_awareness_configured = false;
@@ -152,6 +153,7 @@ const Application = struct {
     integration_resize_requested: bool = false,
     integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 },
     integration_multi_session: MultiSessionIntegration = .{},
+    final_window_destroyed_while_retiring: bool = false,
 
     fn init(allocator: std.mem.Allocator, mode: Mode) Application {
         return .{ .allocator = allocator, .model = .init(allocator), .mode = mode };
@@ -524,7 +526,7 @@ pub fn run(mode: Mode) !void {
                 .integration_input => integration_input_command,
                 .integration_resize => integration_resize_command.?,
                 .integration_multi_session, .integration_multi_resize => integration_multi_first_command,
-                .integration_host_close => integration_host_close_command,
+                .integration_host_close, .integration_final_retirement => integration_host_close_command,
                 else => null,
             },
         );
@@ -564,10 +566,13 @@ pub fn run(mode: Mode) !void {
     } else {
         _ = user32.UpdateWindow(window);
     }
-    if (mode == .integration_host_close)
+    if (mode == .integration_host_close or mode == .integration_final_retirement)
         _ = user32.PostMessageW(window, wm.WM_CLOSE, 0, 0);
+    if (mode == .integration_final_retirement)
+        user32.PostQuitMessage(0);
 
     var message: wm.MSG = undefined;
+    var quit_requested = false;
     while (true) {
         if (application.liveWindowCount() == 0 and application.retirementPending() == 0)
             break;
@@ -587,16 +592,25 @@ pub fn run(mode: Mode) !void {
         if (result != @intFromEnum(foundation.WAIT_OBJECT_0) + handles.len)
             return error.MessageWaitFailed;
         while (user32.PeekMessageW(&message, null, 0, 0, wm.PM_REMOVE) != 0) {
-            if (message.message == wm.WM_QUIT) break;
+            if (message.message == wm.WM_QUIT) {
+                // A WM_QUIT can be posted by external code while sessions
+                // still own notification-posting workers. Preserve the
+                // dispatcher until the explicit retirement gate is satisfied.
+                quit_requested = true;
+                break;
+            }
             _ = user32.TranslateMessage(&message);
             _ = user32.DispatchMessageW(&message);
         }
-        if (message.message == wm.WM_QUIT) break;
+        if (quit_requested) continue;
     }
 
     if (isSmokeMode(mode) and !paint_completed) return error.SmokePaintFailed;
     if (isIntegrationMode(mode) and !integration_succeeded)
         return error.ConptyIntegrationFailed;
+    if (mode == .integration_final_retirement and
+        !application.final_window_destroyed_while_retiring)
+        return error.FinalWindowWasNotDestroyedBeforeRetirementCompleted;
 }
 
 fn createTabControl(
@@ -1733,6 +1747,10 @@ fn windowProcImpl(
                 value.hwnd = null;
                 value.tab_control = null;
                 value.model_window.lifecycle = .destroyed;
+                if (active_mode == .integration_final_retirement and
+                    value.application.liveWindowCount() == 0 and
+                    value.application.retirementPending() != 0)
+                    value.application.final_window_destroyed_while_retiring = true;
                 _ = win32.zig.setWindowLongPtrW(
                     window,
                     @intFromEnum(wm.GWLP_USERDATA),

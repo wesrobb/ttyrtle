@@ -63,3 +63,7 @@ test "resize and DPI changes update every attached ConPTY session" {
 test "repeated host close drains and tears down busy sessions without stale notifications" {
     for (0..5) |_| try app.run(.integration_host_close);
 }
+
+test "final visible window disappears before its busy session retirement completes" {
+    try app.run(.integration_final_retirement);
+}
