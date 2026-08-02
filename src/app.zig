@@ -16,6 +16,7 @@ const memory = win32.system.memory;
 const ole = win32.system.ole;
 const file_system = win32.storage.file_system;
 const controls = win32.ui.controls;
+const hi_dpi = win32.ui.hi_dpi;
 const wm = win32.ui.windows_and_messaging;
 const comctl32 = win32.comctl32;
 const kernel32 = win32.kernel32;
@@ -55,37 +56,47 @@ pub const Mode = enum {
     integration_host_close,
 };
 
+var dpi_awareness_configured = false;
+// TODO(multi-window): the callback conversion below is in progress. These
+// compatibility aliases keep the existing single-window verification modes
+// working while the native WindowState entry point is being wired through the
+// remaining helpers.
 var workspace_ids: workspace.IdSource = .{};
-var workspace_state: workspace.Workspace = undefined;
+var workspace_state: *workspace.Workspace = undefined;
 var model: *terminal.TerminalModel = undefined;
 var model_initialized = false;
 var tab_control: ?foundation.HWND = null;
 var app_window: ?foundation.HWND = null;
+var notification_window: ?foundation.HWND = null;
 var active_mode: Mode = .normal;
 var paint_completed = false;
 var integration_succeeded = false;
 var integration_resize_requested = false;
 var integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 };
 var integration_multi_session: MultiSessionIntegration = .{};
-var input_translator: input.Translator = .{};
-var shortcut_state: ShortcutState = .{};
+var input_translator: *input.Translator = undefined;
+var shortcut_state: *ShortcutState = undefined;
 var test_modifiers: ?input.Mods = null;
 var test_context_menu_command: ?usize = null;
 var rename_editor: ?RenameEditor = null;
-var terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi);
-var tab_drag: TabDrag = .{};
+var terminal_metrics: *geometry.Metrics = undefined;
+var tab_drag: *TabDrag = undefined;
 var selection_dragging = false;
 var selection_anchor: ?terminal.Cursor = null;
 var selection_head: ?terminal.Cursor = null;
 var pressed_mouse_button: ?input.MouseButton = null;
-var active_renderer: renderer.Renderer = .{};
-var render_cache: render_commands.RenderCache = undefined;
+var active_renderer: *renderer.Renderer = undefined;
+var render_cache: *render_commands.RenderCache = undefined;
 var render_cache_initialized = false;
 var output_trace: frame_trace.Counter = .{};
 var paint_trace: frame_trace.Counter = .{};
 var cache_trace: frame_trace.Counter = .{};
 var output_frame_pending = false;
 var resize_message_count: u64 = 0;
+/// The process-global pointer is only the entry point used by the message-only
+/// dispatcher. Every HWND-bound value lives below in `WindowState` and is
+/// recovered from GWLP_USERDATA for every top-level callback.
+var active_application: ?*Application = null;
 
 const cursor_timer_id = 1;
 const output_frame_timer_id = 2;
@@ -122,29 +133,154 @@ const MultiSessionIntegration = struct {
     failed: bool = false,
 };
 
+const Application = struct {
+    allocator: std.mem.Allocator,
+    model: workspace.Application,
+    /// This message-only HWND outlives every terminal session. ConPTY workers
+    /// post stable SessionId tokens here; it resolves their current WindowId.
+    notification_window: ?foundation.HWND = null,
+    windows: std.ArrayListUnmanaged(*WindowState) = .empty,
+    mode: Mode,
+    paint_completed: bool = false,
+    integration_succeeded: bool = false,
+    integration_resize_requested: bool = false,
+    integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 },
+    integration_multi_session: MultiSessionIntegration = .{},
+
+    fn init(allocator: std.mem.Allocator, mode: Mode) Application {
+        return .{ .allocator = allocator, .model = .init(allocator), .mode = mode };
+    }
+
+    fn deinit(self: *Application) void {
+        for (self.windows.items) |state| {
+            state.deinit();
+            self.allocator.destroy(state);
+        }
+        self.windows.deinit(self.allocator);
+        self.model.deinit();
+        self.* = undefined;
+    }
+
+    fn stateForWindow(self: *Application, hwnd: foundation.HWND) ?*WindowState {
+        for (self.windows.items) |state| if (state.hwnd == hwnd) return state;
+        return null;
+    }
+
+    fn stateForSession(self: *Application, id: workspace.SessionId) ?*WindowState {
+        const owner = self.model.sessionOwner(id) orelse return null;
+        const window_id = switch (owner) {
+            .attached, .transferring => |value| value,
+            .retiring => return null,
+        };
+        for (self.windows.items) |state| {
+            if (state.model_window.id == window_id and state.model_window.lifecycle == .live)
+                return state;
+        }
+        return null;
+    }
+
+    fn liveWindowCount(self: *const Application) usize {
+        var count: usize = 0;
+        for (self.windows.items) |state| {
+            if (state.model_window.lifecycle == .live) count += 1;
+        }
+        return count;
+    }
+};
+
+const WindowState = struct {
+    application: *Application,
+    model_window: *workspace.Window,
+    hwnd: ?foundation.HWND = null,
+    tab_control: ?foundation.HWND = null,
+    active_model: ?*terminal.TerminalModel = null,
+    input_translator: input.Translator = .{},
+    shortcut_state: ShortcutState = .{},
+    test_modifiers: ?input.Mods = null,
+    test_context_menu_command: ?usize = null,
+    rename_editor: ?RenameEditor = null,
+    terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi),
+    tab_drag: TabDrag = .{},
+    selection_dragging: bool = false,
+    selection_anchor: ?terminal.Cursor = null,
+    selection_head: ?terminal.Cursor = null,
+    pressed_mouse_button: ?input.MouseButton = null,
+    wheel_scroll_accumulator: WheelScrollAccumulator = .{},
+    held_viewport_shortcuts: std.EnumSet(ViewportShortcut) = .initEmpty(),
+    renderer: renderer.Renderer = .{},
+    render_cache: render_commands.RenderCache,
+    output_trace: frame_trace.Counter = .{},
+    paint_trace: frame_trace.Counter = .{},
+    cache_trace: frame_trace.Counter = .{},
+    output_frame_pending: bool = false,
+    resize_message_count: u64 = 0,
+
+    fn init(application: *Application, model_window: *workspace.Window) WindowState {
+        return .{
+            .application = application,
+            .model_window = model_window,
+            .render_cache = .init(application.allocator),
+        };
+    }
+
+    fn deinit(self: *WindowState) void {
+        self.renderer.deinit();
+        self.render_cache.deinit();
+    }
+
+    fn ownedWorkspace(self: *WindowState) *workspace.Workspace {
+        return &self.model_window.workspace;
+    }
+
+    fn model(self: *WindowState) ?*terminal.TerminalModel {
+        return self.active_model;
+    }
+};
+
 pub fn run(mode: Mode) !void {
     const allocator = std.heap.smp_allocator;
+    var application = Application.init(allocator, mode);
+    active_application = &application;
+    defer {
+        active_application = null;
+        application.deinit();
+    }
+    const model_window = try application.model.createWindow();
+    const state = try allocator.create(WindowState);
+    state.* = .init(&application, model_window);
+    try application.windows.append(allocator, state);
+    const initial_tab = try state.ownedWorkspace().createTab(24, 80);
+    try application.model.routeTab(model_window.id, state.ownedWorkspace().tab(initial_tab).?);
+    if (mode == .smoke_tabs) {
+        const second_tab = try state.ownedWorkspace().createTab(24, 80);
+        try application.model.routeTab(model_window.id, state.ownedWorkspace().tab(second_tab).?);
+    }
+    state.active_model = &state.ownedWorkspace().activeSession().?.model;
+    workspace_state = state.ownedWorkspace();
+    model = state.active_model.?;
+    model_initialized = true;
     active_mode = mode;
     paint_completed = false;
     integration_succeeded = false;
     integration_resize_requested = false;
     integration_resize_target = .{ .columns = 1, .rows = 1 };
     integration_multi_session = .{};
+    notification_window = null;
     tab_control = null;
-    input_translator = .{};
-    shortcut_state = .{};
+    app_window = null;
+    input_translator = &state.input_translator;
+    shortcut_state = &state.shortcut_state;
     test_modifiers = null;
     test_context_menu_command = null;
     rename_editor = null;
-    terminal_metrics = .forDpi(geometry.base_dpi);
-    tab_drag = .{};
+    terminal_metrics = &state.terminal_metrics;
+    tab_drag = &state.tab_drag;
     selection_dragging = false;
     selection_anchor = null;
     selection_head = null;
     pressed_mouse_button = null;
-    active_renderer = .{};
-    defer active_renderer.deinit();
-    render_cache = .init(allocator);
+    active_renderer = &state.renderer;
+    render_cache = &state.render_cache;
     render_cache_initialized = true;
     output_trace = .{};
     paint_trace = .{};
@@ -152,23 +288,12 @@ pub fn run(mode: Mode) !void {
     output_frame_pending = false;
     resize_message_count = 0;
     defer {
-        render_cache.deinit();
         render_cache_initialized = false;
-    }
-
-    workspace_ids = .{};
-    workspace_state = .init(allocator, &workspace_ids);
-    _ = try workspace_state.createTab(24, 80);
-    if (mode == .smoke_tabs) _ = try workspace_state.createTab(24, 80);
-    model = &workspace_state.activeSession().?.model;
-    model_initialized = true;
-    defer {
         model_initialized = false;
-        workspace_state.deinit();
     }
     defer logDebugCounters();
     if (isSmokeMode(mode))
-        try model.write("\x1b[38;2;126;231;135mHello from libghostty.\x1b[0m");
+        try state.model().?.write("\x1b[38;2;126;231;135mHello from libghostty.\x1b[0m");
 
     const instance = kernel32.GetModuleHandleW(null) orelse
         return error.GetModuleHandleFailed;
@@ -178,6 +303,13 @@ pub fn run(mode: Mode) !void {
     };
     if (comctl32.InitCommonControlsEx(&common_controls) == 0)
         return error.InitCommonControlsFailed;
+
+    if (!dpi_awareness_configured) {
+        if (user32.SetProcessDpiAwarenessContext(
+            hi_dpi.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        ) == 0) return error.SetProcessDpiAwarenessContextFailed;
+        dpi_awareness_configured = true;
+    }
 
     const window_class: wm.WNDCLASSEXW = .{
         .cbSize = @sizeOf(wm.WNDCLASSEXW),
@@ -198,6 +330,27 @@ pub fn run(mode: Mode) !void {
         return error.RegisterClassFailed;
     defer _ = user32.UnregisterClassW(class_name, instance);
 
+    const receiver = user32.CreateWindowExW(
+        .{},
+        class_name,
+        null,
+        .{},
+        0,
+        0,
+        0,
+        0,
+        wm.HWND_MESSAGE,
+        null,
+        instance,
+        null,
+    ) orelse return error.CreateNotificationWindowFailed;
+    application.notification_window = receiver;
+    notification_window = receiver;
+    defer {
+        application.notification_window = null;
+        if (user32.IsWindow(receiver) != 0) _ = user32.DestroyWindow(receiver);
+    }
+
     var main_window_style = wm.WS_OVERLAPPEDWINDOW;
     main_window_style.CLIPCHILDREN = 1;
     const window = user32.CreateWindowExW(
@@ -212,16 +365,16 @@ pub fn run(mode: Mode) !void {
         null,
         null,
         instance,
-        null,
+        state,
     ) orelse return error.CreateWindowFailed;
-    app_window = window;
-    defer app_window = null;
     defer if (user32.IsWindow(window) != 0) {
         _ = user32.DestroyWindow(window);
     };
-    tab_control = try createTabControl(instance, window);
-    defer tab_control = null;
-    if (comctl32.SetWindowSubclass(tab_control, tabControlProc, 1, 0) == 0)
+    state.hwnd = window;
+    state.tab_control = try createTabControl(instance, window);
+    app_window = window;
+    tab_control = state.tab_control;
+    if (comctl32.SetWindowSubclass(state.tab_control, tabControlProc, 1, @intFromPtr(state)) == 0)
         return error.SubclassTabControlFailed;
     try syncNativeTabs();
     if (mode != .smoke_gdi)
@@ -232,8 +385,9 @@ pub fn run(mode: Mode) !void {
         _ = user32.KillTimer(window, output_frame_timer_id);
     }
 
-    terminal_metrics = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
+    terminal_metrics.* = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
     try resizeForClient(window);
+    if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
     if (mode == .smoke_tabs) try verifyNativeTabControl(window);
     if (mode == .smoke_shortcuts) try verifyShortcutDispatch(window);
     if (mode == .smoke_rename) try verifyInlineRename(window);
@@ -243,10 +397,11 @@ pub fn run(mode: Mode) !void {
     var integration_resize_command: ?[]u8 = null;
     defer if (integration_resize_command) |command| allocator.free(command);
     if (mode == .integration_resize) {
-        integration_resize_target = .{
-            .columns = model.columns() +| 7,
-            .rows = model.rows() +| 3,
+        application.integration_resize_target = .{
+            .columns = state.model().?.columns() +| 7,
+            .rows = state.model().?.rows() +| 3,
         };
+        integration_resize_target = application.integration_resize_target;
         const script = try std.fmt.allocPrint(
             allocator,
             "$ProgressPreference = 'SilentlyContinue'; " ++
@@ -263,8 +418,8 @@ pub fn run(mode: Mode) !void {
                 " > CON\" }} else {{ & cmd.exe /d /q /c " ++
                 "\"echo CONPTY_STEP_3_RESIZE_MISMATCH > CON\"; exit 1 }}",
             .{
-                integration_resize_target.columns,
-                integration_resize_target.rows,
+                application.integration_resize_target.columns,
+                application.integration_resize_target.rows,
             },
         );
         defer allocator.free(script);
@@ -274,9 +429,9 @@ pub fn run(mode: Mode) !void {
     if (!isSmokeMode(mode)) {
         const process = try conpty.Session.create(
             allocator,
-            window,
-            @intFromEnum(workspace_state.activeSession().?.id),
-            .{ .columns = model.columns(), .rows = model.rows() },
+            receiver,
+            @intFromEnum(state.ownedWorkspace().activeSession().?.id),
+            .{ .columns = state.model().?.columns(), .rows = state.model().?.rows() },
             switch (mode) {
                 .integration => integration_command,
                 .integration_input => integration_input_command,
@@ -286,22 +441,24 @@ pub fn run(mode: Mode) !void {
                 else => null,
             },
         );
-        workspace_state.activeSession().?.attachProcess(.{
+        state.ownedWorkspace().activeSession().?.attachProcess(.{
             .context = process,
             .destroy = destroyConptyProcess,
         }) catch |err| {
             process.destroy();
             return err;
         };
-        model.setReplySink(.{
+        state.model().?.setReplySink(.{
             .context = process,
             .write = queueTerminalReply,
         });
         if (mode == .integration_input) try queueIntegrationInput();
         if (isMultiSessionIntegrationMode(mode)) {
-            integration_multi_session.first = workspace_state.activeSession().?.id;
+            application.integration_multi_session.first = state.ownedWorkspace().activeSession().?.id;
+            integration_multi_session.first = application.integration_multi_session.first;
             try createIntegrationTerminalTab(window, integration_multi_second_command);
-            integration_multi_session.second = workspace_state.activeSession().?.id;
+            application.integration_multi_session.second = state.ownedWorkspace().activeSession().?.id;
+            integration_multi_session.second = application.integration_multi_session.second;
             if (mode == .integration_multi_resize)
                 try verifyMultiSessionResizeAndDpi(window);
         }
@@ -506,8 +663,13 @@ fn tabControlProc(
     wparam: usize,
     lparam: isize,
     _: usize,
-    _: usize,
+    reference_data: usize,
 ) callconv(.winapi) isize {
+    if (reference_data != 0) {
+        const state: *WindowState = @ptrFromInt(reference_data);
+        if (state.model_window.lifecycle == .closing or state.model_window.lifecycle == .destroyed)
+            return comctl32.DefSubclassProc(control, message, wparam, lparam);
+    }
     if (message == wm.WM_LBUTTONDOWN) {
         const hwnd = control orelse return 0;
         var hit: controls.TCHITTESTINFO = .{
@@ -517,7 +679,7 @@ fn tabControlProc(
         const index = user32.SendMessageW(hwnd, controls.TCM_HITTEST, 0, @bitCast(@intFromPtr(&hit)));
         if (index >= 0) {
             if (nativeTabIdAt(@intCast(index))) |id| {
-                tab_drag = .{ .candidate_id = id, .anchor = hit.pt };
+                tab_drag.* = .{ .candidate_id = id, .anchor = hit.pt };
             } else {
                 cancelTabDrag();
             }
@@ -587,7 +749,7 @@ fn tabControlProc(
         return result;
     }
     if (message == wm.WM_CANCELMODE or message == wm.WM_CAPTURECHANGED) {
-        tab_drag = .{};
+        tab_drag.* = .{};
         return comctl32.DefSubclassProc(control, message, wparam, lparam);
     }
     return comctl32.DefSubclassProc(control, message, wparam, lparam);
@@ -715,7 +877,7 @@ fn updateWindowCaption(window: foundation.HWND) void {
 }
 
 const ConptyTabSetup = struct {
-    window: foundation.HWND,
+    notification_window: foundation.HWND,
     dimensions: geometry.Dimensions,
     command: ?[]const u8 = null,
 };
@@ -723,7 +885,7 @@ const ConptyTabSetup = struct {
 fn startConptyTab(session: *workspace.TerminalSession, setup: *const ConptyTabSetup) !void {
     const process = try conpty.Session.create(
         std.heap.smp_allocator,
-        setup.window,
+        setup.notification_window,
         @intFromEnum(session.id),
         setup.dimensions,
         setup.command,
@@ -738,7 +900,10 @@ fn createTerminalTab(window: foundation.HWND) !void {
     if (user32.GetClientRect(window, &client) == 0) return error.GetClientRectFailed;
     const dimensions: geometry.Dimensions = terminal_metrics.dimensions(client.right - client.left, client.bottom - client.top) orelse
         .{ .columns = 80, .rows = 24 };
-    var setup: ConptyTabSetup = .{ .window = window, .dimensions = dimensions };
+    var setup: ConptyTabSetup = .{
+        .notification_window = notification_window orelse return error.NotificationWindowUnavailable,
+        .dimensions = dimensions,
+    };
     const id = if (isSmokeMode(active_mode))
         try workspace_state.createTab(dimensions.rows, dimensions.columns)
     else
@@ -760,7 +925,7 @@ fn createIntegrationTerminalTab(window: foundation.HWND, command: []const u8) !v
     const dimensions: geometry.Dimensions = terminal_metrics.dimensions(client.right - client.left, client.bottom - client.top) orelse
         .{ .columns = 80, .rows = 24 };
     var setup: ConptyTabSetup = .{
-        .window = window,
+        .notification_window = notification_window orelse return error.NotificationWindowUnavailable,
         .dimensions = dimensions,
         .command = command,
     };
@@ -782,20 +947,20 @@ fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
     _ = workspace_state.closeTab(id);
     if (workspace_state.activeTab()) |next| {
         model = &next.root.terminalSession().model;
-        input_translator = .{};
+        input_translator.* = .{};
         selection_dragging = false;
         syncNativeTabs() catch {};
         updateWindowCaption(window);
         model.markFullDamage();
         invalidateRenderDamage(window);
     } else {
-        _ = user32.DestroyWindow(window);
+        beginWindowClose(window);
     }
 }
 
 fn cancelTabDrag() void {
     const was_dragging = tab_drag.dragging;
-    tab_drag = .{};
+    tab_drag.* = .{};
     if (was_dragging) _ = user32.ReleaseCapture();
 }
 
@@ -907,13 +1072,13 @@ fn activateTab(window: foundation.HWND, id: workspace.TabId) !void {
         _ = user32.SendMessageW(control, controls.TCM_SETCURSEL, native_index, 0);
     }
     model = &workspace_state.activeSession().?.model;
-    input_translator = .{};
+    input_translator.* = .{};
     selection_dragging = false;
     selection_anchor = null;
     selection_head = null;
     pressed_mouse_button = null;
     render_cache.deinit();
-    render_cache = .init(std.heap.smp_allocator);
+    render_cache.* = .init(std.heap.smp_allocator);
     // Row generations are model-local; retained GPU text layouts must not be
     // reused for a different terminal merely because their numbers match.
     active_renderer.invalidateTerminalContent();
@@ -1208,6 +1373,24 @@ fn windowProc(
     wparam: usize,
     lparam: isize,
 ) callconv(.winapi) isize {
+    if (message == wm.WM_NCCREATE) {
+        const create: *const wm.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
+        if (create.lpCreateParams) |parameter| {
+            const state: *WindowState = @ptrCast(@alignCast(parameter));
+            state.hwnd = window;
+            _ = win32.zig.setWindowLongPtrW(
+                window,
+                @intFromEnum(wm.GWLP_USERDATA),
+                @intFromPtr(state),
+            );
+        }
+        return user32.DefWindowProcW(window, message, wparam, lparam);
+    }
+
+    const state = windowStateFromHwnd(window);
+    if (state) |value| if (value.model_window.lifecycle == .destroyed)
+        return user32.DefWindowProcW(window, message, wparam, lparam);
+
     switch (message) {
         wm.WM_PAINT => {
             paint_completed = paint(window);
@@ -1252,7 +1435,7 @@ fn windowProc(
         },
         wm.WM_DPICHANGED => {
             cancelTabDrag();
-            terminal_metrics = active_renderer.metricsForDpi(@as(u16, @truncate(wparam)));
+            terminal_metrics.* = active_renderer.metricsForDpi(@as(u16, @truncate(wparam)));
             model.markFullDamage();
             const suggested: *const foundation.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
             _ = user32.SetWindowPos(
@@ -1283,10 +1466,12 @@ fn windowProc(
             return 0;
         },
         conpty.output_message => {
-            handleConptyOutput(window, @enumFromInt(@as(u64, @intCast(wparam))));
+            const target = notificationTarget(window) orelse return 0;
+            handleConptyOutput(target, @enumFromInt(@as(u64, @intCast(wparam))));
             return 0;
         },
         conpty.child_exit_message => {
+            const target = notificationTarget(window) orelse return 0;
             if (workspace_state.session(@enumFromInt(@as(u64, @intCast(wparam))))) |session| {
                 if (session.processAs(conpty.Session)) |process| {
                     _ = process.beginClosing();
@@ -1294,11 +1479,11 @@ fn windowProc(
                         std.log.info("ConPTY child exited with code {d}", .{code});
                     if (isMultiSessionIntegrationMode(active_mode)) {
                         _ = session.noteChildExit();
-                        finishMultiSessionIntegration(window);
+                        finishMultiSessionIntegration(target);
                         return 0;
                     }
                     if (session.noteChildExit())
-                        closeTerminalTab(window, workspace_state.tabForSession(session.id).?.id);
+                        closeTerminalTab(target, workspace_state.tabForSession(session.id).?.id);
                 }
             }
             return 0;
@@ -1350,19 +1535,59 @@ fn windowProc(
             return 0;
         },
         wm.WM_CLOSE => {
-            cancelTabDrag();
-            if (model_initialized) {
-                for (workspace_state.tabs.items) |*tab| tab.root.terminalSession().closeProcess();
-            }
-            _ = user32.DestroyWindow(window);
+            beginWindowClose(window);
             return 0;
         },
         wm.WM_DESTROY => {
-            user32.PostQuitMessage(0);
+            if (state) |value| if (value.application.liveWindowCount() == 0)
+                user32.PostQuitMessage(0);
             return 0;
+        },
+        wm.WM_NCDESTROY => {
+            if (state) |value| {
+                value.hwnd = null;
+                value.tab_control = null;
+                value.model_window.lifecycle = .destroyed;
+                _ = win32.zig.setWindowLongPtrW(
+                    window,
+                    @intFromEnum(wm.GWLP_USERDATA),
+                    0,
+                );
+            }
+            return user32.DefWindowProcW(window, message, wparam, lparam);
         },
         else => return user32.DefWindowProcW(window, message, wparam, lparam),
     }
+}
+
+fn windowStateFromHwnd(window: foundation.HWND) ?*WindowState {
+    const raw = win32.zig.getWindowLongPtrW(window, @intFromEnum(wm.GWLP_USERDATA));
+    if (raw == 0) return null;
+    return @ptrFromInt(raw);
+}
+
+/// The only top-level close entry point. Completion and error paths often do
+/// not receive WM_CLOSE, so they must establish the same lifecycle boundary
+/// before DestroyWindow synchronously enters WM_DESTROY.
+fn beginWindowClose(window: foundation.HWND) void {
+    if (windowStateFromHwnd(window)) |state| {
+        switch (state.model_window.lifecycle) {
+            .destroyed, .closing => return,
+            .constructing, .live, .transferring => state.model_window.lifecycle = .closing,
+        }
+    }
+    cancelTabDrag();
+    if (model_initialized) {
+        for (workspace_state.tabs.items) |tab| tab.root.terminalSession().closeProcess();
+    }
+    _ = user32.DestroyWindow(window);
+}
+
+fn notificationTarget(window: foundation.HWND) ?foundation.HWND {
+    if (notification_window) |receiver| {
+        if (window == receiver) return app_window;
+    }
+    return window;
 }
 
 const Shortcut = enum {
@@ -1979,7 +2204,7 @@ fn paint(window: foundation.HWND) bool {
     const cache_start = frame_trace.timestamp();
     render_cache.update(
         model,
-        terminal_metrics,
+        terminal_metrics.*,
         damage,
     ) catch return false;
     cache_trace.recordSince(cache_start);
@@ -1987,9 +2212,9 @@ fn paint(window: foundation.HWND) bool {
         dc,
         paint_state.rcPaint,
         client,
-        &render_cache,
+        render_cache,
         damage,
-        terminal_metrics,
+        terminal_metrics.*,
         user32.GetDpiForWindow(window),
     );
     model.acknowledgeDamage();
@@ -2021,7 +2246,7 @@ fn resizeForClient(window: foundation.HWND) !void {
     // Ghostty resize is atomic and marks full damage. Copy that current state
     // now, rather than waiting for a timer that may be starved by WM_SIZE.
     const damage = model.damage();
-    try render_cache.update(model, terminal_metrics, damage);
+    try render_cache.update(model, terminal_metrics.*, damage);
     model.acknowledgeDamage();
 }
 
@@ -2047,7 +2272,7 @@ fn surfaceForClient(window: foundation.HWND) !SurfaceSize {
 }
 
 fn resizeTerminalForDimensions(dimensions: geometry.Dimensions) !void {
-    for (workspace_state.tabs.items) |*tab| {
+    for (workspace_state.tabs.items) |tab| {
         const session = tab.root.terminalSession();
         if (dimensions.rows == session.model.rows() and dimensions.columns == session.model.columns())
             continue;
@@ -2087,7 +2312,7 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
     if (changed) {
         applyOutputBatchForSession(window, session, batch.chunks.items, true) catch {
             std.log.err("failed to apply ConPTY output to the terminal model", .{});
-            if (isIntegrationMode(active_mode)) _ = user32.DestroyWindow(window);
+            if (isIntegrationMode(active_mode)) beginWindowClose(window);
             return;
         };
         if (workspace_state.activeSession() == session) scheduleOutputFrame(window);
@@ -2102,7 +2327,7 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
         integration_resize_requested = true;
         requestIntegrationResize(window) catch {
             std.log.err("failed to request integration resize", .{});
-            _ = user32.DestroyWindow(window);
+            beginWindowClose(window);
             return;
         };
     }
@@ -2136,7 +2361,7 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
         };
         integration_succeeded = batch.failure == null and
             terminalContains(marker);
-        _ = user32.DestroyWindow(window);
+        beginWindowClose(window);
     } else if (batch.finished) {
         if (session.noteOutputFinished())
             closeTerminalTab(window, workspace_state.tabForSession(session.id).?.id);
@@ -2148,12 +2373,12 @@ fn finishMultiSessionIntegration(window: foundation.HWND) void {
     const second_id = integration_multi_session.second orelse return;
     const first = workspace_state.session(first_id) orelse {
         integration_multi_session.failed = true;
-        _ = user32.DestroyWindow(window);
+        beginWindowClose(window);
         return;
     };
     const second = workspace_state.session(second_id) orelse {
         integration_multi_session.failed = true;
-        _ = user32.DestroyWindow(window);
+        beginWindowClose(window);
         return;
     };
     if (!first.output_finished or !first.child_exited or
@@ -2165,7 +2390,7 @@ fn finishMultiSessionIntegration(window: foundation.HWND) void {
         terminalContainsForSession(first, integration_multi_first_marker) and
         terminalContainsForSession(second, integration_multi_second_marker) and
         nativeTabLabelEquals(first_id, integration_multi_first_title);
-    _ = user32.DestroyWindow(window);
+    beginWindowClose(window);
 }
 
 fn logDebugCounters() void {
@@ -2717,7 +2942,7 @@ fn expectAllSessionDimensions(window: foundation.HWND) !void {
         client.bottom - client.top,
     ) orelse return error.MultiSessionResizeDimensionsUnavailable;
 
-    for (workspace_state.tabs.items) |*tab| {
+    for (workspace_state.tabs.items) |tab| {
         const session = tab.root.terminalSession();
         if (session.model.columns() != expected.columns or session.model.rows() != expected.rows)
             return error.MultiSessionModelResizeMismatch;

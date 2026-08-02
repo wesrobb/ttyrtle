@@ -56,7 +56,9 @@ relationships:
 
 ```zig
 const Workspace = struct {
-    tabs: std.ArrayListUnmanaged(Tab),
+    // Heap-stable tab owners permit an entire pane root to move without
+    // copying the terminal session or its process ownership.
+    tabs: std.ArrayListUnmanaged(*Tab),
     active_tab_id: TabId,
 };
 
@@ -134,6 +136,14 @@ the [runtime-tabs plan](runtime-tabs-plan.md). Unit tests cover workspace
 operations without Win32; hidden-window integration tests cover native selection
 and drag notifications, multiple asynchronous sessions, resize/DPI propagation,
 and repeated teardown.
+
+The multiple-window transfer milestone is in progress. The model now allocates
+each `Tab` separately, uses application-wide `WindowId`/`SessionId` routing,
+and prepares every destination allocation before detaching a tab. Its commit
+moves the existing `*Tab` and pane root without allocation, then updates the
+existing session routes. The application also creates a message-only ConPTY
+notification receiver before it starts a session. Cross-window dragging and
+tear-out remain deferred.
 
 The feature-work tracker in [todo.md](../../todo.md) is the authoritative place
 for status and plans for future work, including cross-window transfer, panes,

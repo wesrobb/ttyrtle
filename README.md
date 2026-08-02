@@ -10,6 +10,7 @@ A deliberately small native Windows terminal prototype:
 - queued, mode-aware keyboard input via Ghostty's encoder
 - non-blocking terminal query replies, title changes, and bells
 - a workspace model with stable tab and terminal-session identities
+- heap-stable tab owners and an application-level transfer coordinator
 - a native Win32 tab strip synchronized from the workspace model
 - cursor, cell-background, inverse-video, and combining-mark rendering
 - bracketed paste, selection, clipboard copy, focus, and mouse reporting
@@ -39,6 +40,8 @@ sound.
 - Right-click a tab, or invoke the keyboard context menu, for New Tab, Rename,
   and Close actions.
 - Drag a tab with the left mouse button to reorder same-window tabs.
+- Cross-window moves are command-driven work in progress; cross-window drag
+  and tear-out are intentionally not implemented.
 - Terminal output continues to be parsed while its tab is inactive. OSC titles
   label the corresponding tab and window; an explicit tab name takes priority.
 - `Ctrl+Shift+C` copies the current selection as Unicode text.
@@ -137,6 +140,9 @@ Font selection and size are not configurable yet. The internal workspace owns
 each tab's pane root, terminal model, and ConPTY process. Same-window tabs
 support creation, closing, switching, inline renaming, context-menu actions,
 drag reordering, and dynamic OSC labels while inactive tabs continue to process
-output. The [feature-work tracker](todo.md) is the authoritative roadmap for
-future capabilities such as cross-window movement, panes, configuration,
-accessibility, and release work.
+output. Tabs are heap-stable so the application-level transfer coordinator can
+move an existing pane root without recreating a terminal model or process; the
+native multi-window command UI and asynchronous retirement work remain in
+progress. The [feature-work tracker](todo.md) is the authoritative roadmap for
+future capabilities such as panes, configuration, accessibility, and release
+work.

@@ -32,12 +32,18 @@ constraints, but they do not replace this tracker.
   synchronous Direct2D target changes, terminal/ConPTY updates only at cell
   boundaries, and retained-scene reuse for pixel-only resizes.
 
+## In progress
+
+- **In progress** — [Multiple top-level windows and tab transfer](docs/architecture/multi-window-tab-transfer-plan.md):
+  verified transfer-model, notification-receiver, Per-Monitor V2, and
+  `Application`/`WindowState` foundations; native multi-window commands,
+  asynchronous retirement, and their lifecycle coverage remain.
+
 ## Needs planning
 
 ### Windows, tabs, and panes
 
-- Multiple top-level windows and moving running tabs between them while
-  preserving pane layouts and sessions.
+- Cross-window tab dragging and tear-out, built on command-driven tab transfer.
 - Pane splits: horizontal/vertical splits, focus movement, resizing, closing,
   and tab/pane ownership rules.
 - Tab process or working-directory status.

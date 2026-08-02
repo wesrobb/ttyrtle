@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    if (target.result.os.tag != .windows or target.result.cpu.arch != .x86_64)
+        @panic("ttyrtle currently supports only Windows x86_64; 32-bit notification tokens and ARM64 remain deliberately unsupported");
+
     const exe = addExecutable(b, .{
         .name = "ttyrtle",
         .target = target,

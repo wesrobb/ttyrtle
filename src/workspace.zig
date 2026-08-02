@@ -3,10 +3,12 @@ const terminal = @import("terminal.zig");
 
 pub const TabId = enum(u64) { _ };
 pub const SessionId = enum(u64) { _ };
+pub const WindowId = enum(u64) { _ };
 
 pub const IdSource = struct {
     next_tab: u64 = 1,
     next_session: u64 = 1,
+    next_window: u64 = 1,
 
     fn tab(self: *IdSource) TabId {
         const id: TabId = @enumFromInt(self.next_tab);
@@ -17,6 +19,12 @@ pub const IdSource = struct {
     fn session(self: *IdSource) SessionId {
         const id: SessionId = @enumFromInt(self.next_session);
         self.next_session += 1;
+        return id;
+    }
+
+    pub fn window(self: *IdSource) WindowId {
+        const id: WindowId = @enumFromInt(self.next_window);
+        self.next_window += 1;
         return id;
     }
 };
@@ -106,6 +114,21 @@ pub const PaneNode = union(enum) {
             .terminal => |session| session,
         };
     }
+
+    /// This intentionally has a single-leaf implementation today. Split panes
+    /// extend it recursively without changing workspace transfer ownership.
+    pub fn forEachTerminalSession(
+        self: *PaneNode,
+        context: anytype,
+        comptime visit: fn (*TerminalSession, @TypeOf(context)) void,
+    ) void {
+        visit(self.terminalSession(), context);
+    }
+
+    pub fn sessionById(self: *PaneNode, id: SessionId) ?*TerminalSession {
+        const session = self.terminalSession();
+        return if (session.id == id) session else null;
+    }
 };
 
 pub const Tab = struct {
@@ -124,12 +147,22 @@ pub const Tab = struct {
             if (title.len != 0) return title;
         return "Terminal";
     }
+
+    pub fn forEachTerminalSession(
+        self: *Tab,
+        context: anytype,
+        comptime visit: fn (*TerminalSession, @TypeOf(context)) void,
+    ) void {
+        self.root.forEachTerminalSession(context, visit);
+    }
 };
 
 pub const Workspace = struct {
     allocator: std.mem.Allocator,
     ids: *IdSource,
-    tabs: std.ArrayListUnmanaged(Tab) = .empty,
+    /// A tab's address is part of its application identity. A tab may move to
+    /// another workspace, but it is never copied while it owns a session tree.
+    tabs: std.ArrayListUnmanaged(*Tab) = .empty,
     active_tab_id: ?TabId = null,
 
     pub fn init(allocator: std.mem.Allocator, ids: *IdSource) Workspace {
@@ -140,7 +173,10 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace) void {
-        for (self.tabs.items) |*item| item.deinit(self.allocator);
+        for (self.tabs.items) |item| {
+            item.deinit(self.allocator);
+            self.allocator.destroy(item);
+        }
         self.tabs.deinit(self.allocator);
         self.* = undefined;
     }
@@ -165,6 +201,9 @@ pub const Workspace = struct {
     ) !TabId {
         const previous_active = self.active_tab_id;
         const tab_id = self.ids.tab();
+        const created_tab = try self.allocator.create(Tab);
+        var tab_attached = false;
+        errdefer if (!tab_attached) self.allocator.destroy(created_tab);
         const terminal_session = blk: {
             const created = try self.allocator.create(TerminalSession);
             errdefer self.allocator.destroy(created);
@@ -175,10 +214,12 @@ pub const Workspace = struct {
                 columns,
             );
             errdefer created.deinit();
-            try self.tabs.append(self.allocator, .{
+            created_tab.* = .{
                 .id = tab_id,
                 .root = .{ .terminal = created },
-            });
+            };
+            try self.tabs.append(self.allocator, created_tab);
+            tab_attached = true;
             break :blk created;
         };
         errdefer {
@@ -192,8 +233,9 @@ pub const Workspace = struct {
 
     pub fn closeTab(self: *Workspace, id: TabId) bool {
         const index = self.indexOf(id) orelse return false;
-        var removed = self.tabs.orderedRemove(index);
+        const removed = self.tabs.orderedRemove(index);
         removed.deinit(self.allocator);
+        self.allocator.destroy(removed);
 
         if (self.active_tab_id == id) {
             self.active_tab_id = if (self.tabs.items.len == 0)
@@ -233,7 +275,7 @@ pub const Workspace = struct {
 
     pub fn tab(self: *Workspace, id: TabId) ?*Tab {
         const index = self.indexOf(id) orelse return null;
-        return &self.tabs.items[index];
+        return self.tabs.items[index];
     }
 
     pub fn activeTab(self: *Workspace) ?*Tab {
@@ -246,15 +288,15 @@ pub const Workspace = struct {
     }
 
     pub fn tabForSession(self: *Workspace, session_id: SessionId) ?*Tab {
-        for (self.tabs.items) |*item| {
-            if (item.root.terminalSession().id == session_id) return item;
+        for (self.tabs.items) |item| {
+            if (item.root.sessionById(session_id) != null) return item;
         }
         return null;
     }
 
     pub fn session(self: *Workspace, session_id: SessionId) ?*TerminalSession {
         const item = self.tabForSession(session_id) orelse return null;
-        return item.root.terminalSession();
+        return item.root.sessionById(session_id);
     }
 
     pub fn indexOfTab(self: *const Workspace, id: TabId) ?usize {
@@ -266,6 +308,219 @@ pub const Workspace = struct {
             if (item.id == id) return index;
         }
         return null;
+    }
+
+    /// Reserve before a transfer commit. The commit then uses only
+    /// `detachTab`/`attachTabAssumeCapacity`, which cannot allocate.
+    pub fn ensureUnusedCapacity(self: *Workspace, additional: usize) !void {
+        try self.tabs.ensureUnusedCapacity(self.allocator, additional);
+    }
+
+    /// Removes a tab without deinitializing it. The caller becomes its sole
+    /// owner and must attach it to another workspace or retire it.
+    pub fn detachTab(self: *Workspace, id: TabId) ?*Tab {
+        const index = self.indexOf(id) orelse return null;
+        const detached = self.tabs.orderedRemove(index);
+        if (self.active_tab_id == id) {
+            self.active_tab_id = if (self.tabs.items.len == 0)
+                null
+            else
+                self.tabs.items[@min(index, self.tabs.items.len - 1)].id;
+        }
+        return detached;
+    }
+
+    pub fn attachTabAssumeCapacity(self: *Workspace, item: *Tab, index: usize) void {
+        std.debug.assert(index <= self.tabs.items.len);
+        self.tabs.insertAssumeCapacity(index, item);
+        self.active_tab_id = item.id;
+    }
+};
+
+/// Application-owned lifecycle state. HWNDs are intentionally absent here:
+/// they are presentation handles, while WindowId remains valid across native
+/// callbacks and transfer-menu snapshots.
+pub const WindowLifecycle = enum {
+    constructing,
+    live,
+    transferring,
+    closing,
+    destroyed,
+};
+
+pub const SessionOwner = union(enum) {
+    attached: WindowId,
+    transferring: WindowId,
+    retiring,
+};
+
+pub const Window = struct {
+    id: WindowId,
+    lifecycle: WindowLifecycle = .constructing,
+    workspace: Workspace,
+};
+
+/// The UI application owns stable windows and session routing. Win32-specific
+/// WindowState embeds this model rather than using HWND or native tab indexes
+/// as identities.
+pub const Application = struct {
+    allocator: std.mem.Allocator,
+    ids: IdSource = .{},
+    windows: std.ArrayListUnmanaged(*Window) = .empty,
+    session_owners: std.AutoHashMapUnmanaged(SessionId, SessionOwner) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) Application {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Application) void {
+        for (self.windows.items) |value| {
+            value.workspace.deinit();
+            self.allocator.destroy(value);
+        }
+        self.windows.deinit(self.allocator);
+        self.session_owners.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn createWindow(self: *Application) !*Window {
+        const value = try self.allocator.create(Window);
+        errdefer self.allocator.destroy(value);
+        value.* = .{
+            .id = self.ids.window(),
+            .workspace = .init(self.allocator, &self.ids),
+        };
+        try self.windows.append(self.allocator, value);
+        return value;
+    }
+
+    pub fn markLive(self: *Application, id: WindowId) bool {
+        const value = self.window(id) orelse return false;
+        if (value.lifecycle != .constructing) return false;
+        value.lifecycle = .live;
+        return true;
+    }
+
+    pub fn window(self: *Application, id: WindowId) ?*Window {
+        for (self.windows.items) |value| if (value.id == id) return value;
+        return null;
+    }
+
+    pub fn sessionOwner(self: *const Application, id: SessionId) ?SessionOwner {
+        return self.session_owners.get(id);
+    }
+
+    /// Creates and routes a new terminal leaf. Process startup remains an
+    /// application/Win32 concern and can use `Workspace.createTabWithSetup`.
+    pub fn createTab(self: *Application, window_id: WindowId, rows: u16, columns: u16) !TabId {
+        const value = self.window(window_id) orelse return error.UnknownWindow;
+        if (value.lifecycle != .live) return error.WindowNotLive;
+        const id = try value.workspace.createTab(rows, columns);
+        errdefer _ = value.workspace.closeTab(id);
+        try self.routeTab(value.id, value.workspace.tab(id).?);
+        return id;
+    }
+
+    pub fn routeTab(self: *Application, window_id: WindowId, item: *Tab) !void {
+        const Route = struct {
+            application: *Application,
+            window_id: WindowId,
+            err: ?anyerror = null,
+
+            fn put(session: *TerminalSession, context: *@This()) void {
+                context.application.session_owners.put(
+                    context.application.allocator,
+                    session.id,
+                    .{ .attached = context.window_id },
+                ) catch |err| {
+                    context.err = err;
+                };
+            }
+        };
+        var route: Route = .{ .application = self, .window_id = window_id };
+        item.forEachTerminalSession(&route, Route.put);
+        if (route.err) |err| return err;
+    }
+
+    pub fn prepareTransfer(
+        self: *Application,
+        source_id: WindowId,
+        destination_id: WindowId,
+        tab_id: TabId,
+        destination_index: usize,
+    ) !TransferTransaction {
+        const source = self.window(source_id) orelse return error.UnknownSourceWindow;
+        const destination = self.window(destination_id) orelse return error.UnknownDestinationWindow;
+        if (source == destination) return error.SameWindowTransfer;
+        if (source.lifecycle != .live or destination.lifecycle != .live)
+            return error.WindowNotLive;
+        const item = source.workspace.tab(tab_id) orelse return error.UnknownTab;
+        if (destination_index > destination.workspace.tabs.items.len)
+            return error.InvalidDestinationIndex;
+
+        var transaction: TransferTransaction = .{
+            .application = self,
+            .source = source,
+            .destination = destination,
+            .tab_id = tab_id,
+            .destination_index = destination_index,
+        };
+        errdefer transaction.deinit();
+        try destination.workspace.ensureUnusedCapacity(1);
+        try transaction.sessions.ensureUnusedCapacity(self.allocator, 1);
+        const Collect = struct {
+            sessions: *std.ArrayListUnmanaged(SessionId),
+            fn append(session: *TerminalSession, context: *@This()) void {
+                context.sessions.appendAssumeCapacity(session.id);
+            }
+        };
+        var collect: Collect = .{ .sessions = &transaction.sessions };
+        item.forEachTerminalSession(&collect, Collect.append);
+        for (transaction.sessions.items) |session_id| {
+            const owner = self.session_owners.get(session_id) orelse return error.UnroutedSession;
+            if (owner != .attached or owner.attached != source.id)
+                return error.SessionOwnerMismatch;
+        }
+        return transaction;
+    }
+};
+
+/// All allocation occurs in `Application.prepareTransfer`. `commit` changes
+/// only list membership and existing hash-map values, so an existing terminal,
+/// ConPTY process, and pane root cannot be recreated or lost mid-transfer.
+pub const TransferTransaction = struct {
+    application: *Application,
+    source: *Window,
+    destination: *Window,
+    tab_id: TabId,
+    destination_index: usize,
+    sessions: std.ArrayListUnmanaged(SessionId) = .empty,
+
+    pub fn deinit(self: *TransferTransaction) void {
+        self.sessions.deinit(self.application.allocator);
+        self.* = undefined;
+    }
+
+    pub fn commit(self: *TransferTransaction) *Tab {
+        // `prepareTransfer` validates these conditions, and UI-thread callers
+        // hold both lifecycle guards before they can reenter native code.
+        std.debug.assert(self.source.lifecycle == .live);
+        std.debug.assert(self.destination.lifecycle == .live);
+        self.source.lifecycle = .transferring;
+        self.destination.lifecycle = .transferring;
+        for (self.sessions.items) |session_id| {
+            const route = self.application.session_owners.getPtr(session_id) orelse unreachable;
+            route.* = .{ .transferring = self.destination.id };
+        }
+        const item = self.source.workspace.detachTab(self.tab_id) orelse unreachable;
+        self.destination.workspace.attachTabAssumeCapacity(item, self.destination_index);
+        for (self.sessions.items) |session_id| {
+            const route = self.application.session_owners.getPtr(session_id) orelse unreachable;
+            route.* = .{ .attached = self.destination.id };
+        }
+        self.source.lifecycle = .live;
+        self.destination.lifecycle = .live;
+        return item;
     }
 };
 
@@ -477,4 +732,64 @@ test "tab setup rollback closes an attached process after attachment failure" {
     try std.testing.expectEqual(@as(usize, 1), value.tabs.items.len);
     try std.testing.expectEqual(first, value.active_tab_id.?);
     try std.testing.expectEqual(@as(usize, 1), process.destroy_count);
+}
+
+test "application transfer preserves heap-stable tab, pane, and session identities" {
+    var application = Application.init(std.testing.allocator);
+    defer application.deinit();
+    const source = try application.createWindow();
+    const destination = try application.createWindow();
+    try std.testing.expect(application.markLive(source.id));
+    try std.testing.expect(application.markLive(destination.id));
+
+    const first = try application.createTab(source.id, 24, 80);
+    const moved = try application.createTab(source.id, 24, 80);
+    const destination_tab = try application.createTab(destination.id, 24, 80);
+    const original = source.workspace.tab(moved).?;
+    const original_root = &original.root;
+    const original_session = original.root.terminalSession();
+    try original_session.model.write("transfer-marker");
+    try std.testing.expect(try source.workspace.renameTab(moved, "Pinned"));
+
+    var transaction = try application.prepareTransfer(
+        source.id,
+        destination.id,
+        moved,
+        0,
+    );
+    defer transaction.deinit();
+    const transferred = transaction.commit();
+    try std.testing.expectEqual(original, transferred);
+    try std.testing.expectEqual(original_root, &transferred.root);
+    try std.testing.expectEqual(original_session, transferred.root.terminalSession());
+    try std.testing.expectEqual(moved, destination.workspace.active_tab_id.?);
+    try std.testing.expectEqual(first, source.workspace.active_tab_id.?);
+    try std.testing.expectEqual(destination_tab, destination.workspace.tabs.items[1].id);
+    try std.testing.expectEqualStrings("Pinned", transferred.effectiveLabel());
+    try std.testing.expectEqual(
+        SessionOwner{ .attached = destination.id },
+        application.sessionOwner(original_session.id).?,
+    );
+}
+
+test "transfer preflight failures leave workspace membership and routing unchanged" {
+    var application = Application.init(std.testing.allocator);
+    defer application.deinit();
+    const source = try application.createWindow();
+    const destination = try application.createWindow();
+    try std.testing.expect(application.markLive(source.id));
+    try std.testing.expect(application.markLive(destination.id));
+    const item = try application.createTab(source.id, 24, 80);
+    const session_id = source.workspace.tab(item).?.root.terminalSession().id;
+
+    try std.testing.expectError(
+        error.InvalidDestinationIndex,
+        application.prepareTransfer(source.id, destination.id, item, 1),
+    );
+    try std.testing.expectEqual(@as(usize, 1), source.workspace.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), destination.workspace.tabs.items.len);
+    try std.testing.expectEqual(
+        SessionOwner{ .attached = source.id },
+        application.sessionOwner(session_id).?,
+    );
 }

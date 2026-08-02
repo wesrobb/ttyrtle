@@ -12,13 +12,21 @@ const threading = win32.system.threading;
 const kernel32 = win32.kernel32;
 const user32 = win32.user32;
 
+comptime {
+    if (@sizeOf(usize) < @sizeOf(u64))
+        @compileError("ConPTY notifications carry SessionId in WPARAM and require a 64-bit target");
+}
+
 pub const output_message = win32.ui.windows_and_messaging.WM_APP + 1;
 pub const child_exit_message = win32.ui.windows_and_messaging.WM_APP + 2;
 pub const input_failure_message = win32.ui.windows_and_messaging.WM_APP + 3;
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
-    window: foundation.HWND,
+    /// Application-lifetime message-only receiver. This is never the owning
+    /// top-level window, because a tab may transfer or retire while worker
+    /// threads still need a safe notification target.
+    notification_window: foundation.HWND,
     notification_token: usize,
     pseudo_console: ?console.HPCON,
     input_write: ?foundation.HANDLE,
@@ -40,7 +48,7 @@ pub const Session = struct {
 
     pub fn create(
         allocator: std.mem.Allocator,
-        window: foundation.HWND,
+        notification_window: foundation.HWND,
         notification_token: usize,
         dimensions: geometry.Dimensions,
         command_line_override: ?[]const u8,
@@ -190,7 +198,7 @@ pub const Session = struct {
         const self = try allocator.create(Session);
         self.* = .{
             .allocator = allocator,
-            .window = window,
+            .notification_window = notification_window,
             .notification_token = notification_token,
             .pseudo_console = pseudo_console,
             .input_write = input_write,
@@ -388,7 +396,7 @@ pub const Session = struct {
                         self.input_failure_code.store(code, .release);
                         self.markFailed();
                         _ = user32.PostMessageW(
-                            self.window,
+                            self.notification_window,
                             input_failure_message,
                             self.notification_token,
                             0,
@@ -451,7 +459,7 @@ pub const Session = struct {
 
     fn postOutputMessage(self: *Session) bool {
         return user32.PostMessageW(
-            self.window,
+            self.notification_window,
             output_message,
             self.notification_token,
             0,
@@ -475,7 +483,7 @@ pub const Session = struct {
                 );
             }
             _ = user32.PostMessageW(
-                self.window,
+                self.notification_window,
                 child_exit_message,
                 self.notification_token,
                 0,
