@@ -2060,8 +2060,13 @@ fn windowProcImpl(
             return 0;
         },
         wm.WM_KILLFOCUS => {
+            cancelSelectionDrag();
             queueFocus(.lost);
             return 0;
+        },
+        wm.WM_CANCELMODE, wm.WM_CAPTURECHANGED => {
+            cancelSelectionDrag();
+            return user32.DefWindowProcW(window, message, wparam, lparam);
         },
         wm.WM_PASTE => {
             pasteClipboard(window);
@@ -2317,6 +2322,11 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) bool {
     const bits: usize = @bitCast(lparam);
     const repeated = (bits & (@as(usize, 1) << 30)) != 0;
     const modifiers = currentModifiers();
+    // Escape follows the normal Windows text-selection convention while a
+    // local terminal selection is present. A subsequent Escape is delivered
+    // to the hosted terminal normally.
+    if (is_down and wparam == 0x1b and cancelTerminalSelection(app_window))
+        return true;
     if (handleViewportKey(message, wparam, modifiers)) return true;
     if (shortcut_state.handleKey(message, wparam, repeated, modifiers)) |shortcut| switch (shortcut) {
         .suppress => {},
@@ -2364,6 +2374,84 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) bool {
         return false;
     }
     return true;
+}
+
+/// Cancel an in-progress local drag and clear its rendered selection. Mouse
+/// capture is owned only while the drag is active, so releasing it here cannot
+/// affect mouse reporting for a terminal-managed interaction.
+fn cancelTerminalSelection(window: ?foundation.HWND) bool {
+    const has_selection = model.core.screens.active.selection != null;
+    const was_dragging = selection_dragging;
+    if (!has_selection and !was_dragging) return false;
+
+    selection_dragging = false;
+    selection_anchor = null;
+    selection_head = null;
+    if (was_dragging) _ = user32.ReleaseCapture();
+    if (has_selection) {
+        model.clearSelection();
+        if (window) |value| invalidateRenderDamage(value);
+    }
+    return true;
+}
+
+/// Windows sends these cancellation notifications when another window takes
+/// capture (including during modal system interactions). The existing visual
+/// selection remains available, but ttyrtle must no longer treat later mouse
+/// motion as part of the abandoned drag.
+fn cancelSelectionDrag() void {
+    selection_dragging = false;
+    selection_anchor = null;
+    selection_head = null;
+}
+
+test "escape clears a local terminal selection" {
+    var test_model: terminal.TerminalModel = undefined;
+    try test_model.init(std.testing.allocator, 4, 16);
+    defer test_model.deinit();
+
+    const previous_dragging = selection_dragging;
+    const previous_anchor = selection_anchor;
+    const previous_head = selection_head;
+    model = &test_model;
+    selection_dragging = true;
+    selection_anchor = null;
+    selection_head = null;
+    defer {
+        model = undefined;
+        selection_dragging = previous_dragging;
+        selection_anchor = previous_anchor;
+        selection_head = previous_head;
+    }
+
+    model.startSelection(1, 2);
+    model.updateSelection(2, 4);
+
+    try std.testing.expect(handleKeyMessage(wm.WM_KEYDOWN, 0x1b, 0));
+    try std.testing.expect(model.core.screens.active.selection == null);
+    try std.testing.expect(!selection_dragging);
+    try std.testing.expect(selection_anchor == null);
+    try std.testing.expect(selection_head == null);
+}
+
+test "capture cancellation stops a local selection drag" {
+    const previous_dragging = selection_dragging;
+    const previous_anchor = selection_anchor;
+    const previous_head = selection_head;
+    selection_dragging = true;
+    selection_anchor = null;
+    selection_head = null;
+    defer {
+        selection_dragging = previous_dragging;
+        selection_anchor = previous_anchor;
+        selection_head = previous_head;
+    }
+
+    cancelSelectionDrag();
+
+    try std.testing.expect(!selection_dragging);
+    try std.testing.expect(selection_anchor == null);
+    try std.testing.expect(selection_head == null);
 }
 
 const ViewportShortcut = enum(u2) { page_up, page_down, top, bottom };
