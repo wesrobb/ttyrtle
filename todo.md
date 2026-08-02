@@ -28,9 +28,9 @@ constraints, but they do not replace this tracker.
   per-session Ghostty history with a 10 MiB application limit, keyboard and
   mouse navigation, selection across historical and live rows, and
   bidirectional retained-renderer scroll reuse.
-- **Done** — [Smooth interactive resizing](docs/architecture/interactive-resize-plan.md):
-  frame-paced Direct2D target changes, immediate terminal/ConPTY dimensions,
-  and retained-scene reuse for pixel-only resizes.
+- **Done** — [Pixel-correct live resizing](docs/architecture/interactive-resize-plan.md):
+  synchronous Direct2D target changes, terminal/ConPTY updates only at cell
+  boundaries, and retained-scene reuse for pixel-only resizes.
 
 ## Needs planning
 

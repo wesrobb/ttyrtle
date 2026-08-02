@@ -6,7 +6,6 @@ test {
     _ = @import("input_queue.zig");
     _ = @import("input.zig");
     _ = @import("geometry.zig");
-    _ = @import("resize_scheduler.zig");
     _ = @import("session_lifecycle.zig");
     _ = @import("workspace.zig");
     _ = @import("renderer/resource_cache.zig");
