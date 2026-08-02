@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Run only integration tests whose names contain this text");
 
     if (target.result.os.tag != .windows or target.result.cpu.arch != .x86_64)
         @panic("ttyrtle currently supports only Windows x86_64; 32-bit notification tokens and ARM64 remain deliberately unsupported");
@@ -58,6 +59,7 @@ pub fn build(b: *std.Build) void {
         .name = "integration-tests",
         .root_module = integration_root,
         .use_llvm = true,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
     if (target.result.os.tag == .windows) integration_tests.subsystem = .Windows;
     // ConPTY children inspect the host process standard handles while
