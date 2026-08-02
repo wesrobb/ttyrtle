@@ -121,7 +121,6 @@ function keys, modifiers, and repeats. Committed IME text follows the normal
 Windows character path, but pre-edit composition and candidate positioning are
 not rendered yet. Selection is backed by Ghostty's retained screen state and
 can span scrollback and the live viewport.
-the visible grid.
 
 The Direct2D renderer shapes one complete UTF-16 row at a time with persistent
 system font fallback. Ghostty graphemes retain exact one- or two-cell advances,

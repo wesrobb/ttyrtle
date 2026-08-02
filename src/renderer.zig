@@ -28,12 +28,16 @@ pub const Renderer = struct {
         frames_presented: u64,
         gpu_present_count: u64,
         gpu_recreation_count: u64,
+        surface_resize_count: u64,
+        scene_recreation_count: u64,
+        scene_redraw_count: u64,
         layout_build_count: u64,
         gpu_paint_trace: frame_trace.Stats,
         scene_trace: frame_trace.Stats,
         layout_trace: frame_trace.Stats,
         copy_trace: frame_trace.Stats,
         present_trace: frame_trace.Stats,
+        surface_resize_trace: frame_trace.Stats,
     };
 
     pub fn initialize(self: *Renderer, window: foundation.HWND) void {
@@ -160,12 +164,16 @@ pub const Renderer = struct {
             .frames_presented = 0,
             .gpu_present_count = 0,
             .gpu_recreation_count = 0,
+            .surface_resize_count = 0,
+            .scene_recreation_count = 0,
+            .scene_redraw_count = 0,
             .layout_build_count = 0,
             .gpu_paint_trace = .{},
             .scene_trace = .{},
             .layout_trace = .{},
             .copy_trace = .{},
             .present_trace = .{},
+            .surface_resize_trace = .{},
         };
         const gpu_traces = if (self.gpu) |*resources| .{
             resources.paint_trace.snapshot(),
@@ -173,7 +181,9 @@ pub const Renderer = struct {
             resources.layout_trace.snapshot(),
             resources.copy_trace.snapshot(),
             resources.present_trace.snapshot(),
+            resources.surface_resize_trace.snapshot(),
         } else .{
+            frame_trace.Stats{},
             frame_trace.Stats{},
             frame_trace.Stats{},
             frame_trace.Stats{},
@@ -185,6 +195,9 @@ pub const Renderer = struct {
             .frames_presented = self.frame_presented_count,
             .gpu_present_count = self.gpu_present_count,
             .gpu_recreation_count = self.gpu_recreation_count,
+            .surface_resize_count = if (self.gpu) |resources| resources.surface_resize_count else 0,
+            .scene_recreation_count = if (self.gpu) |resources| resources.scene_recreation_count else 0,
+            .scene_redraw_count = if (self.gpu) |resources| resources.scene_redraw_count else 0,
             .layout_build_count = self.retired_layout_build_count +
                 if (self.gpu) |resources| resources.layout_build_count else 0,
             .gpu_paint_trace = gpu_traces[0],
@@ -192,6 +205,7 @@ pub const Renderer = struct {
             .layout_trace = gpu_traces[2],
             .copy_trace = gpu_traces[3],
             .present_trace = gpu_traces[4],
+            .surface_resize_trace = gpu_traces[5],
         };
     }
 

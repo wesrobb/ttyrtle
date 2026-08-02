@@ -65,6 +65,9 @@ pub const DeviceResources = struct {
     target_width: u32,
     target_height: u32,
     target_dpi: u32,
+    scene_width: u32,
+    scene_height: u32,
+    scene_dpi: u32,
     scene_valid: bool,
     text_format: ?*dwrite.IDWriteTextFormat,
     font_state: resource_cache.FontState,
@@ -76,6 +79,10 @@ pub const DeviceResources = struct {
     layout_trace: frame_trace.Counter,
     copy_trace: frame_trace.Counter,
     present_trace: frame_trace.Counter,
+    surface_resize_trace: frame_trace.Counter,
+    surface_resize_count: if (counters_enabled) u64 else void,
+    scene_recreation_count: if (counters_enabled) u64 else void,
+    scene_redraw_count: if (counters_enabled) u64 else void,
     brushes: [max_brushes]BrushEntry,
     brush_slots: resource_cache.KeySlots(max_brushes),
     simulate_device_loss: bool,
@@ -93,6 +100,9 @@ pub const DeviceResources = struct {
         resources.target_width = 0;
         resources.target_height = 0;
         resources.target_dpi = 0;
+        resources.scene_width = 0;
+        resources.scene_height = 0;
+        resources.scene_dpi = 0;
         resources.scene_valid = false;
         resources.text_format = null;
         resources.font_state = .{};
@@ -104,6 +114,10 @@ pub const DeviceResources = struct {
         resources.layout_trace = .{};
         resources.copy_trace = .{};
         resources.present_trace = .{};
+        resources.surface_resize_trace = .{};
+        resources.surface_resize_count = if (counters_enabled) 0 else {};
+        resources.scene_recreation_count = if (counters_enabled) 0 else {};
+        resources.scene_redraw_count = if (counters_enabled) 0 else {};
         resources.brush_slots = .{};
         resources.simulate_device_loss = false;
 
@@ -252,15 +266,16 @@ pub const DeviceResources = struct {
     ) !bool {
         if (width == 0 or height == 0) return false;
         if (self.target_bitmap != null and
-            self.scene_bitmap != null and
             self.target_width == width and
             self.target_height == height and
             self.target_dpi == dpi)
             return false;
 
+        const trace_start = frame_trace.timestamp();
+        defer self.surface_resize_trace.recordSince(trace_start);
         const size_changed = self.target_width != width or
             self.target_height != height;
-        self.releaseTargetResources();
+        self.releaseSwapChainTarget();
         if (size_changed and self.swap_chain.IDXGISwapChain.ResizeBuffers(
             0,
             width,
@@ -269,11 +284,11 @@ pub const DeviceResources = struct {
             0,
         ).failed) return error.ResizeSwapChainFailed;
 
-        try self.createTargetResources(width, height, dpi);
+        try self.createTargetBitmap(width, height, dpi);
         self.target_width = width;
         self.target_height = height;
         self.target_dpi = dpi;
-        self.scene_valid = false;
+        if (counters_enabled) self.surface_resize_count +|= 1;
         return true;
     }
 
@@ -343,20 +358,21 @@ pub const DeviceResources = struct {
             self.simulate_device_loss = false;
             return error.DeviceLost;
         }
-        if (self.target_bitmap == null or self.scene_bitmap == null)
+        if (self.target_bitmap == null)
             return error.TargetUnavailable;
 
         _ = try self.ensureTextFormat(metrics, dpi);
         try self.resizeRowLayouts(cache.rows.items.len);
         self.rotateRowLayoutsUp(cache.scroll_up_rows);
         self.rotateRowLayoutsDown(cache.scroll_down_rows);
+        try self.ensureSceneBitmap(cache, metrics, dpi);
         if (!self.scene_valid) {
             try self.drawScene(cache, .full, metrics, dpi);
         } else switch (damage) {
             .none => {},
             else => try self.drawScene(cache, damage, metrics, dpi),
         }
-        try self.presentScene();
+        try self.presentScene(cache.background);
     }
 
     pub fn deinit(self: *DeviceResources) void {
@@ -395,10 +411,10 @@ pub const DeviceResources = struct {
         self.simulate_device_loss = true;
     }
 
-    fn createTargetResources(
+    fn createTargetBitmap(
         self: *DeviceResources,
-        width: u32,
-        height: u32,
+        _: u32,
+        _: u32,
         dpi: u32,
     ) !void {
         var surface_raw: *anyopaque = undefined;
@@ -428,10 +444,29 @@ pub const DeviceResources = struct {
             &target_properties,
             &target,
         ).failed) return error.CreateSwapChainBitmapFailed;
-        errdefer release(target);
+        self.target_bitmap = target;
+    }
 
-        const scene_properties: d2d.D2D1_BITMAP_PROPERTIES1 = .{
-            .pixelFormat = pixel_format,
+    fn ensureSceneBitmap(
+        self: *DeviceResources,
+        cache: *const render_commands.RenderCache,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !void {
+        const width = metrics.margin_x + @as(u32, cache.columns) * metrics.cell_width;
+        const height = metrics.margin_y + @as(u32, @intCast(cache.rows.items.len)) * metrics.cell_height;
+        if (self.scene_bitmap != null and self.scene_width == width and
+            self.scene_height == height and self.scene_dpi == dpi)
+            return;
+
+        if (self.scene_bitmap) |bitmap| release(bitmap);
+        self.scene_bitmap = null;
+        const pixels_per_inch: f32 = @floatFromInt(dpi);
+        const properties: d2d.D2D1_BITMAP_PROPERTIES1 = .{
+            .pixelFormat = .{
+                .format = dxgi_common.DXGI_FORMAT_B8G8R8A8_UNORM,
+                .alphaMode = d2d_common.D2D1_ALPHA_MODE_IGNORE,
+            },
             .dpiX = pixels_per_inch,
             .dpiY = pixels_per_inch,
             .bitmapOptions = d2d.D2D1_BITMAP_OPTIONS_TARGET,
@@ -442,13 +477,15 @@ pub const DeviceResources = struct {
             .{ .width = width, .height = height },
             null,
             0,
-            &scene_properties,
+            &properties,
             &scene,
         ).failed) return error.CreateSceneBitmapFailed;
-
-        self.target_bitmap = target;
         self.scene_bitmap = scene;
+        self.scene_width = width;
+        self.scene_height = height;
+        self.scene_dpi = dpi;
         self.scene_valid = false;
+        if (counters_enabled) self.scene_recreation_count +|= 1;
     }
 
     fn drawScene(
@@ -458,6 +495,7 @@ pub const DeviceResources = struct {
         metrics: geometry.Metrics,
         dpi: u32,
     ) !void {
+        if (counters_enabled) self.scene_redraw_count +|= 1;
         const trace_start = frame_trace.timestamp();
         defer self.scene_trace.recordSince(trace_start);
         const scene = self.scene_bitmap orelse return error.TargetUnavailable;
@@ -748,7 +786,7 @@ pub const DeviceResources = struct {
         }
     }
 
-    fn presentScene(self: *DeviceResources) !void {
+    fn presentScene(self: *DeviceResources, background_rgb: terminal.Rgb) !void {
         const copy_start = frame_trace.timestamp();
         const target_bitmap = self.target_bitmap orelse
             return error.TargetUnavailable;
@@ -756,6 +794,8 @@ pub const DeviceResources = struct {
         self.d2d_context.SetTarget(@ptrCast(target_bitmap));
         const target = &self.d2d_context.ID2D1RenderTarget;
         target.BeginDraw();
+        const background = toColor(background_rgb);
+        target.Clear(&background);
         target.DrawBitmap(
             @ptrCast(scene),
             null,
@@ -865,12 +905,19 @@ pub const DeviceResources = struct {
     }
 
     fn releaseTargetResources(self: *DeviceResources) void {
-        self.d2d_context.SetTarget(null);
+        self.releaseSwapChainTarget();
         if (self.scene_bitmap) |bitmap| release(bitmap);
         self.scene_bitmap = null;
+        self.scene_width = 0;
+        self.scene_height = 0;
+        self.scene_dpi = 0;
+        self.scene_valid = false;
+    }
+
+    fn releaseSwapChainTarget(self: *DeviceResources) void {
+        self.d2d_context.SetTarget(null);
         if (self.target_bitmap) |bitmap| release(bitmap);
         self.target_bitmap = null;
-        self.scene_valid = false;
     }
 };
 

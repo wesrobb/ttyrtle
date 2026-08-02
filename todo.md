@@ -24,6 +24,13 @@ constraints, but they do not replace this tracker.
 - **Done** — [Multi-session workspace foundation](docs/architecture/runtime-tabs-plan.md):
   stable tab/session identities, workspace ownership, notification routing, and
   safe per-session lifecycle handling for one top-level window.
+- **Done** — [Scrollback history](docs/architecture/scrollback-plan.md):
+  per-session Ghostty history with a 10 MiB application limit, keyboard and
+  mouse navigation, selection across historical and live rows, and
+  bidirectional retained-renderer scroll reuse.
+- **Done** — [Smooth interactive resizing](docs/architecture/interactive-resize-plan.md):
+  frame-paced Direct2D target changes, immediate terminal/ConPTY dimensions,
+  and retained-scene reuse for pixel-only resizes.
 
 ## Needs planning
 
@@ -55,8 +62,6 @@ constraints, but they do not replace this tracker.
 
 ### Terminal interaction
 
-- **Planned** — Scrollback history with configurable limits, keyboard/mouse navigation, and
-  selection beyond the visible viewport.
 - OSC 8 hyperlinks with safe modifier-click opening and an untrusted-target
   confirmation policy.
 - Full IME support, including pre-edit composition rendering and candidate-window

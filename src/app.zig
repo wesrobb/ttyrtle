@@ -6,6 +6,7 @@ const frame_trace = @import("frame_trace.zig");
 const geometry = @import("geometry.zig");
 const input = @import("input.zig");
 const render_commands = @import("render_commands.zig");
+const resize_scheduler = @import("resize_scheduler.zig");
 const renderer = @import("renderer.zig");
 const terminal = @import("terminal.zig");
 const workspace = @import("workspace.zig");
@@ -85,9 +86,12 @@ var output_trace: frame_trace.Counter = .{};
 var paint_trace: frame_trace.Counter = .{};
 var cache_trace: frame_trace.Counter = .{};
 var output_frame_pending = false;
+var surface_resize: resize_scheduler.Scheduler = .{};
+var resize_message_count: u64 = 0;
 
 const cursor_timer_id = 1;
 const output_frame_timer_id = 2;
+const surface_resize_timer_id = 3;
 const output_frame_interval_ms = 8;
 
 const integration_marker = "CONPTY_STEP_1_OK";
@@ -149,6 +153,8 @@ pub fn run(mode: Mode) !void {
     paint_trace = .{};
     cache_trace = .{};
     output_frame_pending = false;
+    surface_resize = .{};
+    resize_message_count = 0;
     defer {
         render_cache.deinit();
         render_cache_initialized = false;
@@ -228,6 +234,7 @@ pub fn run(mode: Mode) !void {
     defer {
         if (cursor_timer != 0) _ = user32.KillTimer(window, cursor_timer);
         _ = user32.KillTimer(window, output_frame_timer_id);
+        _ = user32.KillTimer(window, surface_resize_timer_id);
     }
 
     terminal_metrics = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
@@ -1208,6 +1215,17 @@ fn windowProc(
 ) callconv(.winapi) isize {
     switch (message) {
         wm.WM_PAINT => {
+            // HREDRAW/VREDRAW can enqueue paints faster than the GPU can
+            // resize. Consume those invalidations until the coalesced target
+            // resize commits; terminal damage remains pending for that frame.
+            if (surface_resize.interactive and surface_resize.pending != null) {
+                var paint_state: gdi.PAINTSTRUCT = undefined;
+                if (user32.BeginPaint(window, &paint_state)) |dc| {
+                    _ = dc;
+                    _ = user32.EndPaint(window, &paint_state);
+                }
+                return 0;
+            }
             paint_completed = paint(window);
             if (isSmokeMode(active_mode)) {
                 _ = user32.PostMessageW(window, wm.WM_CLOSE, 0, 0);
@@ -1215,12 +1233,25 @@ fn windowProc(
             return 0;
         },
         wm.WM_SIZE => {
+            if (builtin.mode == .Debug or builtin.is_test) resize_message_count +|= 1;
             cancelTabDrag();
             if (wparam != wm.SIZE_MINIMIZED) {
-                resizeForClient(window) catch {
+                handleClientResize(window) catch {
                     std.log.err("failed to resize terminal for client area", .{});
                 };
+            } else {
+                surface_resize.cancel();
+                _ = user32.KillTimer(window, surface_resize_timer_id);
             }
+            return 0;
+        },
+        wm.WM_ENTERSIZEMOVE => {
+            surface_resize.enter();
+            return 0;
+        },
+        wm.WM_EXITSIZEMOVE => {
+            _ = user32.KillTimer(window, surface_resize_timer_id);
+            if (surface_resize.exit()) |size| commitSurfaceResize(window, size);
             return 0;
         },
         wm.WM_NOTIFY => {
@@ -1243,6 +1274,8 @@ fn windowProc(
         },
         wm.WM_DPICHANGED => {
             cancelTabDrag();
+            surface_resize.cancel();
+            _ = user32.KillTimer(window, surface_resize_timer_id);
             terminal_metrics = active_renderer.metricsForDpi(@as(u16, @truncate(wparam)));
             model.markFullDamage();
             const suggested: *const foundation.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
@@ -1270,6 +1303,10 @@ fn windowProc(
                 _ = user32.KillTimer(window, output_frame_timer_id);
                 output_frame_pending = false;
                 invalidateRenderDamage(window);
+            }
+            if (wparam == surface_resize_timer_id) {
+                _ = user32.KillTimer(window, surface_resize_timer_id);
+                if (surface_resize.onTimer()) |size| commitSurfaceResize(window, size);
             }
             return 0;
         },
@@ -1987,23 +2024,51 @@ fn paint(window: foundation.HWND) bool {
     return rendered;
 }
 
+/// Keep the terminal grid synchronous, but let interactive sizing coalesce
+/// swap-chain changes. This deliberately does not mark model damage for a
+/// pixel-only surface resize.
+fn handleClientResize(window: foundation.HWND) !void {
+    const surface = try resizeTerminalForClient(window);
+    switch (surface_resize.request(surface)) {
+        .immediate => |size| commitSurfaceResize(window, size),
+        .queued => |request| if (request.arm_timer) {
+            if (user32.SetTimer(
+                window,
+                surface_resize_timer_id,
+                output_frame_interval_ms,
+                null,
+            ) == 0) {
+                // Surface correctness must not depend on timer availability.
+                if (surface_resize.onTimer()) |size| commitSurfaceResize(window, size);
+            }
+        },
+    }
+}
+
 fn resizeForClient(window: foundation.HWND) !void {
-    if (!model_initialized) return;
+    const surface = try resizeTerminalForClient(window);
+    surface_resize.cancel();
+    _ = user32.KillTimer(window, surface_resize_timer_id);
+    commitSurfaceResize(window, surface);
+}
+
+fn resizeTerminalForClient(window: foundation.HWND) !resize_scheduler.SurfaceSize {
+    if (!model_initialized) return error.ModelUnavailable;
 
     var client: foundation.RECT = undefined;
     if (user32.GetClientRect(window, &client) == 0)
         return error.GetClientRectFailed;
     try layoutTabControl(window);
     repositionRenameEditor();
-    if (active_renderer.resize(
-        @intCast(@max(client.right - client.left, 0)),
-        @intCast(@max(client.bottom - client.top, 0)),
-        user32.GetDpiForWindow(window),
-    )) model.markFullDamage();
+    const surface: resize_scheduler.SurfaceSize = .{
+        .width = @intCast(@max(client.right - client.left, 0)),
+        .height = @intCast(@max(client.bottom - client.top, 0)),
+        .dpi = user32.GetDpiForWindow(window),
+    };
     const dimensions = terminal_metrics.dimensions(
         client.right - client.left,
         client.bottom - client.top,
-    ) orelse return;
+    ) orelse return surface;
     for (workspace_state.tabs.items) |*tab| {
         const session = tab.root.terminalSession();
         if (dimensions.rows == session.model.rows() and dimensions.columns == session.model.columns())
@@ -2021,6 +2086,19 @@ fn resizeForClient(window: foundation.HWND) !void {
             };
     }
     invalidateRenderDamage(window);
+    return surface;
+}
+
+fn commitSurfaceResize(
+    window: foundation.HWND,
+    size: resize_scheduler.SurfaceSize,
+) void {
+    if (size.width == 0 or size.height == 0) return;
+    _ = active_renderer.resize(size.width, size.height, size.dpi);
+    // A resized swap-chain needs a complete client presentation even when the
+    // terminal model has no dirty rows. GPU scene/cache content is retained.
+    active_renderer.requestFrame();
+    _ = user32.InvalidateRect(window, null, 0);
 }
 
 fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) void {
@@ -2126,7 +2204,7 @@ fn logDebugCounters() void {
             "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} " ++
             "rectangle_requests={d} rectangle_commands={d} " ++
             "frames_requested={d} frames_presented={d} " ++
-            "gpu_presents={d} device_recreations={d}",
+            "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d}",
         .{
             terminal_counts.output_batches,
             terminal_counts.chunks_parsed,
@@ -2143,6 +2221,10 @@ fn logDebugCounters() void {
             renderer_counts.frames_presented,
             renderer_counts.gpu_present_count,
             renderer_counts.gpu_recreation_count,
+            resize_message_count,
+            renderer_counts.surface_resize_count,
+            renderer_counts.scene_recreation_count,
+            renderer_counts.scene_redraw_count,
         },
     );
     const trace_file = kernel32.CreateFileW(
@@ -2162,7 +2244,7 @@ fn logDebugCounters() void {
                 "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} " ++
                 "rectangle_requests={d} rectangle_commands={d} " ++
                 "frames_requested={d} frames_presented={d} " ++
-                "gpu_presents={d} device_recreations={d}",
+                "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d}",
             .{
                 terminal_counts.output_batches,
                 terminal_counts.chunks_parsed,
@@ -2179,6 +2261,10 @@ fn logDebugCounters() void {
                 renderer_counts.frames_presented,
                 renderer_counts.gpu_present_count,
                 renderer_counts.gpu_recreation_count,
+                resize_message_count,
+                renderer_counts.surface_resize_count,
+                renderer_counts.scene_recreation_count,
+                renderer_counts.scene_redraw_count,
             },
         );
         writeFrameTrace(trace_file, "output", output_trace.snapshot());
@@ -2196,6 +2282,7 @@ fn logDebugCounters() void {
         writeFrameTrace(trace_file, "layout", renderer_counts.layout_trace);
         writeFrameTrace(trace_file, "copy", renderer_counts.copy_trace);
         writeFrameTrace(trace_file, "present", renderer_counts.present_trace);
+        writeFrameTrace(trace_file, "surface_resize", renderer_counts.surface_resize_trace);
     }
     logFrameTrace("output", output_trace.snapshot());
     logFrameTrace("parse", terminal_counts.parse_trace);
@@ -2208,6 +2295,7 @@ fn logDebugCounters() void {
     logFrameTrace("layout", renderer_counts.layout_trace);
     logFrameTrace("copy", renderer_counts.copy_trace);
     logFrameTrace("present", renderer_counts.present_trace);
+    logFrameTrace("surface_resize", renderer_counts.surface_resize_trace);
 }
 
 fn logFrameTrace(name: []const u8, stats: frame_trace.Stats) void {
@@ -2328,6 +2416,55 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     if (clean.gpu_present_count != initial.gpu_present_count + 1 or
         clean.layout_build_count != initial.layout_build_count)
         return error.CleanPaintRebuiltLayouts;
+
+    // Several same-grid WM_SIZE messages during an interactive drag must
+    // collapse to one target resize while preserving layouts and scene pixels.
+    var resize_outer: foundation.RECT = undefined;
+    if (user32.GetWindowRect(window, &resize_outer) == 0)
+        return error.GetWindowRectFailed;
+    var resize_client: foundation.RECT = undefined;
+    if (user32.GetClientRect(window, &resize_client) == 0)
+        return error.GetClientRectFailed;
+    const client_width = resize_client.right - resize_client.left;
+    const usable_width = @max(
+        client_width - @as(i32, @intCast(terminal_metrics.margin_x * 2)),
+        0,
+    );
+    const cell_width: i32 = @intCast(terminal_metrics.cell_width);
+    const remainder = @mod(usable_width, cell_width);
+    const pixel_delta: i32 = if (remainder == 0 or remainder + 1 < cell_width) 1 else -1;
+    const before_coalesced_resize = active_renderer.diagnostics();
+    const before_coalesced_cache = render_cache.diagnostics();
+    _ = user32.SendMessageW(window, wm.WM_ENTERSIZEMOVE, 0, 0);
+    if (user32.SetWindowPos(
+        window,
+        null,
+        0,
+        0,
+        resize_outer.right - resize_outer.left + pixel_delta,
+        resize_outer.bottom - resize_outer.top,
+        .{ .NOMOVE = 1, .NOZORDER = 1, .NOACTIVATE = 1 },
+    ) == 0) return error.ResizeLifecycleFailed;
+    _ = user32.SendMessageW(window, wm.WM_SIZE, wm.SIZE_RESTORED, 0);
+    _ = user32.SendMessageW(window, wm.WM_SIZE, wm.SIZE_RESTORED, 0);
+    _ = user32.SendMessageW(window, wm.WM_TIMER, surface_resize_timer_id, 0);
+    _ = user32.SendMessageW(window, wm.WM_EXITSIZEMOVE, 0, 0);
+    try paintForTesting(window);
+    const after_coalesced_resize = active_renderer.diagnostics();
+    if (after_coalesced_resize.surface_resize_count !=
+        before_coalesced_resize.surface_resize_count + 1)
+        return error.InteractiveResizeWasNotCoalesced;
+    if (after_coalesced_resize.scene_recreation_count !=
+        before_coalesced_resize.scene_recreation_count)
+        return error.PixelResizeRecreatedScene;
+    if (after_coalesced_resize.scene_redraw_count !=
+        before_coalesced_resize.scene_redraw_count)
+        return error.PixelResizeRedrewScene;
+    if (after_coalesced_resize.layout_build_count !=
+        before_coalesced_resize.layout_build_count)
+        return error.PixelResizeDiscardedLayouts;
+    if (render_cache.diagnostics().full_rebuilds != before_coalesced_cache.full_rebuilds)
+        return error.PixelResizeRebuiltRenderCache;
 
     model.startSelection(0, 0);
     const before_selection = active_renderer.diagnostics();
