@@ -7,7 +7,6 @@ const geometry = @import("geometry.zig");
 const input = @import("input.zig");
 const render_commands = @import("render_commands.zig");
 const renderer = @import("renderer.zig");
-const resize_coordinator = @import("resize_coordinator.zig");
 const terminal = @import("terminal.zig");
 const workspace = @import("workspace.zig");
 
@@ -82,23 +81,15 @@ var pressed_mouse_button: ?input.MouseButton = null;
 var active_renderer: renderer.Renderer = .{};
 var render_cache: render_commands.RenderCache = undefined;
 var render_cache_initialized = false;
-var staged_render_cache: ?render_commands.RenderCache = null;
-var resize_state: resize_coordinator.ResizeCoordinator = .{};
-var resize_scene_started = false;
 var output_trace: frame_trace.Counter = .{};
 var paint_trace: frame_trace.Counter = .{};
 var cache_trace: frame_trace.Counter = .{};
-var resize_build_trace: frame_trace.Counter = .{};
 var output_frame_pending = false;
-var interactive_resize = false;
 var resize_message_count: u64 = 0;
 
 const cursor_timer_id = 1;
 const output_frame_timer_id = 2;
-const resize_build_timer_id = 3;
 const output_frame_interval_ms = 8;
-const resize_build_interval_ms = 1;
-const resize_build_row_budget: u16 = 1;
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
@@ -155,18 +146,12 @@ pub fn run(mode: Mode) !void {
     defer active_renderer.deinit();
     render_cache = .init(allocator);
     render_cache_initialized = true;
-    staged_render_cache = null;
-    resize_state = .{};
-    resize_scene_started = false;
     output_trace = .{};
     paint_trace = .{};
     cache_trace = .{};
-    resize_build_trace = .{};
     output_frame_pending = false;
-    interactive_resize = false;
     resize_message_count = 0;
     defer {
-        cancelInteractiveBuild();
         render_cache.deinit();
         render_cache_initialized = false;
     }
@@ -245,7 +230,6 @@ pub fn run(mode: Mode) !void {
     defer {
         if (cursor_timer != 0) _ = user32.KillTimer(window, cursor_timer);
         _ = user32.KillTimer(window, output_frame_timer_id);
-        _ = user32.KillTimer(window, resize_build_timer_id);
     }
 
     terminal_metrics = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
@@ -928,7 +912,6 @@ fn activateTab(window: foundation.HWND, id: workspace.TabId) !void {
     selection_anchor = null;
     selection_head = null;
     pressed_mouse_button = null;
-    cancelInteractiveBuild();
     render_cache.deinit();
     render_cache = .init(std.heap.smp_allocator);
     // Row generations are model-local; retained GPU text layouts must not be
@@ -1237,24 +1220,16 @@ fn windowProc(
             if (builtin.mode == .Debug or builtin.is_test) resize_message_count +|= 1;
             cancelTabDrag();
             if (wparam != wm.SIZE_MINIMIZED) {
-                (if (interactive_resize)
-                    queueInteractiveResize(window)
-                else
-                    resizeForClient(window)) catch {
+                resizeForClient(window) catch {
                     std.log.err("failed to resize terminal for client area", .{});
                 };
             }
             return 0;
         },
         wm.WM_ENTERSIZEMOVE => {
-            interactive_resize = true;
-            resize_state.enter();
             return 0;
         },
         wm.WM_EXITSIZEMOVE => {
-            interactive_resize = false;
-            resize_state.leave();
-            armResizeBuild(window);
             return 0;
         },
         wm.WM_NOTIFY => {
@@ -1305,7 +1280,6 @@ fn windowProc(
                 output_frame_pending = false;
                 invalidateRenderDamage(window);
             }
-            if (wparam == resize_build_timer_id) advanceInteractiveResize(window);
             return 0;
         },
         conpty.output_message => {
@@ -1837,10 +1811,6 @@ fn invalidateRenderDamage(window: foundation.HWND) void {
         .none => return,
         else => active_renderer.requestFrame(),
     }
-    if (resize_state.build_active) {
-        cancelInteractiveBuild();
-        armResizeBuild(window);
-    }
     switch (damage) {
         .none => {},
         .full => _ = user32.InvalidateRect(window, null, 0),
@@ -2005,12 +1975,9 @@ fn paint(window: foundation.HWND) bool {
     var client: foundation.RECT = undefined;
     if (user32.GetClientRect(window, &client) == 0) return false;
 
-    // A live resize owns the model's full damage until its back cache and
-    // bitmap are complete.  Present the coherent front generation meanwhile.
-    const building_resize = resize_state.build_active;
-    const damage = if (building_resize) terminal.RenderDamage.none else model.damage();
+    const damage = model.damage();
     const cache_start = frame_trace.timestamp();
-    if (!building_resize) render_cache.update(
+    render_cache.update(
         model,
         terminal_metrics,
         damage,
@@ -2025,7 +1992,7 @@ fn paint(window: foundation.HWND) bool {
         terminal_metrics,
         user32.GetDpiForWindow(window),
     );
-    if (!building_resize) model.acknowledgeDamage();
+    model.acknowledgeDamage();
     return rendered;
 }
 
@@ -2037,126 +2004,25 @@ fn resizePresentationForClient(window: foundation.HWND) !void {
     commitSurfaceResize(window, surface);
 }
 
-/// Resizing a terminal grid invalidates and redraws its entire scene. Do that
-/// once after the interactive sizing loop finishes, rather than for every
-/// crossed cell boundary while the user is dragging the frame.
+/// A terminal viewport is entirely visible.  Unlike a document editor there
+/// is no non-visible wrapping work to defer: a crossed cell boundary must
+/// synchronously update the model and its retained command cache so the next
+/// WM_PAINT always sees the current grid.
 fn resizeForClient(window: foundation.HWND) !void {
-    cancelStagedResizeOnly();
-    resize_state = .{};
-    _ = user32.KillTimer(window, resize_build_timer_id);
-    const surface = try surfaceForClient(window);
-    try resizeTerminalForSurface(surface);
-    commitSurfaceResize(window, surface);
-}
-
-/// Every WM_SIZE resizes the swap-chain synchronously, but a crossed terminal
-/// cell is only queued.  This mirrors Scintilla's low-priority wrapping work:
-/// the current frame stays intact while the newest requested grid supersedes
-/// older requests.
-fn queueInteractiveResize(window: foundation.HWND) !void {
     const surface = try surfaceForClient(window);
     commitSurfaceResize(window, surface);
     const dimensions = terminal_metrics.dimensions(
         @intCast(surface.width),
         @intCast(surface.height),
-    );
-    if (dimensions) |grid| {
-        if (!resize_state.build_active and grid.rows == model.rows() and
-            grid.columns == model.columns())
-            return;
-    }
-    if (resize_state.request(.{
-        .width = surface.width,
-        .height = surface.height,
-        .dpi = surface.dpi,
-    }, dimensions)) {
-        cancelStagedResizeOnly();
-        armResizeBuild(window);
-    }
-}
+    ) orelse return;
+    if (dimensions.rows == model.rows() and dimensions.columns == model.columns()) return;
 
-fn armResizeBuild(window: foundation.HWND) void {
-    if (!resize_state.timer_armed) return;
-    if (user32.SetTimer(window, resize_build_timer_id, resize_build_interval_ms, null) == 0)
-        std.log.warn("could not schedule low-priority terminal resize", .{});
-}
-
-fn advanceInteractiveResize(window: foundation.HWND) void {
-    // A repeating one-row slice keeps this lower priority than WM_SIZE and
-    // input.  DirectWrite can occasionally take longer for an individual row,
-    // but no full viewport work is performed in this callback.
-    const trace_start = frame_trace.timestamp();
-    defer resize_build_trace.recordSince(trace_start);
-    const grid = resize_state.latest_grid orelse {
-        _ = user32.KillTimer(window, resize_build_timer_id);
-        return;
-    };
-    if (!resize_state.build_active) {
-        _ = resize_state.beginLatest();
-        resizeTerminalForDimensions(grid) catch |err| {
-            std.log.err("failed to apply deferred terminal resize: {}", .{err});
-            _ = user32.KillTimer(window, resize_build_timer_id);
-            return;
-        };
-        var cache = render_commands.RenderCache.init(std.heap.smp_allocator);
-        cache.beginFullBuild(model, terminal_metrics) catch {
-            cache.deinit();
-            _ = user32.KillTimer(window, resize_build_timer_id);
-            return;
-        };
-        staged_render_cache = cache;
-        resize_scene_started = false;
-    }
-    const staged = &(staged_render_cache orelse return);
-    const cache_done = staged.advanceFullBuild(
-        model,
-        terminal_metrics,
-        resize_build_row_budget,
-    ) catch return cancelInteractiveBuild();
-    if (!cache_done) {
-        _ = user32.InvalidateRect(window, null, 0);
-        return;
-    }
-    if (!resize_scene_started) {
-        if (!active_renderer.beginRetainedBuild(staged, terminal_metrics, user32.GetDpiForWindow(window))) {
-            // The GDI fallback has no retained bitmap: commit safely and let
-            // its normal paint path draw the complete cache.
-            commitStagedResize(window);
-            return;
-        }
-        resize_scene_started = true;
-    }
-    const scene_done = active_renderer.advanceRetainedBuild(
-        staged,
-        terminal_metrics,
-        user32.GetDpiForWindow(window),
-        resize_build_row_budget,
-    ) orelse return cancelInteractiveBuild();
-    if (scene_done) commitStagedResize(window) else _ = user32.InvalidateRect(window, null, 0);
-}
-
-fn commitStagedResize(window: foundation.HWND) void {
-    const completed = staged_render_cache orelse return;
-    staged_render_cache = render_cache;
-    render_cache = completed;
-    resize_scene_started = false;
-    resize_state.finishBuild();
+    try resizeTerminalForDimensions(dimensions);
+    // Ghostty resize is atomic and marks full damage. Copy that current state
+    // now, rather than waiting for a timer that may be starved by WM_SIZE.
+    const damage = model.damage();
+    try render_cache.update(model, terminal_metrics, damage);
     model.acknowledgeDamage();
-    active_renderer.requestFrame();
-    _ = user32.InvalidateRect(window, null, 0);
-    if (!resize_state.timer_armed) _ = user32.KillTimer(window, resize_build_timer_id);
-}
-
-fn cancelStagedResizeOnly() void {
-    active_renderer.cancelRetainedBuild();
-    if (staged_render_cache) |*cache| cache.deinit();
-    staged_render_cache = null;
-    resize_scene_started = false;
-}
-
-fn cancelInteractiveBuild() void {
-    cancelStagedResizeOnly();
-    resize_state.cancel();
 }
 
 const SurfaceSize = struct {
@@ -2178,14 +2044,6 @@ fn surfaceForClient(window: foundation.HWND) !SurfaceSize {
         .height = @intCast(@max(client.bottom - client.top, 0)),
         .dpi = user32.GetDpiForWindow(window),
     };
-}
-
-fn resizeTerminalForSurface(surface: SurfaceSize) !void {
-    const dimensions = terminal_metrics.dimensions(
-        @intCast(surface.width),
-        @intCast(surface.height),
-    ) orelse return;
-    try resizeTerminalForDimensions(dimensions);
 }
 
 fn resizeTerminalForDimensions(dimensions: geometry.Dimensions) !void {
@@ -2318,8 +2176,8 @@ fn logDebugCounters() void {
     const cache_counts = render_cache.diagnostics();
     const renderer_counts = active_renderer.diagnostics();
     std.log.info(
-        "performance counters: batches={d} chunks={d} refreshes={d} " ++
-            "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} " ++
+        "performance counters: batches={d} chunks={d} refreshes={d} core_resizes={d} " ++
+            "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} layout_pool_hits={d} layout_pool_evictions={d} " ++
             "rectangle_requests={d} rectangle_commands={d} " ++
             "frames_requested={d} frames_presented={d} " ++
             "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d}",
@@ -2327,12 +2185,15 @@ fn logDebugCounters() void {
             terminal_counts.output_batches,
             terminal_counts.chunks_parsed,
             terminal_counts.render_refreshes,
+            terminal_counts.core_resizes,
             cache_counts.dirty_rows,
             cache_counts.rebuilt_rows,
             cache_counts.scroll_reuses,
             cache_counts.scroll_reused_rows,
             cache_counts.full_rebuilds,
             renderer_counts.layout_build_count,
+            renderer_counts.layout_pool_hits,
+            renderer_counts.layout_pool_evictions,
             cache_counts.rectangle_requests,
             cache_counts.rectangle_commands,
             renderer_counts.frames_requested,
@@ -2358,8 +2219,8 @@ fn logDebugCounters() void {
         defer _ = kernel32.CloseHandle(trace_file);
         writeTraceLine(
             trace_file,
-            "performance counters: batches={d} chunks={d} refreshes={d} " ++
-                "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} " ++
+            "performance counters: batches={d} chunks={d} refreshes={d} core_resizes={d} " ++
+                "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} layout_pool_hits={d} layout_pool_evictions={d} " ++
                 "rectangle_requests={d} rectangle_commands={d} " ++
                 "frames_requested={d} frames_presented={d} " ++
                 "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d}",
@@ -2367,12 +2228,15 @@ fn logDebugCounters() void {
                 terminal_counts.output_batches,
                 terminal_counts.chunks_parsed,
                 terminal_counts.render_refreshes,
+                terminal_counts.core_resizes,
                 cache_counts.dirty_rows,
                 cache_counts.rebuilt_rows,
                 cache_counts.scroll_reuses,
                 cache_counts.scroll_reused_rows,
                 cache_counts.full_rebuilds,
                 renderer_counts.layout_build_count,
+                renderer_counts.layout_pool_hits,
+                renderer_counts.layout_pool_evictions,
                 cache_counts.rectangle_requests,
                 cache_counts.rectangle_commands,
                 renderer_counts.frames_requested,
@@ -2393,6 +2257,7 @@ fn logDebugCounters() void {
             terminal_counts.render_state_trace,
         );
         writeFrameTrace(trace_file, "damage", terminal_counts.damage_trace);
+        writeFrameTrace(trace_file, "core_resize", terminal_counts.resize_trace);
         writeFrameTrace(trace_file, "paint", paint_trace.snapshot());
         writeFrameTrace(trace_file, "cache", cache_trace.snapshot());
         writeFrameTrace(trace_file, "gpu", renderer_counts.gpu_paint_trace);
@@ -2401,12 +2266,12 @@ fn logDebugCounters() void {
         writeFrameTrace(trace_file, "copy", renderer_counts.copy_trace);
         writeFrameTrace(trace_file, "present", renderer_counts.present_trace);
         writeFrameTrace(trace_file, "surface_resize", renderer_counts.surface_resize_trace);
-        writeFrameTrace(trace_file, "resize_build", resize_build_trace.snapshot());
     }
     logFrameTrace("output", output_trace.snapshot());
     logFrameTrace("parse", terminal_counts.parse_trace);
     logFrameTrace("render_state", terminal_counts.render_state_trace);
     logFrameTrace("damage", terminal_counts.damage_trace);
+    logFrameTrace("core_resize", terminal_counts.resize_trace);
     logFrameTrace("paint", paint_trace.snapshot());
     logFrameTrace("cache", cache_trace.snapshot());
     logFrameTrace("gpu", renderer_counts.gpu_paint_trace);
@@ -2415,7 +2280,6 @@ fn logDebugCounters() void {
     logFrameTrace("copy", renderer_counts.copy_trace);
     logFrameTrace("present", renderer_counts.present_trace);
     logFrameTrace("surface_resize", renderer_counts.surface_resize_trace);
-    logFrameTrace("resize_build", resize_build_trace.snapshot());
 }
 
 fn logFrameTrace(name: []const u8, stats: frame_trace.Stats) void {
@@ -2590,10 +2454,9 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     if (render_cache.diagnostics().full_rebuilds != before_pixel_cache.full_rebuilds)
         return error.PixelResizeRebuiltRenderCache;
 
-    // Cross several cell boundaries in one sizing loop.  The presentation
-    // target follows each native message, while the terminal stays on the
-    // coherent front generation until the low-priority timer commits the
-    // newest grid.  Repeated messages must not allocate a scene per cell.
+    // Cross several cell boundaries in one sizing loop. Both the presentation
+    // target and terminal model must be current before WM_SIZE returns: a
+    // terminal has no off-screen document lines which may be wrapped later.
     const before_crossed = active_renderer.diagnostics();
     _ = user32.SendMessageW(window, wm.WM_ENTERSIZEMOVE, 0, 0);
     const crossed_columns: i32 = @intCast(terminal_metrics.cell_width * 3);
@@ -2614,23 +2477,21 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         if (current.target_width != @as(u32, @intCast(current_client.right - current_client.left)) or
             current.target_height != @as(u32, @intCast(current_client.bottom - current_client.top)))
             return error.LiveResizeTargetWasNotExact;
-        if (model.rows() != initial_rows or model.columns() != initial_columns)
-            return error.LiveResizeBlockedWindowProcedure;
+        const current_grid = terminal_metrics.dimensions(
+            @intCast(current_client.right - current_client.left),
+            @intCast(current_client.bottom - current_client.top),
+        ) orelse return error.ResizeDimensionsUnavailable;
+        if (model.rows() != current_grid.rows or model.columns() != current_grid.columns)
+            return error.LiveResizeDidNotApplyCurrentGrid;
     }
     const crossed_surface = try surfaceForClient(window);
     const crossed_grid = terminal_metrics.dimensions(
         @intCast(crossed_surface.width),
         @intCast(crossed_surface.height),
     ) orelse return error.ResizeDimensionsUnavailable;
-    for (0..128) |_| {
-        _ = user32.SendMessageW(window, wm.WM_TIMER, resize_build_timer_id, 0);
-        if (model.rows() == crossed_grid.rows and model.columns() == crossed_grid.columns and
-            !resize_state.build_active) break;
-    }
     _ = user32.SendMessageW(window, wm.WM_EXITSIZEMOVE, 0, 0);
     const after_crossed = active_renderer.diagnostics();
-    if (model.rows() != crossed_grid.rows or model.columns() != crossed_grid.columns or
-        resize_state.build_active)
+    if (model.rows() != crossed_grid.rows or model.columns() != crossed_grid.columns)
         return error.LiveResizeDidNotSettle;
     if (after_crossed.scene_recreation_count > before_crossed.scene_recreation_count + 1)
         return error.LiveResizeRepeatedSceneAllocation;

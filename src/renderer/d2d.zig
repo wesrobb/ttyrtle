@@ -19,6 +19,7 @@ const dxgi_common = dxgi.common;
 const terminal_font_name = std.unicode.utf8ToUtf16LeStringLiteral("Consolas");
 const locale_name = std.unicode.utf8ToUtf16LeStringLiteral("en-US");
 const max_brushes = 64;
+const max_orphan_layouts = 128;
 const counters_enabled = builtin.mode == .Debug or builtin.is_test;
 
 const BrushEntry = struct {
@@ -30,6 +31,7 @@ const RowLayouts = struct {
     font_generation: u64 = 0,
     content_fingerprint: u64 = 0,
     shape_fingerprint: u64 = 0,
+    layout_width: u32 = 0,
     layout: ?*dwrite.IDWriteTextLayout = null,
 
     fn clear(self: *RowLayouts) void {
@@ -39,6 +41,7 @@ const RowLayouts = struct {
         self.font_generation = 0;
         self.content_fingerprint = 0;
         self.shape_fingerprint = 0;
+        self.layout_width = 0;
     }
 
     fn deinit(self: *RowLayouts) void {
@@ -61,10 +64,6 @@ pub const DeviceResources = struct {
     font_fallback: *dwrite.IDWriteFontFallback,
     typography: *dwrite.IDWriteTypography,
     target_bitmap: ?*d2d.ID2D1Bitmap1,
-    /// The currently displayed scene is never modified by a live-resize
-    /// build.  Rows are drawn into this second target and exchanged only when
-    /// the complete generation is ready.
-    building_scene_bitmap: ?*d2d.ID2D1Bitmap1,
     scene_bitmap: ?*d2d.ID2D1Bitmap1,
     target_width: u32,
     target_height: u32,
@@ -72,15 +71,19 @@ pub const DeviceResources = struct {
     scene_width: u32,
     scene_height: u32,
     scene_dpi: u32,
+    scene_capacity_width: u32,
+    scene_capacity_height: u32,
     scene_valid: bool,
-    build_width: u32,
-    build_height: u32,
-    build_dpi: u32,
-    build_next_row: ?usize,
     text_format: ?*dwrite.IDWriteTextFormat,
     font_state: resource_cache.FontState,
     font_generation: u64,
     row_layouts: std.ArrayListUnmanaged(RowLayouts),
+    /// Bounded ownership pool for layouts displaced by viewport/grid changes.
+    /// Layouts are position independent; drawing effects are reapplied after a
+    /// layout is exclusively taken from this pool.
+    orphan_layouts: std.ArrayListUnmanaged(RowLayouts),
+    layout_pool_hit_count: if (counters_enabled) u64 else void,
+    layout_pool_evict_count: if (counters_enabled) u64 else void,
     layout_build_count: if (counters_enabled) u64 else void,
     paint_trace: frame_trace.Counter,
     scene_trace: frame_trace.Counter,
@@ -104,7 +107,6 @@ pub const DeviceResources = struct {
     pub fn create(window: foundation.HWND) !DeviceResources {
         var resources: DeviceResources = undefined;
         resources.target_bitmap = null;
-        resources.building_scene_bitmap = null;
         resources.scene_bitmap = null;
         resources.target_width = 0;
         resources.target_height = 0;
@@ -112,15 +114,16 @@ pub const DeviceResources = struct {
         resources.scene_width = 0;
         resources.scene_height = 0;
         resources.scene_dpi = 0;
+        resources.scene_capacity_width = 0;
+        resources.scene_capacity_height = 0;
         resources.scene_valid = false;
-        resources.build_width = 0;
-        resources.build_height = 0;
-        resources.build_dpi = 0;
-        resources.build_next_row = null;
         resources.text_format = null;
         resources.font_state = .{};
         resources.font_generation = 0;
         resources.row_layouts = .empty;
+        resources.orphan_layouts = .empty;
+        resources.layout_pool_hit_count = if (counters_enabled) 0 else {};
+        resources.layout_pool_evict_count = if (counters_enabled) 0 else {};
         resources.layout_build_count = if (counters_enabled) 0 else {};
         resources.paint_trace = .{};
         resources.scene_trace = .{};
@@ -388,74 +391,6 @@ pub const DeviceResources = struct {
         try self.presentScene(cache.background);
     }
 
-    /// Starts an off-screen full scene build.  This deliberately leaves the
-    /// front bitmap and its dimensions alone, so presentation cannot expose a
-    /// half-reflowed terminal.
-    pub fn beginSceneBuild(
-        self: *DeviceResources,
-        cache: *const render_commands.RenderCache,
-        metrics: geometry.Metrics,
-        dpi: u32,
-    ) !void {
-        _ = try self.ensureTextFormat(metrics, dpi);
-        try self.resizeRowLayouts(cache.rows.items.len);
-        try self.ensureBuildingSceneBitmap(cache, metrics, dpi);
-        const scene = self.building_scene_bitmap orelse return error.TargetUnavailable;
-        self.d2d_context.SetTarget(@ptrCast(scene));
-        const target = &self.d2d_context.ID2D1RenderTarget;
-        target.BeginDraw();
-        const background = toColor(cache.background);
-        target.Clear(&background);
-        try checkDrawResult(target.EndDraw(null, null));
-        self.build_next_row = 0;
-    }
-
-    /// Draw a bounded number of already-cached rows.  Completion atomically
-    /// swaps front and back bitmaps; callers therefore never present mixed
-    /// terminal generations.
-    pub fn advanceSceneBuild(
-        self: *DeviceResources,
-        cache: *const render_commands.RenderCache,
-        metrics: geometry.Metrics,
-        dpi: u32,
-        row_budget: usize,
-    ) !bool {
-        const next = self.build_next_row orelse return true;
-        const scene = self.building_scene_bitmap orelse return error.TargetUnavailable;
-        const end = @min(cache.rows.items.len, next + @max(row_budget, 1));
-        const trace_start = frame_trace.timestamp();
-        defer self.scene_trace.recordSince(trace_start);
-        self.d2d_context.SetTarget(@ptrCast(scene));
-        const target = &self.d2d_context.ID2D1RenderTarget;
-        target.BeginDraw();
-        var drawing = true;
-        errdefer {
-            if (drawing) _ = target.EndDraw(null, null);
-        }
-        for (next..end) |row_index|
-            try self.drawCachedRow(row_index, &cache.rows.items[row_index], metrics, dpi);
-        try checkDrawResult(target.EndDraw(null, null));
-        drawing = false;
-        if (counters_enabled) self.scene_redraw_count +|= 1;
-        if (end != cache.rows.items.len) {
-            self.build_next_row = end;
-            return false;
-        }
-        const previous = self.scene_bitmap;
-        self.scene_bitmap = self.building_scene_bitmap;
-        self.building_scene_bitmap = previous;
-        self.scene_width = self.build_width;
-        self.scene_height = self.build_height;
-        self.scene_dpi = self.build_dpi;
-        self.scene_valid = true;
-        self.build_next_row = null;
-        return true;
-    }
-
-    pub fn cancelSceneBuild(self: *DeviceResources) void {
-        self.build_next_row = null;
-    }
-
     pub fn deinit(self: *DeviceResources) void {
         self.releaseTargetResources();
         self.releaseRowLayouts();
@@ -486,6 +421,7 @@ pub const DeviceResources = struct {
     pub fn invalidateTerminalContent(self: *DeviceResources) void {
         self.scene_valid = false;
         for (self.row_layouts.items) |*layouts| layouts.clear();
+        self.clearOrphanLayouts();
     }
 
     pub fn simulateDeviceLossForTesting(self: *DeviceResources) void {
@@ -536,9 +472,15 @@ pub const DeviceResources = struct {
     ) !void {
         const width = metrics.margin_x + @as(u32, cache.columns) * metrics.cell_width;
         const height = metrics.margin_y + @as(u32, @intCast(cache.rows.items.len)) * metrics.cell_height;
-        if (self.scene_bitmap != null and self.scene_width == width and
-            self.scene_height == height and self.scene_dpi == dpi)
+        if (self.scene_bitmap != null and self.scene_dpi == dpi and
+            self.scene_capacity_width >= width and self.scene_capacity_height >= height)
+        {
+            if (self.scene_width != width or self.scene_height != height)
+                self.scene_valid = false;
+            self.scene_width = width;
+            self.scene_height = height;
             return;
+        }
 
         if (self.scene_bitmap) |bitmap| release(bitmap);
         self.scene_bitmap = null;
@@ -553,9 +495,11 @@ pub const DeviceResources = struct {
             .bitmapOptions = d2d.D2D1_BITMAP_OPTIONS_TARGET,
             .colorContext = null,
         };
+        const capacity_width = growSceneCapacity(self.scene_capacity_width, width);
+        const capacity_height = growSceneCapacity(self.scene_capacity_height, height);
         var scene: *d2d.ID2D1Bitmap1 = undefined;
         if (self.d2d_context.CreateBitmap(
-            .{ .width = width, .height = height },
+            .{ .width = capacity_width, .height = capacity_height },
             null,
             0,
             &properties,
@@ -565,46 +509,9 @@ pub const DeviceResources = struct {
         self.scene_width = width;
         self.scene_height = height;
         self.scene_dpi = dpi;
+        self.scene_capacity_width = capacity_width;
+        self.scene_capacity_height = capacity_height;
         self.scene_valid = false;
-        if (counters_enabled) self.scene_recreation_count +|= 1;
-    }
-
-    fn ensureBuildingSceneBitmap(
-        self: *DeviceResources,
-        cache: *const render_commands.RenderCache,
-        metrics: geometry.Metrics,
-        dpi: u32,
-    ) !void {
-        const width = metrics.margin_x + @as(u32, cache.columns) * metrics.cell_width;
-        const height = metrics.margin_y + @as(u32, @intCast(cache.rows.items.len)) * metrics.cell_height;
-        if (self.building_scene_bitmap != null and self.build_width == width and
-            self.build_height == height and self.build_dpi == dpi)
-            return;
-        if (self.building_scene_bitmap) |bitmap| release(bitmap);
-        self.building_scene_bitmap = null;
-        const pixels_per_inch: f32 = @floatFromInt(dpi);
-        const properties: d2d.D2D1_BITMAP_PROPERTIES1 = .{
-            .pixelFormat = .{
-                .format = dxgi_common.DXGI_FORMAT_B8G8R8A8_UNORM,
-                .alphaMode = d2d_common.D2D1_ALPHA_MODE_IGNORE,
-            },
-            .dpiX = pixels_per_inch,
-            .dpiY = pixels_per_inch,
-            .bitmapOptions = d2d.D2D1_BITMAP_OPTIONS_TARGET,
-            .colorContext = null,
-        };
-        var bitmap: *d2d.ID2D1Bitmap1 = undefined;
-        if (self.d2d_context.CreateBitmap(
-            .{ .width = width, .height = height },
-            null,
-            0,
-            &properties,
-            &bitmap,
-        ).failed) return error.CreateSceneBitmapFailed;
-        self.building_scene_bitmap = bitmap;
-        self.build_width = width;
-        self.build_height = height;
-        self.build_dpi = dpi;
         if (counters_enabled) self.scene_recreation_count +|= 1;
     }
 
@@ -734,7 +641,7 @@ pub const DeviceResources = struct {
     fn resizeRowLayouts(self: *DeviceResources, row_count: usize) !void {
         const old_length = self.row_layouts.items.len;
         if (row_count < old_length) {
-            for (self.row_layouts.items[row_count..]) |*layouts| layouts.deinit();
+            for (self.row_layouts.items[row_count..]) |*layouts| self.stashOrphan(layouts);
             self.row_layouts.shrinkRetainingCapacity(row_count);
         } else if (row_count > old_length) {
             try self.row_layouts.resize(std.heap.smp_allocator, row_count);
@@ -771,18 +678,31 @@ pub const DeviceResources = struct {
         dpi: u32,
     ) !*RowLayouts {
         const layouts = &self.row_layouts.items[row_index];
+        const layout_width = metrics.cell_width * @as(u32, row.shaped_columns);
         if (layouts.row_generation == row.generation and
             layouts.font_generation == self.font_generation)
             return layouts;
+
+        const text_length = render_commands.shapedUtf16Length(row);
+        if (text_length == 0) {
+            self.stashOrphan(layouts);
+            layouts.row_generation = row.generation;
+            layouts.font_generation = self.font_generation;
+            layouts.content_fingerprint = row.fingerprint;
+            layouts.shape_fingerprint = row.shape_fingerprint;
+            layouts.layout_width = layout_width;
+            return layouts;
+        }
 
         // Selection, cursor, and color changes only alter drawing effects.
         // Keep the expensive shaped layout when its text and cell advances
         // are unchanged, and update the brush ranges in place.
         if (layouts.layout) |layout| {
             if (layouts.font_generation == self.font_generation and
-                layouts.shape_fingerprint == row.shape_fingerprint)
+                layouts.shape_fingerprint == row.shape_fingerprint and
+                layouts.layout_width == layout_width)
             {
-                try self.applyDrawingEffects(layout, row);
+                try self.applyDrawingEffects(layout, row, text_length);
                 layouts.row_generation = row.generation;
                 layouts.content_fingerprint = row.fingerprint;
                 return layouts;
@@ -790,44 +710,37 @@ pub const DeviceResources = struct {
         }
 
         // Broad terminal damage can move unchanged rows to new viewport
-        // positions. DirectWrite layouts are position-independent, so transfer
-        // an identical retained layout instead of constructing it again. A
-        // block cursor changes the drawing effect in the row, so that row is
-        // intentionally rebuilt.
-        if (!rowHasCursor(row)) {
-            for (self.row_layouts.items, 0..) |candidate, index| {
-                if (index == row_index or candidate.layout == null or
-                    candidate.font_generation != self.font_generation or
-                    candidate.content_fingerprint != row.fingerprint)
-                    continue;
-                layouts.clear();
-                layouts.* = candidate;
-                self.row_layouts.items[index] = .{};
-                layouts.row_generation = row.generation;
-                return layouts;
-            }
+        // positions. Transfer a matching layout with exclusive ownership, then
+        // apply current colors/selection/cursor effects in place.
+        if (self.takeMatchingLayout(row_index, row, layout_width)) |replacement| {
+            self.stashOrphan(layouts);
+            layouts.* = replacement;
+            try self.applyDrawingEffects(layouts.layout.?, row, text_length);
+            layouts.row_generation = row.generation;
+            layouts.content_fingerprint = row.fingerprint;
+            if (counters_enabled) self.layout_pool_hit_count +|= 1;
+            return layouts;
         }
 
         const trace_start = frame_trace.timestamp();
         defer self.layout_trace.recordSince(trace_start);
-        layouts.clear();
+        self.stashOrphan(layouts);
         errdefer layouts.clear();
         const format = self.text_format orelse return error.TextFormatUnavailable;
         const scale = dipScale(dpi);
         var layout: *dwrite.IDWriteTextLayout = undefined;
         if (self.dwrite_factory.CreateTextLayout(
             @ptrCast(row.utf16.items.ptr),
-            @intCast(row.utf16.items.len),
+            @intCast(text_length),
             format,
-            @max(1.0, @as(f32, @floatFromInt(metrics.cell_width *
-                @as(u32, @intCast(row.cells.items.len)))) * scale),
+            @max(1.0, @as(f32, @floatFromInt(layout_width)) * scale),
             @as(f32, @floatFromInt(metrics.cell_height)) * scale,
             &layout,
         ).failed) return error.CreateTextLayoutFailed;
         errdefer release(layout);
         const full_range: dwrite.DWRITE_TEXT_RANGE = .{
             .startPosition = 0,
-            .length = @intCast(row.utf16.items.len),
+            .length = @intCast(text_length),
         };
         if (layout.SetTypography(self.typography, full_range).failed)
             return error.ConfigureTextLayoutFailed;
@@ -856,6 +769,7 @@ pub const DeviceResources = struct {
                 full_range,
             ).failed) return error.ConfigureTextLayoutFailed;
         } else for (row.graphemes.items) |grapheme| {
+            if (grapheme.cell_start + grapheme.cell_count > row.shaped_columns) break;
             const range: dwrite.DWRITE_TEXT_RANGE = .{
                 .startPosition = @intCast(grapheme.text_start),
                 .length = @intCast(grapheme.text_len),
@@ -873,13 +787,14 @@ pub const DeviceResources = struct {
             if (layout1.SetCharacterSpacing(0, trailing, 0, range).failed)
                 return error.ConfigureTextLayoutFailed;
         }
-        try self.applyDrawingEffects(layout, row);
+        try self.applyDrawingEffects(layout, row, text_length);
         layouts.layout = layout;
         if (counters_enabled) self.layout_build_count +|= 1;
         layouts.row_generation = row.generation;
         layouts.font_generation = self.font_generation;
         layouts.content_fingerprint = row.fingerprint;
         layouts.shape_fingerprint = row.shape_fingerprint;
+        layouts.layout_width = layout_width;
         return layouts;
     }
 
@@ -887,20 +802,26 @@ pub const DeviceResources = struct {
         self: *DeviceResources,
         layout: *dwrite.IDWriteTextLayout,
         row: *const render_commands.CachedRow,
+        text_length: usize,
     ) !void {
         const full_range: dwrite.DWRITE_TEXT_RANGE = .{
             .startPosition = 0,
-            .length = @intCast(row.utf16.items.len),
+            .length = @intCast(text_length),
         };
         if (layout.SetDrawingEffect(null, full_range).failed)
             return error.ConfigureTextLayoutFailed;
         for (row.text_runs.items) |text_run| {
+            if (text_run.text_start >= text_length) break;
+            const effect_length = @min(
+                text_run.text_len,
+                text_length - text_run.text_start,
+            );
             const brush = try self.getBrush(text_run.color);
             if (layout.SetDrawingEffect(
                 @ptrCast(&brush.IUnknown),
                 .{
                     .startPosition = @intCast(text_run.text_start),
-                    .length = @intCast(text_run.text_len),
+                    .length = @intCast(effect_length),
                 },
             ).failed) return error.ConfigureTextLayoutFailed;
         }
@@ -1002,6 +923,7 @@ pub const DeviceResources = struct {
         self.font_generation +%= 1;
         if (self.font_generation == 0) self.font_generation = 1;
         self.clearRowLayouts();
+        self.clearOrphanLayouts();
         self.scene_valid = false;
         return replacement;
     }
@@ -1043,19 +965,65 @@ pub const DeviceResources = struct {
         for (self.row_layouts.items) |*layouts| layouts.deinit();
         self.row_layouts.deinit(std.heap.smp_allocator);
         self.row_layouts = .empty;
+        self.clearOrphanLayouts();
+        self.orphan_layouts.deinit(std.heap.smp_allocator);
+        self.orphan_layouts = .empty;
+    }
+
+    fn clearOrphanLayouts(self: *DeviceResources) void {
+        for (self.orphan_layouts.items) |*layouts| layouts.deinit();
+        self.orphan_layouts.clearRetainingCapacity();
+    }
+
+    fn stashOrphan(self: *DeviceResources, layouts: *RowLayouts) void {
+        if (layouts.layout == null) return;
+        if (self.orphan_layouts.items.len == max_orphan_layouts) {
+            self.orphan_layouts.items[0].deinit();
+            _ = self.orphan_layouts.orderedRemove(0);
+            if (counters_enabled) self.layout_pool_evict_count +|= 1;
+        }
+        self.orphan_layouts.append(std.heap.smp_allocator, layouts.*) catch {
+            layouts.deinit();
+            return;
+        };
+        layouts.* = .{};
+    }
+
+    fn takeMatchingLayout(
+        self: *DeviceResources,
+        row_index: usize,
+        row: *const render_commands.CachedRow,
+        layout_width: u32,
+    ) ?RowLayouts {
+        for (self.row_layouts.items, 0..) |candidate, index| {
+            if (index == row_index or candidate.layout == null or
+                candidate.font_generation != self.font_generation or
+                candidate.shape_fingerprint != row.shape_fingerprint or
+                candidate.layout_width != layout_width)
+                continue;
+            self.row_layouts.items[index] = .{};
+            return candidate;
+        }
+        for (self.orphan_layouts.items, 0..) |candidate, index| {
+            if (candidate.font_generation != self.font_generation or
+                candidate.shape_fingerprint != row.shape_fingerprint or
+                candidate.layout_width != layout_width)
+                continue;
+            return self.orphan_layouts.orderedRemove(index);
+        }
+        return null;
     }
 
     fn releaseTargetResources(self: *DeviceResources) void {
         self.releaseSwapChainTarget();
         if (self.scene_bitmap) |bitmap| release(bitmap);
-        if (self.building_scene_bitmap) |bitmap| release(bitmap);
-        self.building_scene_bitmap = null;
         self.scene_bitmap = null;
         self.scene_width = 0;
         self.scene_height = 0;
         self.scene_dpi = 0;
+        self.scene_capacity_width = 0;
+        self.scene_capacity_height = 0;
         self.scene_valid = false;
-        self.build_next_row = null;
     }
 
     fn releaseSwapChainTarget(self: *DeviceResources) void {
@@ -1065,13 +1033,17 @@ pub const DeviceResources = struct {
     }
 };
 
-fn rowHasCursor(row: *const render_commands.CachedRow) bool {
-    for (row.cells.items) |cell| if (cell.cursor) return true;
-    return false;
-}
-
 fn dipScale(dpi: u32) f32 {
     return 96.0 / @as(f32, @floatFromInt(@max(dpi, 1)));
+}
+
+/// Grow retained build surfaces geometrically. Interactive sizing crosses
+/// cell boundaries far more often than it changes the eventual allocation
+/// class, so exact-size allocations turn a drag into repeated GPU churn.
+fn growSceneCapacity(current: u32, required: u32) u32 {
+    if (current >= required) return current;
+    const grown = current +| current / 2;
+    return @max(required, @max(grown, 64));
 }
 
 fn toColor(color: terminal.Rgb) d2d_common.D2D_COLOR_F {

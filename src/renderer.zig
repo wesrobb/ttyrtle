@@ -32,6 +32,8 @@ pub const Renderer = struct {
         scene_recreation_count: u64,
         scene_redraw_count: u64,
         layout_build_count: u64,
+        layout_pool_hits: u64,
+        layout_pool_evictions: u64,
         target_width: u32,
         target_height: u32,
         gpu_paint_trace: frame_trace.Stats,
@@ -156,38 +158,6 @@ pub const Renderer = struct {
         if (counters_enabled) self.frame_request_count +|= 1;
     }
 
-    pub fn beginRetainedBuild(
-        self: *Renderer,
-        cache: *const render_commands.RenderCache,
-        metrics: geometry.Metrics,
-        dpi: u32,
-    ) bool {
-        const resources = &(self.gpu orelse return false);
-        resources.beginSceneBuild(cache, metrics, dpi) catch |err| {
-            std.log.warn("GPU resize scene build failed: {s}", .{@errorName(err)});
-            return false;
-        };
-        return true;
-    }
-
-    pub fn advanceRetainedBuild(
-        self: *Renderer,
-        cache: *const render_commands.RenderCache,
-        metrics: geometry.Metrics,
-        dpi: u32,
-        row_budget: usize,
-    ) ?bool {
-        const resources = &(self.gpu orelse return null);
-        return resources.advanceSceneBuild(cache, metrics, dpi, row_budget) catch |err| {
-            std.log.warn("GPU resize scene advance failed: {s}", .{@errorName(err)});
-            return null;
-        };
-    }
-
-    pub fn cancelRetainedBuild(self: *Renderer) void {
-        if (self.gpu) |*resources| resources.cancelSceneBuild();
-    }
-
     pub fn invalidateTerminalContent(self: *Renderer) void {
         if (self.gpu) |*resources| resources.invalidateTerminalContent();
     }
@@ -202,6 +172,8 @@ pub const Renderer = struct {
             .scene_recreation_count = 0,
             .scene_redraw_count = 0,
             .layout_build_count = 0,
+            .layout_pool_hits = 0,
+            .layout_pool_evictions = 0,
             .target_width = 0,
             .target_height = 0,
             .gpu_paint_trace = .{},
@@ -236,6 +208,8 @@ pub const Renderer = struct {
             .scene_redraw_count = if (self.gpu) |resources| resources.scene_redraw_count else 0,
             .layout_build_count = self.retired_layout_build_count +
                 if (self.gpu) |resources| resources.layout_build_count else 0,
+            .layout_pool_hits = if (self.gpu) |resources| resources.layout_pool_hit_count else 0,
+            .layout_pool_evictions = if (self.gpu) |resources| resources.layout_pool_evict_count else 0,
             .target_width = if (self.gpu) |resources| resources.target_width else 0,
             .target_height = if (self.gpu) |resources| resources.target_height else 0,
             .gpu_paint_trace = gpu_traces[0],

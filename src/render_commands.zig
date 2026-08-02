@@ -40,6 +40,10 @@ pub const CachedRow = struct {
     generation: u64 = 0,
     fingerprint: u64 = 0,
     shape_fingerprint: u64 = 0,
+    /// Number of terminal columns represented by the DirectWrite payload.
+    /// Cells and rectangles retain the full viewport so blank selection and
+    /// cursor geometry is never lost.
+    shaped_columns: u16 = 0,
     utf16: std.ArrayListUnmanaged(u16) = .empty,
     utf16_to_cell: std.ArrayListUnmanaged(u16) = .empty,
     cells: std.ArrayListUnmanaged(CellMetadata) = .empty,
@@ -97,9 +101,6 @@ pub const RenderCache = struct {
         rectangle_commands: u64,
     };
     allocator: std.mem.Allocator,
-    /// A full cache may be built in bounded slices while another cache remains
-    /// on screen.  `build_next_row == null` means this cache is committed.
-    build_next_row: ?u16 = null,
     background: terminal.Rgb = .{ .red = 12, .green = 16, .blue = 20 },
     rows: std.ArrayListUnmanaged(CachedRow) = .empty,
     columns: u16 = 0,
@@ -137,40 +138,6 @@ pub const RenderCache = struct {
         self.* = undefined;
     }
 
-    /// Prepare an empty, self-contained cache for a new terminal geometry.
-    /// No existing cache is touched; callers may continue presenting it until
-    /// `advanceFullBuild` reports completion.
-    pub fn beginFullBuild(
-        self: *RenderCache,
-        model: *const terminal.TerminalModel,
-        metrics: geometry.Metrics,
-    ) !void {
-        try self.resize(model.rows(), model.columns());
-        self.metrics = metrics;
-        self.background = model.background();
-        self.scroll_up_rows = 0;
-        self.scroll_down_rows = 0;
-        self.build_next_row = 0;
-    }
-
-    /// Rebuild at most `row_budget` rows and return true once every row is
-    /// present.  The model must not change during a generation; the app
-    /// cancels and restarts this cache whenever it receives model output.
-    pub fn advanceFullBuild(
-        self: *RenderCache,
-        model: *const terminal.TerminalModel,
-        metrics: geometry.Metrics,
-        row_budget: u16,
-    ) !bool {
-        var next = self.build_next_row orelse return true;
-        const end = @min(model.rows(), next +| @max(row_budget, 1));
-        while (next < end) : (next += 1) try self.rebuildRow(model, metrics, next);
-        self.recordDirtyRows(end - self.build_next_row.?);
-        self.build_next_row = if (end == model.rows()) null else end;
-        if (self.build_next_row == null and counters_enabled) self.full_rebuild_count +|= 1;
-        return self.build_next_row == null;
-    }
-
     /// Copies all pending model damage into application-owned retained rows.
     /// The caller may acknowledge model damage after this returns successfully.
     pub fn update(
@@ -185,7 +152,6 @@ pub const RenderCache = struct {
             !std.meta.eql(self.metrics.?, metrics);
 
         if (dimensions_changed) try self.resize(model.rows(), model.columns());
-        self.build_next_row = null;
         self.metrics = metrics;
         self.background = model.background();
         self.scroll_up_rows = 0;
@@ -306,6 +272,7 @@ pub const RenderCache = struct {
     ) !void {
         const row = &self.rows.items[row_index];
         row.clearRetainingCapacity();
+        row.shaped_columns = 0;
         const cursor = model.cursor();
         var active_run: ?usize = null;
 
@@ -419,6 +386,16 @@ pub const RenderCache = struct {
                     .cell_start = @intCast(column),
                     .cell_count = if (next_is_spacer) 2 else 1,
                 });
+                if (cell.codepoint) |codepoint| {
+                    // DirectWrite receives only cells which can produce ink.
+                    // The full cells/rectangles arrays deliberately remain so
+                    // selected, styled, and cursor blanks still paint.
+                    if (codepoint != ' ') {
+                        const shaped_end = column +
+                            (if (next_is_spacer) @as(usize, 2) else @as(usize, 1));
+                        row.shaped_columns = @intCast(shaped_end);
+                    }
+                }
             }
 
             try row.cells.append(self.allocator, .{
@@ -650,9 +627,11 @@ fn appendUtf16(
 
 fn shapeFingerprint(row: *const CachedRow) u64 {
     var hash: u64 = 0xcbf29ce484222325;
-    for (row.utf16.items) |code_unit|
+    const length = shapedUtf16Length(row);
+    for (row.utf16.items[0..length]) |code_unit|
         hash = fingerprintMix(hash, code_unit);
     for (row.graphemes.items) |grapheme| {
+        if (grapheme.cell_start + grapheme.cell_count > row.shaped_columns) break;
         hash = fingerprintMix(hash, grapheme.text_start);
         hash = fingerprintMix(hash, grapheme.text_len);
         hash = fingerprintMix(hash, grapheme.cell_count);
@@ -660,30 +639,37 @@ fn shapeFingerprint(row: *const CachedRow) u64 {
     return hash;
 }
 
+pub fn shapedUtf16Length(row: *const CachedRow) usize {
+    if (row.shaped_columns == 0) return 0;
+    var length: usize = 0;
+    for (row.graphemes.items) |grapheme| {
+        if (grapheme.cell_start + grapheme.cell_count > row.shaped_columns) break;
+        length = grapheme.text_start + grapheme.text_len;
+    }
+    return length;
+}
+
 fn fingerprintMix(hash: u64, value: anytype) u64 {
     return (hash ^ @as(u64, @intCast(value))) *% 0x100000001b3;
 }
 
-test "staged full build exposes rows only after deterministic completion" {
+test "trailing blank growth keeps the DirectWrite shape unchanged" {
     var model: terminal.TerminalModel = undefined;
-    try model.init(std.testing.allocator, 4, 20);
+    try model.init(std.testing.allocator, 4, 10);
     defer model.deinit();
-    try model.write("staged cache");
+    try model.write("ink");
     const metrics: geometry.Metrics = .forDpi(96);
-    var front = RenderCache.init(std.testing.allocator);
-    defer front.deinit();
-    try front.update(&model, metrics, model.damage());
-    const front_generation = front.rows.items[0].generation;
-
-    var back = RenderCache.init(std.testing.allocator);
-    defer back.deinit();
-    try back.beginFullBuild(&model, metrics);
-    try std.testing.expect(!(try back.advanceFullBuild(&model, metrics, 1)));
-    try std.testing.expect(back.build_next_row != null);
-    try std.testing.expectEqual(front_generation, front.rows.items[0].generation);
-    while (!(try back.advanceFullBuild(&model, metrics, 1))) {}
-    try std.testing.expect(back.build_next_row == null);
-    try std.testing.expectEqual(model.rows(), @as(u16, @intCast(back.rows.items.len)));
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    try cache.update(&model, metrics, model.damage());
+    const before = cache.rows.items[0];
+    const before_shape = before.shape_fingerprint;
+    try model.resize(4, 20, metrics.cell_width, metrics.cell_height);
+    try cache.update(&model, metrics, model.damage());
+    const after = cache.rows.items[0];
+    try std.testing.expectEqual(before_shape, after.shape_fingerprint);
+    try std.testing.expectEqual(@as(u16, 3), after.shaped_columns);
+    try std.testing.expectEqual(@as(usize, 20), after.cells.items.len);
 }
 
 test "cache rebuilds only dirty rows" {
