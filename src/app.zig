@@ -36,10 +36,14 @@ const context_menu_new_tab = 1;
 const context_menu_rename_tab = 2;
 const context_menu_close_tab = 3;
 const context_menu_new_window = 4;
+const context_menu_move_tab_to_new_window = 5;
+const context_menu_move_tab_to_window_first = 0x100;
 const context_menu_new_tab_label = std.unicode.utf8ToUtf16LeStringLiteral("New Tab");
 const context_menu_rename_tab_label = std.unicode.utf8ToUtf16LeStringLiteral("Rename");
 const context_menu_close_tab_label = std.unicode.utf8ToUtf16LeStringLiteral("Close");
 const context_menu_new_window_label = std.unicode.utf8ToUtf16LeStringLiteral("New Window");
+const context_menu_move_tab_to_new_window_label = std.unicode.utf8ToUtf16LeStringLiteral("Move Tab to New Window");
+const context_menu_move_tab_to_window_label = std.unicode.utf8ToUtf16LeStringLiteral("Move Tab to Window");
 
 pub const Mode = enum {
     normal,
@@ -943,6 +947,43 @@ fn showTabContextMenu(id: workspace.TabId, point: foundation.POINT) !void {
         return error.AppendContextMenuItemFailed;
     if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_rename_tab, context_menu_rename_tab_label) == 0)
         return error.AppendContextMenuItemFailed;
+    if (user32.AppendMenuW(
+        menu,
+        wm.MF_STRING,
+        context_menu_move_tab_to_new_window,
+        context_menu_move_tab_to_new_window_label,
+    ) == 0) return error.AppendContextMenuItemFailed;
+
+    var destinations: std.ArrayListUnmanaged(workspace.WindowId) = .empty;
+    defer destinations.deinit(std.heap.smp_allocator);
+    try appendMoveDestinations(&destinations, windowStateFromHwnd(window) orelse return error.WindowStateUnavailable);
+    if (destinations.items.len != 0) {
+        const move_menu = user32.CreatePopupMenu() orelse return error.CreateContextMenuFailed;
+        for (destinations.items, 0..) |destination_id, index| {
+            var label_buffer: [512]u8 = undefined;
+            const label = try destinationMenuLabel(
+                (windowStateFromHwnd(window) orelse return error.WindowStateUnavailable).application,
+                destination_id,
+                &label_buffer,
+            );
+            const wide = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.smp_allocator, label);
+            defer std.heap.smp_allocator.free(wide);
+            if (user32.AppendMenuW(
+                move_menu,
+                wm.MF_STRING,
+                context_menu_move_tab_to_window_first + index,
+                wide.ptr,
+            ) == 0) return error.AppendContextMenuItemFailed;
+        }
+        if (user32.AppendMenuW(
+            menu,
+            wm.MF_POPUP,
+            @intFromPtr(move_menu),
+            context_menu_move_tab_to_window_label,
+        ) == 0) return error.AppendContextMenuItemFailed;
+
+        // The submenu is now owned by the parent menu and is released with it.
+    }
     if (user32.AppendMenuW(menu, wm.MF_SEPARATOR, 0, null) == 0)
         return error.AppendContextMenuItemFailed;
     if (user32.AppendMenuW(menu, wm.MF_STRING, context_menu_close_tab, context_menu_close_tab_label) == 0)
@@ -952,7 +993,50 @@ fn showTabContextMenu(id: workspace.TabId, point: foundation.POINT) !void {
         return;
     }
     _ = user32.SetForegroundWindow(window);
-    _ = user32.TrackPopupMenu(menu, wm.TPM_RIGHTBUTTON, point.x, point.y, 0, window, null);
+    var flags = wm.TPM_RIGHTBUTTON;
+    flags.RETURNCMD = 1;
+    const command: usize = @intCast(user32.TrackPopupMenuEx(menu, @bitCast(flags), point.x, point.y, window, null));
+    if (command >= context_menu_move_tab_to_window_first) {
+        const index = command - context_menu_move_tab_to_window_first;
+        if (index < destinations.items.len)
+            moveTabToWindow(windowStateFromHwnd(window) orelse return, id, destinations.items[index]) catch |err|
+                std.log.err("failed to move terminal tab to selected window: {}", .{err});
+    } else if (command != 0) {
+        _ = handleContextMenuCommand(window, command);
+    }
+}
+
+/// Capture stable application identities before entering the native menu loop.
+/// HWNDs may disappear or be reused while TrackPopupMenuEx dispatches messages.
+fn appendMoveDestinations(
+    destinations: *std.ArrayListUnmanaged(workspace.WindowId),
+    source: *WindowState,
+) !void {
+    const application = source.application;
+    for (application.windows.items) |candidate| {
+        if (candidate == source or candidate.model_window.lifecycle != .live) continue;
+        try destinations.append(std.heap.smp_allocator, candidate.model_window.id);
+    }
+}
+
+/// Captions make the list recognizable while the ordinal makes duplicates
+/// deterministic. The ID behind the command remains the sole identity.
+fn destinationMenuLabel(
+    application: *Application,
+    destination_id: workspace.WindowId,
+    buffer: []u8,
+) ![]const u8 {
+    const destination = application.model.window(destination_id) orelse return error.UnknownDestinationWindow;
+    const label = if (destination.workspace.activeTab()) |tab| tab.effectiveLabel() else "Terminal";
+    var ordinal: usize = 0;
+    for (application.windows.items) |candidate| {
+        if (candidate.model_window.lifecycle != .live) continue;
+        const candidate_label = if (candidate.ownedWorkspace().activeTab()) |tab| tab.effectiveLabel() else "Terminal";
+        if (!std.mem.eql(u8, candidate_label, label)) continue;
+        ordinal += 1;
+        if (candidate.model_window.id == destination_id) break;
+    }
+    return std.fmt.bufPrint(buffer, "{s} ({d})", .{ label, ordinal });
 }
 
 fn handleContextMenuCommand(window: foundation.HWND, command: usize) bool {
@@ -961,6 +1045,9 @@ fn handleContextMenuCommand(window: foundation.HWND, command: usize) bool {
             std.log.err("failed to create terminal tab from context menu: {}", .{err}),
         context_menu_new_window => createNewWindow() catch |err|
             std.log.err("failed to create terminal window from context menu: {}", .{err}),
+        context_menu_move_tab_to_new_window => if (workspace_state.active_tab_id) |id|
+            moveTabToNewWindow(windowStateFromHwnd(window) orelse return false, id) catch |err|
+                std.log.err("failed to move terminal tab to a new window: {}", .{err}),
         context_menu_rename_tab => if (workspace_state.active_tab_id) |id|
             beginRenameTab(id) catch |err|
                 std.log.err("failed to rename terminal tab from context menu: {}", .{err}),
@@ -975,6 +1062,123 @@ fn createNewWindow() !void {
     const application = active_application orelse return error.ApplicationUnavailable;
     const instance = kernel32.GetModuleHandleW(null) orelse return error.GetModuleHandleFailed;
     _ = try createVisibleWindow(application, instance);
+}
+
+/// Creates the complete native receiver required by a transfer, but leaves it
+/// hidden and empty until the allocation-free model commit succeeds.
+fn createTransferDestination(application: *Application, instance: foundation.HINSTANCE) !*WindowState {
+    const model_window = try application.model.createWindow();
+    const state = try application.allocator.create(WindowState);
+    errdefer application.allocator.destroy(state);
+    state.* = .init(application, model_window);
+    try application.windows.append(application.allocator, state);
+
+    var style = wm.WS_OVERLAPPEDWINDOW;
+    style.CLIPCHILDREN = 1;
+    const window = user32.CreateWindowExW(
+        .{},
+        class_name,
+        window_title,
+        style,
+        wm.CW_USEDEFAULT,
+        wm.CW_USEDEFAULT,
+        900,
+        560,
+        null,
+        null,
+        instance,
+        state,
+    ) orelse return error.CreateWindowFailed;
+    errdefer {
+        if (user32.IsWindow(window) != 0) _ = user32.DestroyWindow(window);
+    }
+
+    state.hwnd = window;
+    state.tab_control = try createTabControl(instance, window);
+    if (comctl32.SetWindowSubclass(state.tab_control, tabControlProc, 1, @intFromPtr(state)) == 0)
+        return error.SubclassTabControlFailed;
+    bindWindowState(state);
+    if (active_mode != .smoke_gdi) state.renderer.initialize(window);
+    state.terminal_metrics = state.renderer.metricsForDpi(user32.GetDpiForWindow(window));
+    _ = user32.SetTimer(window, cursor_timer_id, 500, null);
+    if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
+    storeWindowState(state);
+    return state;
+}
+
+fn moveTabToNewWindow(source: *WindowState, id: workspace.TabId) !void {
+    const instance = kernel32.GetModuleHandleW(null) orelse return error.GetModuleHandleFailed;
+    const destination = try createTransferDestination(source.application, instance);
+    moveTabToState(source, id, destination) catch |err| {
+        if (destination.hwnd) |window| beginWindowClose(window);
+        return err;
+    };
+}
+
+/// Resolve the destination by its stable ID immediately before transfer. A
+/// destination which was closed while its menu was open is a harmless no-op.
+fn moveTabToWindow(source: *WindowState, id: workspace.TabId, destination_id: workspace.WindowId) !void {
+    const destination = source.application.model.window(destination_id) orelse return;
+    if (destination.lifecycle != .live) return;
+    const destination_state = blk: {
+        for (source.application.windows.items) |candidate|
+            if (candidate.model_window == destination) break :blk candidate;
+        return;
+    };
+    try moveTabToState(source, id, destination_state);
+}
+
+fn moveTabToState(source: *WindowState, id: workspace.TabId, destination: *WindowState) !void {
+    if (source == destination) return;
+    const source_window = source.hwnd orelse return error.SourceWindowUnavailable;
+    const destination_window = destination.hwnd orelse return error.DestinationWindowUnavailable;
+    var transaction = try source.application.model.prepareTransfer(
+        source.model_window.id,
+        destination.model_window.id,
+        id,
+        destination.ownedWorkspace().tabs.items.len,
+    );
+    defer transaction.deinit();
+
+    // No native call occurs between commit's lifecycle guards and restored
+    // ownership. Presentation is rebuilt only after the stable identities are
+    // routed to their new window.
+    _ = transaction.commit();
+    try refreshTransferredPresentation(destination, destination_window);
+    if (source.ownedWorkspace().activeTab() != null) {
+        try refreshTransferredPresentation(source, source_window);
+    } else {
+        bindWindowState(source);
+        beginWindowClose(source_window);
+    }
+
+    if (user32.IsIconic(destination_window) != 0)
+        _ = user32.ShowWindow(destination_window, wm.SW_RESTORE)
+    else
+        _ = user32.ShowWindow(destination_window, wm.SW_SHOW);
+    _ = user32.SetForegroundWindow(destination_window);
+    _ = user32.SetFocus(destination_window);
+}
+
+fn refreshTransferredPresentation(state: *WindowState, window: foundation.HWND) !void {
+    bindWindowState(state);
+    const active = state.ownedWorkspace().activeSession() orelse return;
+    model = &active.model;
+    model_initialized = true;
+    input_translator.* = .{};
+    selection_dragging = false;
+    selection_anchor = null;
+    selection_head = null;
+    pressed_mouse_button = null;
+    try syncNativeTabs();
+    model.markFullDamage();
+    render_cache.deinit();
+    render_cache.* = .init(std.heap.smp_allocator);
+    active_renderer.invalidateTerminalContent();
+    try resizeForClient(window);
+    updateWindowCaption(window);
+    invalidateRenderDamage(window);
+    storeWindowState(state);
 }
 
 fn syncNativeTabs() !void {
@@ -3283,4 +3487,28 @@ fn nativeTabLabelEquals(id: workspace.SessionId, expected: []const u8) bool {
     ) catch return false;
     defer std.heap.smp_allocator.free(label);
     return std.mem.eql(u8, label, expected);
+}
+
+test "move destination snapshot contains only other live stable windows" {
+    var application = Application.init(std.testing.allocator, .normal);
+    defer application.deinit();
+
+    const source_model = try application.model.createWindow();
+    const destination_model = try application.model.createWindow();
+    const closing_model = try application.model.createWindow();
+    try std.testing.expect(application.model.markLive(source_model.id));
+    try std.testing.expect(application.model.markLive(destination_model.id));
+    try std.testing.expect(application.model.markLive(closing_model.id));
+    closing_model.lifecycle = .closing;
+
+    for ([_]*workspace.Window{ source_model, destination_model, closing_model }) |model_window| {
+        const state = try std.testing.allocator.create(WindowState);
+        state.* = .init(&application, model_window);
+        try application.windows.append(std.testing.allocator, state);
+    }
+
+    var snapshot: std.ArrayListUnmanaged(workspace.WindowId) = .empty;
+    defer snapshot.deinit(std.heap.smp_allocator);
+    try appendMoveDestinations(&snapshot, application.windows.items[0]);
+    try std.testing.expectEqualSlices(workspace.WindowId, &.{destination_model.id}, snapshot.items);
 }
