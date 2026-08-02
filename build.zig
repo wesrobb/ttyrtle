@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
         .smoke_test = false,
     });
     b.installArtifact(exe);
+    installBundledFonts(b, exe);
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
@@ -84,6 +85,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
         .smoke_test = true,
     });
+    installBundledFonts(b, smoke_exe);
     const run_smoke = b.addRunArtifact(smoke_exe);
     const smoke_step = b.step(
         "smoke",
@@ -117,6 +119,21 @@ pub fn build(b: *std.Build) void {
     verify_step.dependOn(integration_step);
     verify_step.dependOn(smoke_step);
     verify_step.dependOn(check_step);
+}
+
+fn installBundledFonts(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    const install_font = b.addInstallFileWithDir(
+        b.path("assets/fonts/SymbolsNerdFontMono-Regular.ttf"),
+        .bin,
+        "assets/fonts/SymbolsNerdFontMono-Regular.ttf",
+    );
+    exe.step.dependOn(&install_font.step);
+    const install_license = b.addInstallFileWithDir(
+        b.path("assets/fonts/LICENSE_OFL.txt"),
+        .bin,
+        "assets/fonts/LICENSE_OFL.txt",
+    );
+    exe.step.dependOn(&install_license.step);
 }
 
 const ExecutableOptions = struct {

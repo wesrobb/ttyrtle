@@ -137,7 +137,8 @@ not rendered yet. Selection is backed by Ghostty's retained screen state and
 can span scrollback and the live viewport.
 
 The Direct2D renderer shapes one complete UTF-16 row at a time with persistent
-system font fallback. Ghostty graphemes retain exact one- or two-cell advances,
+system font fallback plus bundled Symbols Nerd Font Mono fallback for Nerd Font
+Private Use Area glyphs. Ghostty graphemes retain exact one- or two-cell advances,
 including combining marks, CJK, supplementary characters, emoji sequences, and
 missing glyphs. Text colors are ranges within the row layout; backgrounds,
 inverse video, underline, selection, and cursor drawing remain aligned to cell

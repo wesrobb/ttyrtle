@@ -17,6 +17,10 @@ const d2d_common = d2d.common;
 const dxgi_common = dxgi.common;
 
 const terminal_font_name = std.unicode.utf8ToUtf16LeStringLiteral("Consolas");
+const nerd_font_name = std.unicode.utf8ToUtf16LeStringLiteral("Symbols Nerd Font Mono");
+const nerd_font_relative_path = std.unicode.utf8ToUtf16LeStringLiteral(
+    "\\assets\\fonts\\SymbolsNerdFontMono-Regular.ttf",
+);
 const locale_name = std.unicode.utf8ToUtf16LeStringLiteral("en-US");
 const max_brushes = 64;
 const max_orphan_layouts = 128;
@@ -251,9 +255,10 @@ pub const DeviceResources = struct {
             dwrite.IID_IDWriteFactory2,
         );
         errdefer release(resources.dwrite_factory2);
-        if (resources.dwrite_factory2.GetSystemFontFallback(
-            &resources.font_fallback,
-        ).failed) return error.GetSystemFontFallbackFailed;
+        resources.font_fallback = try createFontFallback(
+            resources.dwrite_factory,
+            resources.dwrite_factory2,
+        );
         errdefer release(resources.font_fallback);
         if (resources.dwrite_factory.CreateTypography(
             &resources.typography,
@@ -1032,6 +1037,97 @@ pub const DeviceResources = struct {
         self.target_bitmap = null;
     }
 };
+
+/// Build the normal system fallback chain, with the application-bundled Nerd
+/// Font symbols taking priority for its Private Use Area glyphs. The font is
+/// kept beside the executable so it never needs to be installed system-wide.
+fn createFontFallback(
+    factory: *dwrite.IDWriteFactory,
+    factory2: *dwrite.IDWriteFactory2,
+) !*dwrite.IDWriteFontFallback {
+    var system_fallback: *dwrite.IDWriteFontFallback = undefined;
+    if (factory2.GetSystemFontFallback(&system_fallback).failed)
+        return error.GetSystemFontFallbackFailed;
+    errdefer release(system_fallback);
+
+    const factory3 = queryInterface(
+        dwrite.IDWriteFactory3,
+        factory,
+        dwrite.IID_IDWriteFactory3,
+    ) catch return system_fallback;
+    defer release(factory3);
+
+    var font_path: [1024:0]u16 = undefined;
+    const executable_length = win32.kernel32.GetModuleFileNameW(
+        null,
+        &font_path,
+        font_path.len,
+    );
+    if (executable_length == 0 or executable_length >= font_path.len)
+        return system_fallback;
+    const executable_path = font_path[0..executable_length];
+    const directory_length = std.mem.lastIndexOfScalar(u16, executable_path, '\\') orelse
+        return system_fallback;
+    const font_path_length = directory_length + nerd_font_relative_path.len;
+    if (font_path_length >= font_path.len) return system_fallback;
+    std.mem.copyForwards(
+        u16,
+        font_path[directory_length..font_path_length],
+        nerd_font_relative_path,
+    );
+    font_path[font_path_length] = 0;
+
+    var face_reference: *dwrite.IDWriteFontFaceReference = undefined;
+    if (factory3.CreateFontFaceReferencePath(
+        @ptrCast(&font_path),
+        null,
+        0,
+        .{},
+        &face_reference,
+    ).failed) return system_fallback;
+    defer release(face_reference);
+    var font_set_builder: *dwrite.IDWriteFontSetBuilder = undefined;
+    if (factory3.CreateFontSetBuilder(&font_set_builder).failed)
+        return system_fallback;
+    defer release(font_set_builder);
+    if (font_set_builder.AddFontFaceReferenceDefault(face_reference).failed)
+        return system_fallback;
+    var font_set: *dwrite.IDWriteFontSet = undefined;
+    if (font_set_builder.CreateFontSet(&font_set).failed)
+        return system_fallback;
+    defer release(font_set);
+    var font_collection: *dwrite.IDWriteFontCollection1 = undefined;
+    if (factory3.CreateFontCollectionFromFontSet(font_set, &font_collection).failed)
+        return system_fallback;
+    defer release(font_collection);
+
+    var builder: *dwrite.IDWriteFontFallbackBuilder = undefined;
+    if (factory2.CreateFontFallbackBuilder(&builder).failed)
+        return system_fallback;
+    defer release(builder);
+    const ranges = [_]dwrite.DWRITE_UNICODE_RANGE{
+        .{ .first = 0xe000, .last = 0xf8ff },
+        .{ .first = 0xf0000, .last = 0xf1fff },
+    };
+    const families = [_]?*const u16{@ptrCast(nerd_font_name.ptr)};
+    if (builder.AddMapping(
+        &ranges,
+        ranges.len,
+        &families,
+        families.len,
+        @ptrCast(font_collection),
+        null,
+        null,
+        1.0,
+    ).failed) return system_fallback;
+    if (builder.AddMappings(system_fallback).failed)
+        return system_fallback;
+    var fallback: *dwrite.IDWriteFontFallback = undefined;
+    if (builder.CreateFontFallback(&fallback).failed)
+        return system_fallback;
+    release(system_fallback);
+    return fallback;
+}
 
 fn dipScale(dpi: u32) f32 {
     return 96.0 / @as(f32, @floatFromInt(@max(dpi, 1)));
