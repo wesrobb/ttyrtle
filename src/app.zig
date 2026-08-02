@@ -1691,6 +1691,23 @@ fn verifyShortcutDispatch(window: foundation.HWND) !void {
     _ = user32.SendMessageW(window, wm.WM_KEYUP, 'W', @as(isize, 1) << 31);
     if (workspace_state.tabs.items.len != count_before)
         return error.ShortcutCloseDidNotSynchronizeTabs;
+
+    // Exercise the real top-level window procedure for the standard keyboard
+    // context-menu gesture. The test command is consumed by the production
+    // popup path, proving Shift+F10 does not fall through to terminal input.
+    setTestContextMenuCommand(window, context_menu_new_tab);
+    setTestModifiers(window, .{ .shift = true });
+    _ = user32.SendMessageW(window, wm.WM_KEYDOWN, 0x79, 1); // VK_F10
+    setTestModifiers(window, .{});
+    _ = user32.SendMessageW(window, wm.WM_KEYUP, 0x79, @as(isize, 1) << 31);
+    setTestContextMenuCommand(window, null);
+    if (workspace_state.tabs.items.len != count_before + 1)
+        return error.ShiftF10DidNotOpenTabContextMenu;
+    const keyboard_created = workspace_state.active_tab_id orelse
+        return error.ShiftF10DidNotActivateNewTab;
+    closeTerminalTab(window, keyboard_created);
+    if (workspace_state.tabs.items.len != count_before)
+        return error.ShiftF10ContextMenuDidNotCloseCreatedTab;
 }
 
 fn verifyInlineRename(window: foundation.HWND) !void {
@@ -2113,12 +2130,13 @@ fn windowProcImpl(
             // WM_SYSCHAR is generated for system-menu mnemonics. Application
             // shortcuts have already accounted for their generated character;
             // ordinary Alt text is intentionally delivered to the terminal.
+            // Let DefWindowProc consume the Alt+Space character before it can
+            // reach the terminal. Calling the terminal path first was enough
+            // to open the native menu, but also queued a literal space.
+            if (isSystemCharacterMessage(message, wparam))
+                return user32.DefWindowProcW(window, message, wparam, lparam);
             if (!shortcut_state.consumeCharacter()) handleCharacterMessage(@truncate(wparam));
-            return if (message == wm.WM_SYSCHAR and
-                keyRoute(message, wparam) == .system)
-                user32.DefWindowProcW(window, message, wparam, lparam)
-            else
-                0;
+            return 0;
         },
         wm.WM_DEADCHAR, wm.WM_SYSDEADCHAR => {
             input_translator.deadCharacter();
@@ -2244,6 +2262,7 @@ const Shortcut = enum {
     select_tab,
     paste,
     copy,
+    tab_context_menu,
 };
 
 /// Windows reserves a small set of Alt gestures for the non-client/system
@@ -2266,6 +2285,10 @@ fn keyRoute(message: u32, virtual_key: usize) KeyRoute {
     };
 }
 
+fn isSystemCharacterMessage(message: u32, virtual_key: usize) bool {
+    return message == wm.WM_SYSCHAR and keyRoute(message, virtual_key) == .system;
+}
+
 test "key routing reserves system gestures but keeps terminal Alt input" {
     try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSKEYDOWN, 0x73));
     try std.testing.expectEqual(KeyRoute.system, keyRoute(wm.WM_SYSKEYUP, 0x20));
@@ -2273,6 +2296,8 @@ test "key routing reserves system gestures but keeps terminal Alt input" {
     try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_SYSKEYDOWN, 'A'));
     try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_SYSCHAR, 'a'));
     try std.testing.expectEqual(KeyRoute.terminal, keyRoute(wm.WM_KEYDOWN, 0x79)); // VK_F10
+    try std.testing.expect(isSystemCharacterMessage(wm.WM_SYSCHAR, 0x20));
+    try std.testing.expect(!isSystemCharacterMessage(wm.WM_SYSCHAR, 'a'));
 }
 
 const ShortcutState = struct {
@@ -2319,6 +2344,11 @@ const ShortcutState = struct {
 };
 
 fn shortcutForKey(virtual_key: usize, mods: input.Mods) ?Shortcut {
+    // ttyrtle has no menu bar, so F10 remains available to the terminal.
+    // Shift+F10 retains its standard Windows meaning: invoke the context menu
+    // for the focused content, which here is the active tab's menu.
+    if (mods.shift and !mods.ctrl and !mods.alt and virtual_key == 0x79)
+        return .tab_context_menu;
     if (mods.ctrl and mods.shift) return switch (virtual_key) {
         'T' => .new_tab,
         'N' => if (mods.shift) .new_window else null,
@@ -2343,6 +2373,7 @@ fn shortcutVirtualKey(shortcut: Shortcut, virtual_key: usize) bool {
         .select_tab => virtual_key >= '1' and virtual_key <= '9',
         .paste => virtual_key == 'V',
         .copy => virtual_key == 'C',
+        .tab_context_menu => virtual_key == 0x79,
     };
 }
 
@@ -2358,6 +2389,24 @@ test "shortcut dispatch consumes press release and generated character" {
     try std.testing.expectEqual(
         Shortcut.new_tab,
         state.handleKey(wm.WM_KEYUP, 'T', false, .{}).?,
+    );
+}
+
+test "F10 keeps its terminal route while Shift+F10 invokes the tab menu" {
+    try std.testing.expect(shortcutForKey(0x79, .{}) == null);
+    try std.testing.expectEqual(
+        Shortcut.tab_context_menu,
+        shortcutForKey(0x79, .{ .shift = true }).?,
+    );
+    var state: ShortcutState = .{};
+    try std.testing.expectEqual(
+        Shortcut.tab_context_menu,
+        state.handleKey(wm.WM_KEYDOWN, 0x79, false, .{ .shift = true }).?,
+    );
+    // The release remains consumed even after Shift is released first.
+    try std.testing.expectEqual(
+        Shortcut.tab_context_menu,
+        state.handleKey(wm.WM_KEYUP, 0x79, false, .{}).?,
     );
 }
 
@@ -2423,6 +2472,10 @@ fn handleKeyMessage(message: u32, wparam: usize, lparam: isize) bool {
         },
         .paste => if (is_down) pasteClipboard(null),
         .copy => if (is_down) copySelection(null),
+        .tab_context_menu => if (is_down) {
+            showActiveTabContextMenu() catch |err|
+                std.log.err("failed to show keyboard tab context menu: {}", .{err});
+        },
     } else {
         if (isSmokeMode(active_mode) or activeProcess() == null) return false;
         const action: input.Action = if (!is_down)

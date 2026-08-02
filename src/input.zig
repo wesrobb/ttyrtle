@@ -395,6 +395,22 @@ test "Ghostty encoding follows application cursor mode" {
     try std.testing.expectEqualStrings("\x1bOA", application);
 }
 
+test "F10 is encoded for the hosted terminal" {
+    var terminal: ghostty.Terminal = try .init(
+        std.testing.io,
+        std.testing.allocator,
+        .{ .rows = 2, .cols = 2 },
+    );
+    defer terminal.deinit(std.testing.allocator);
+
+    const encoded = try encodeAlloc(std.testing.allocator, .{
+        .key = .f10,
+        .action = .press,
+    }, &terminal);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings("\x1b[21~", encoded);
+}
+
 test "control letter is encoded as a C0 byte" {
     var terminal: ghostty.Terminal = try .init(
         std.testing.io,
