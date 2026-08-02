@@ -52,9 +52,11 @@ const SelectionRange = ?[2]u16;
 
 const counters_enabled = builtin.mode == .Debug or builtin.is_test;
 
-/// Per-terminal primary-screen history budget. Configuration will replace this
-/// application default in a later milestone.
-pub const default_scrollback_bytes: usize = 10 * 1024 * 1024;
+/// A narrow reflow can temporarily require more physical rows for the same
+/// logical history. A fixed byte limit would evict that history during the
+/// narrow phase and widening cannot recover it, so keep the application
+/// default unlimited until configurable scrollback limits are available.
+pub const default_scrollback_bytes: ?usize = null;
 
 pub const TerminalModel = struct {
     pub const Diagnostics = struct {
@@ -1086,5 +1088,21 @@ test "scrollback delta and page navigation clamp at live bottom" {
     try model.scrollViewportTop();
     try std.testing.expect(!model.viewportFollowsBottom());
     try model.scrollViewportPage(.up);
+    try std.testing.expect(!model.viewportFollowsBottom());
+}
+
+test "narrow then wide resize retains scrollback" {
+    var model: TerminalModel = undefined;
+    try model.init(std.testing.allocator, 4, 20);
+    defer model.deinit();
+
+    for (0..64) |line| {
+        var text: [32]u8 = undefined;
+        const written = try std.fmt.bufPrint(&text, "line-{d:0>3}\r\n", .{line});
+        try model.write(written);
+    }
+    try model.resize(4, 5, 9, 18);
+    try model.resize(4, 20, 9, 18);
+    try model.scrollViewportTop();
     try std.testing.expect(!model.viewportFollowsBottom());
 }
