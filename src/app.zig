@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const win32 = @import("win32");
 const conpty = @import("conpty.zig");
 const frame_trace = @import("frame_trace.zig");
@@ -48,7 +47,6 @@ const context_menu_move_tab_to_window_label = std.unicode.utf8ToUtf16LeStringLit
 pub const Mode = enum {
     normal,
     smoke,
-    smoke_gdi,
     smoke_phase5,
     smoke_tabs,
     smoke_shortcuts,
@@ -101,7 +99,9 @@ var render_cache_initialized = false;
 var output_trace: frame_trace.Counter = .{};
 var paint_trace: frame_trace.Counter = .{};
 var cache_trace: frame_trace.Counter = .{};
-var output_frame_pending = false;
+var frame_message_pending = false;
+var renderer_failure_queued = false;
+var renderer_failure: ?anyerror = null;
 var resize_message_count: u64 = 0;
 /// The process-global pointer is only the entry point used by the message-only
 /// dispatcher. Every HWND-bound value lives below in `WindowState` and is
@@ -109,8 +109,8 @@ var resize_message_count: u64 = 0;
 var active_application: ?*Application = null;
 
 const cursor_timer_id = 1;
-const output_frame_timer_id = 2;
-const output_frame_interval_ms = 8;
+const frame_message = wm.WM_APP + 10;
+const renderer_failure_message = wm.WM_APP + 11;
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
@@ -141,6 +141,24 @@ const MultiSessionIntegration = struct {
     first: ?workspace.SessionId = null,
     second: ?workspace.SessionId = null,
     failed: bool = false,
+};
+
+const PerformanceSnapshot = struct {
+    terminal: terminal.TerminalModel.Diagnostics,
+    cache: render_commands.RenderCache.Diagnostics,
+    renderer: renderer.Renderer.Diagnostics,
+    output_trace: frame_trace.Stats,
+    paint_trace: frame_trace.Stats,
+    cache_trace: frame_trace.Stats,
+    queue_delay_trace: frame_trace.Stats,
+    frame_delay_trace: frame_trace.Stats,
+    output_to_present_trace: frame_trace.Stats,
+    resize_messages: u64,
+    bytes_read: u64,
+    bytes_parsed: u64,
+    maximum_backlog: u64,
+    continuation_count: u64,
+    maximum_ui_batch: u64,
 };
 
 const Application = struct {
@@ -246,8 +264,22 @@ const WindowState = struct {
     output_trace: frame_trace.Counter = .{},
     paint_trace: frame_trace.Counter = .{},
     cache_trace: frame_trace.Counter = .{},
-    output_frame_pending: bool = false,
+    frame_message_pending: bool = false,
+    renderer_failure_queued: bool = false,
+    renderer_failure: ?anyerror = null,
     resize_message_count: u64 = 0,
+    queue_delay_trace: frame_trace.Counter = .{},
+    frame_delay_trace: frame_trace.Counter = .{},
+    output_to_present_trace: frame_trace.Counter = .{},
+    frame_request_timestamp: i64 = 0,
+    oldest_pending_output_timestamp: i64 = 0,
+    bytes_read: u64 = 0,
+    bytes_parsed: u64 = 0,
+    maximum_backlog: u64 = 0,
+    continuation_count: u64 = 0,
+    maximum_ui_batch: u64 = 0,
+    performance_snapshot: ?PerformanceSnapshot = null,
+    auto_close_on_paint: bool = true,
 
     fn init(application: *Application, model_window: *workspace.Window) WindowState {
         return .{
@@ -299,7 +331,9 @@ fn bindWindowState(state: *WindowState) void {
     output_trace = state.output_trace;
     paint_trace = state.paint_trace;
     cache_trace = state.cache_trace;
-    output_frame_pending = state.output_frame_pending;
+    frame_message_pending = state.frame_message_pending;
+    renderer_failure_queued = state.renderer_failure_queued;
+    renderer_failure = state.renderer_failure;
     resize_message_count = state.resize_message_count;
 }
 
@@ -319,7 +353,9 @@ fn storeWindowState(state: *WindowState) void {
     state.output_trace = output_trace;
     state.paint_trace = paint_trace;
     state.cache_trace = cache_trace;
-    state.output_frame_pending = output_frame_pending;
+    state.frame_message_pending = frame_message_pending;
+    state.renderer_failure_queued = renderer_failure_queued;
+    state.renderer_failure = renderer_failure;
     state.resize_message_count = resize_message_count;
 }
 
@@ -372,7 +408,9 @@ pub fn run(mode: Mode) !void {
     output_trace = .{};
     paint_trace = .{};
     cache_trace = .{};
-    output_frame_pending = false;
+    frame_message_pending = false;
+    renderer_failure_queued = false;
+    renderer_failure = null;
     resize_message_count = 0;
     defer {
         render_cache_initialized = false;
@@ -464,12 +502,10 @@ pub fn run(mode: Mode) !void {
     if (comctl32.SetWindowSubclass(state.tab_control, tabControlProc, 1, @intFromPtr(state)) == 0)
         return error.SubclassTabControlFailed;
     try syncNativeTabs();
-    if (mode != .smoke_gdi)
-        active_renderer.initialize(window);
+    try initializeRenderer(window, active_renderer);
     const cursor_timer = user32.SetTimer(window, cursor_timer_id, 500, null);
     defer {
         if (cursor_timer != 0) _ = user32.KillTimer(window, cursor_timer);
-        _ = user32.KillTimer(window, output_frame_timer_id);
     }
 
     terminal_metrics.* = active_renderer.metricsForDpi(user32.GetDpiForWindow(window));
@@ -654,6 +690,7 @@ fn createVisibleWindow(application: *Application, instance: foundation.HINSTANCE
     const state = try application.allocator.create(WindowState);
     errdefer application.allocator.destroy(state);
     state.* = .init(application, model_window);
+    state.auto_close_on_paint = false;
     try application.windows.append(application.allocator, state);
 
     var style = wm.WS_OVERLAPPEDWINDOW;
@@ -681,7 +718,7 @@ fn createVisibleWindow(application: *Application, instance: foundation.HINSTANCE
     if (comctl32.SetWindowSubclass(state.tab_control, tabControlProc, 1, @intFromPtr(state)) == 0)
         return error.SubclassTabControlFailed;
     bindWindowState(state);
-    if (active_mode != .smoke_gdi) state.renderer.initialize(window);
+    try initializeRenderer(window, &state.renderer);
     state.terminal_metrics = state.renderer.metricsForDpi(user32.GetDpiForWindow(window));
     state.dpi = user32.GetDpiForWindow(window);
     _ = user32.SetTimer(window, cursor_timer_id, 500, null);
@@ -691,6 +728,7 @@ fn createVisibleWindow(application: *Application, instance: foundation.HINSTANCE
     // active model exists. Rebind after assigning it so the persisted view is
     // never overwritten with that transient empty state.
     bindWindowState(state);
+    try resizeForClient(window);
     if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
     storeWindowState(state);
     _ = user32.ShowWindow(window, if (active_mode == .normal) wm.SW_SHOWDEFAULT else wm.SW_HIDE);
@@ -1154,6 +1192,7 @@ fn createTransferDestination(application: *Application, instance: foundation.HIN
     const state = try application.allocator.create(WindowState);
     errdefer application.allocator.destroy(state);
     state.* = .init(application, model_window);
+    state.auto_close_on_paint = false;
     try application.windows.append(application.allocator, state);
 
     var style = wm.WS_OVERLAPPEDWINDOW;
@@ -1181,7 +1220,7 @@ fn createTransferDestination(application: *Application, instance: foundation.HIN
     if (comctl32.SetWindowSubclass(state.tab_control, tabControlProc, 1, @intFromPtr(state)) == 0)
         return error.SubclassTabControlFailed;
     bindWindowState(state);
-    if (active_mode != .smoke_gdi) state.renderer.initialize(window);
+    try initializeRenderer(window, &state.renderer);
     state.terminal_metrics = state.renderer.metricsForDpi(user32.GetDpiForWindow(window));
     _ = user32.SetTimer(window, cursor_timer_id, 500, null);
     if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
@@ -2002,15 +2041,19 @@ fn windowProcImpl(
     switch (message) {
         wm.WM_PAINT => {
             paint_completed = paint(window);
-            if (isSmokeMode(active_mode)) {
+            if (isSmokeMode(active_mode) and
+                (state == null or state.?.auto_close_on_paint))
+            {
                 _ = user32.PostMessageW(window, wm.WM_CLOSE, 0, 0);
             }
             return 0;
         },
         wm.WM_SIZE => {
-            if (builtin.mode == .Debug or builtin.is_test) resize_message_count +|= 1;
+            if (frame_trace.enabled) resize_message_count +|= 1;
             cancelTabDrag();
-            if (wparam != wm.SIZE_MINIMIZED) {
+            if (wparam != wm.SIZE_MINIMIZED and
+                (state == null or state.?.renderer.gpu != null))
+            {
                 resizeForClient(window) catch {
                     std.log.err("failed to resize terminal for client area", .{});
                 };
@@ -2068,11 +2111,22 @@ fn windowProcImpl(
                 model.toggleCursorBlink();
                 invalidateRenderDamage(window);
             }
-            if (wparam == output_frame_timer_id) {
-                _ = user32.KillTimer(window, output_frame_timer_id);
-                output_frame_pending = false;
-                invalidateRenderDamage(window);
+            return 0;
+        },
+        frame_message => {
+            if (state) |value| {
+                if (value.frame_request_timestamp != 0)
+                    value.frame_delay_trace.recordSince(value.frame_request_timestamp);
+                value.frame_request_timestamp = 0;
             }
+            frame_message_pending = false;
+            _ = user32.UpdateWindow(window);
+            return 0;
+        },
+        renderer_failure_message => {
+            const failure = renderer_failure orelse error.RendererUnavailable;
+            showRendererFailure(window, failure);
+            beginWindowClose(window);
             return 0;
         },
         conpty.output_message => {
@@ -2090,7 +2144,7 @@ fn windowProcImpl(
             if (windowStateFromHwnd(target)) |target_state| bindWindowState(target_state);
             if (workspace_state.session(id)) |session| {
                 if (session.processAs(conpty.Session)) |process| {
-                    _ = process.beginClosing();
+                    _ = process.beginClosingAfterChildExit();
                     if (process.childExitCode()) |code|
                         std.log.info("ConPTY child exited with code {d}", .{code});
                     if (isMultiSessionIntegrationMode(active_mode)) {
@@ -2210,6 +2264,7 @@ fn windowStateFromHwnd(window: foundation.HWND) ?*WindowState {
 /// before DestroyWindow synchronously enters WM_DESTROY.
 fn beginWindowClose(window: foundation.HWND) void {
     if (windowStateFromHwnd(window)) |state| {
+        capturePerformanceSnapshot(state);
         switch (state.model_window.lifecycle) {
             .destroyed, .closing => return,
             .constructing, .live, .transferring => state.model_window.lifecycle = .closing,
@@ -2224,6 +2279,28 @@ fn beginWindowClose(window: foundation.HWND) void {
     model_initialized = false;
     if (windowStateFromHwnd(window)) |state| state.active_model = null;
     _ = user32.DestroyWindow(window);
+}
+
+fn capturePerformanceSnapshot(state: *WindowState) void {
+    if (state.performance_snapshot != null) return;
+    const active = state.active_model orelse return;
+    state.performance_snapshot = .{
+        .terminal = active.diagnostics(),
+        .cache = state.render_cache.diagnostics(),
+        .renderer = state.renderer.diagnostics(),
+        .output_trace = output_trace.snapshot(),
+        .paint_trace = paint_trace.snapshot(),
+        .cache_trace = cache_trace.snapshot(),
+        .queue_delay_trace = state.queue_delay_trace.snapshot(),
+        .frame_delay_trace = state.frame_delay_trace.snapshot(),
+        .output_to_present_trace = state.output_to_present_trace.snapshot(),
+        .resize_messages = resize_message_count,
+        .bytes_read = state.bytes_read,
+        .bytes_parsed = state.bytes_parsed,
+        .maximum_backlog = state.maximum_backlog,
+        .continuation_count = state.continuation_count,
+        .maximum_ui_batch = state.maximum_ui_batch,
+    };
 }
 
 /// Establish the session boundary before the tab leaves visible ownership.
@@ -2846,12 +2923,10 @@ fn sameCell(left: terminal.Cursor, right: terminal.Cursor) bool {
 }
 
 fn invalidateRenderDamage(window: foundation.HWND) void {
+    if (renderer_failure_queued) return;
     const damage = model.damage();
-    switch (damage) {
-        .none => return,
-        else => active_renderer.requestFrame(),
-    }
-    switch (damage) {
+    if (damage.rows == .none and !damage.cursor) return;
+    switch (damage.rows) {
         .none => {},
         .full => _ = user32.InvalidateRect(window, null, 0),
         .partial => |rows| for (rows) |row| {
@@ -2869,6 +2944,57 @@ fn invalidateRenderDamage(window: foundation.HWND) void {
             _ = user32.InvalidateRect(window, &dirty, 0);
         },
     }
+    scheduleFrameMessage(window);
+}
+
+fn scheduleFrameMessage(window: foundation.HWND) void {
+    if (renderer_failure_queued) return;
+    active_renderer.requestFrame();
+    if (frame_message_pending) return;
+    frame_message_pending = true;
+    if (windowStateFromHwnd(window)) |state|
+        state.frame_request_timestamp = frame_trace.timestamp();
+    if (user32.PostMessageW(window, frame_message, 0, 0) == 0) {
+        frame_message_pending = false;
+        _ = user32.UpdateWindow(window);
+    }
+}
+
+fn initializeRenderer(window: foundation.HWND, target: *renderer.Renderer) !void {
+    target.initialize(window) catch |err| {
+        showRendererFailure(window, err);
+        return err;
+    };
+}
+
+fn queueRendererFailure(window: foundation.HWND, failure: anyerror) void {
+    if (renderer_failure_queued) return;
+    renderer_failure_queued = true;
+    renderer_failure = failure;
+    frame_message_pending = false;
+    if (user32.PostMessageW(window, renderer_failure_message, 0, 0) == 0)
+        _ = user32.PostMessageW(window, wm.WM_CLOSE, 0, 0);
+}
+
+fn showRendererFailure(window: foundation.HWND, failure: anyerror) void {
+    if (active_mode != .normal) return;
+    const message = std.fmt.allocPrint(
+        std.heap.smp_allocator,
+        "Direct2D initialization or recovery failed ({s}).",
+        .{@errorName(failure)},
+    ) catch return;
+    defer std.heap.smp_allocator.free(message);
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(
+        std.heap.smp_allocator,
+        message,
+    ) catch return;
+    defer std.heap.smp_allocator.free(wide);
+    _ = user32.MessageBoxW(
+        window,
+        wide,
+        window_title,
+        .{ .ICONHAND = 1 },
+    );
 }
 
 fn pasteClipboard(window: ?foundation.HWND) void {
@@ -3022,29 +3148,36 @@ fn paint(window: foundation.HWND) bool {
     defer paint_trace.recordSince(paint_start);
 
     var paint_state: gdi.PAINTSTRUCT = undefined;
-    const dc = user32.BeginPaint(window, &paint_state) orelse return false;
+    _ = user32.BeginPaint(window, &paint_state) orelse return false;
     defer _ = user32.EndPaint(window, &paint_state);
-
-    var client: foundation.RECT = undefined;
-    if (user32.GetClientRect(window, &client) == 0) return false;
 
     const damage = model.damage();
     const cache_start = frame_trace.timestamp();
-    render_cache.update(
+    const effective_damage = render_cache.updateEffective(
         model,
         terminal_metrics.*,
         damage,
-    ) catch return false;
+    ) catch |err| {
+        std.log.err("updating the retained render cache failed: {s}", .{@errorName(err)});
+        return false;
+    };
     cache_trace.recordSince(cache_start);
     const rendered = active_renderer.paint(
-        dc,
-        paint_state.rcPaint,
-        client,
         render_cache,
-        damage,
+        effective_damage,
         terminal_metrics.*,
         user32.GetDpiForWindow(window),
-    );
+    ) catch |err| {
+        std.log.err("painting the Direct2D frame failed: {s}", .{@errorName(err)});
+        queueRendererFailure(window, err);
+        return false;
+    };
+    if (rendered) if (windowStateFromHwnd(window)) |state| {
+        if (state.oldest_pending_output_timestamp != 0) {
+            state.output_to_present_trace.recordSince(state.oldest_pending_output_timestamp);
+            state.oldest_pending_output_timestamp = 0;
+        }
+    };
     model.acknowledgeDamage();
     return rendered;
 }
@@ -3123,18 +3256,45 @@ fn commitSurfaceResize(
     size: SurfaceSize,
 ) void {
     if (size.width == 0 or size.height == 0) return;
-    _ = active_renderer.resize(size.width, size.height, size.dpi);
+    _ = active_renderer.resize(size.width, size.height, size.dpi) catch |err| {
+        queueRendererFailure(window, err);
+        return;
+    };
     // A resized swap-chain needs a complete client presentation even when the
     // terminal model has no dirty rows. GPU scene/cache content is retained.
-    active_renderer.requestFrame();
     _ = user32.InvalidateRect(window, null, 0);
+    scheduleFrameMessage(window);
 }
 
 fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) void {
+    const handler_entry = frame_trace.timestamp();
     const session = workspace_state.session(session_id) orelse return;
     const process = session.processAs(conpty.Session) orelse return;
-    var batch = process.drainOutput();
+    var batch = process.drainOutput() catch {
+        std.log.err("failed to drain queued ConPTY output", .{});
+        _ = process.beginClosing();
+        return;
+    };
     defer batch.deinit();
+    if (windowStateFromHwnd(window)) |state| {
+        if (batch.oldest_enqueue_timestamp != 0)
+            state.queue_delay_trace.recordTicks(@max(
+                handler_entry - batch.oldest_enqueue_timestamp,
+                0,
+            ));
+        state.bytes_read +|= @intCast(batch.byte_count);
+        state.bytes_parsed +|= @intCast(batch.byte_count);
+        state.maximum_ui_batch = @max(state.maximum_ui_batch, batch.byte_count);
+        state.continuation_count +|= @intFromBool(batch.continuation_required);
+        state.maximum_backlog = @max(
+            state.maximum_backlog,
+            process.outputDiagnostics().maximum_backlog,
+        );
+        if (batch.oldest_enqueue_timestamp != 0 and
+            (state.oldest_pending_output_timestamp == 0 or
+                batch.oldest_enqueue_timestamp < state.oldest_pending_output_timestamp))
+            state.oldest_pending_output_timestamp = batch.oldest_enqueue_timestamp;
+    }
 
     const changed = batch.chunks.items.len != 0;
     if (changed) {
@@ -3158,6 +3318,12 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
             beginWindowClose(window);
             return;
         };
+    }
+
+    if (batch.continuation_required and !process.postOutputContinuation()) {
+        std.log.err("posting the bounded ConPTY output continuation failed", .{});
+        _ = process.beginClosing();
+        return;
     }
 
     if (batch.failure) |failure| {
@@ -3222,20 +3388,24 @@ fn finishMultiSessionIntegration(window: foundation.HWND) void {
 }
 
 fn logDebugCounters() void {
-    // Window shutdown clears model_initialized before this deferred diagnostic
-    // writer runs. The model and render cache remain owned by Application until
-    // the surrounding scope finishes, so do not use that lifecycle flag here.
-    if (builtin.mode != .Debug or active_mode != .normal or !render_cache_initialized)
-        return;
-    const terminal_counts = model.diagnostics();
-    const cache_counts = render_cache.diagnostics();
-    const renderer_counts = active_renderer.diagnostics();
+    if (!frame_trace.enabled or active_mode != .normal) return;
+    const application = active_application orelse return;
+    var captured: ?PerformanceSnapshot = null;
+    for (application.windows.items) |state| if (state.performance_snapshot) |snapshot| {
+        captured = snapshot;
+        break;
+    };
+    const snapshot = captured orelse return;
+    const terminal_counts = snapshot.terminal;
+    const cache_counts = snapshot.cache;
+    const renderer_counts = snapshot.renderer;
     std.log.info(
         "performance counters: batches={d} chunks={d} refreshes={d} core_resizes={d} " ++
-            "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} layout_pool_hits={d} layout_pool_evictions={d} " ++
+            "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} shaped_layout_cache_hits={d} shaped_layout_cache_evictions={d} " ++
             "rectangle_requests={d} rectangle_commands={d} " ++
             "frames_requested={d} frames_presented={d} " ++
-            "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d}",
+            "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d} " ++
+            "direct_glyph_cells={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
         .{
             terminal_counts.output_batches,
             terminal_counts.chunks_parsed,
@@ -3255,10 +3425,14 @@ fn logDebugCounters() void {
             renderer_counts.frames_presented,
             renderer_counts.gpu_present_count,
             renderer_counts.gpu_recreation_count,
-            resize_message_count,
+            snapshot.resize_messages,
             renderer_counts.surface_resize_count,
             renderer_counts.scene_recreation_count,
             renderer_counts.scene_redraw_count,
+            renderer_counts.direct_glyph_cells,
+            renderer_counts.cursor_overlay_draws,
+            renderer_counts.cursor_only_frames,
+            cache_counts.unchanged_dirty_rows_skipped,
         },
     );
     const trace_file = kernel32.CreateFileW(
@@ -3275,10 +3449,11 @@ fn logDebugCounters() void {
         writeTraceLine(
             trace_file,
             "performance counters: batches={d} chunks={d} refreshes={d} core_resizes={d} " ++
-                "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} layout_pool_hits={d} layout_pool_evictions={d} " ++
+                "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} shaped_layout_cache_hits={d} shaped_layout_cache_evictions={d} " ++
                 "rectangle_requests={d} rectangle_commands={d} " ++
                 "frames_requested={d} frames_presented={d} " ++
-                "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d}",
+                "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d} " ++
+                "direct_glyph_cells={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
             .{
                 terminal_counts.output_batches,
                 terminal_counts.chunks_parsed,
@@ -3298,13 +3473,22 @@ fn logDebugCounters() void {
                 renderer_counts.frames_presented,
                 renderer_counts.gpu_present_count,
                 renderer_counts.gpu_recreation_count,
-                resize_message_count,
+                snapshot.resize_messages,
                 renderer_counts.surface_resize_count,
                 renderer_counts.scene_recreation_count,
                 renderer_counts.scene_redraw_count,
+                renderer_counts.direct_glyph_cells,
+                renderer_counts.cursor_overlay_draws,
+                renderer_counts.cursor_only_frames,
+                cache_counts.unchanged_dirty_rows_skipped,
             },
         );
-        writeFrameTrace(trace_file, "output", output_trace.snapshot());
+        writeTraceLine(
+            trace_file,
+            "output bytes: read={d} parsed={d} max_backlog={d} continuations={d} max_ui_batch={d}",
+            .{ snapshot.bytes_read, snapshot.bytes_parsed, snapshot.maximum_backlog, snapshot.continuation_count, snapshot.maximum_ui_batch },
+        );
+        writeFrameTrace(trace_file, "output", snapshot.output_trace);
         writeFrameTrace(trace_file, "parse", terminal_counts.parse_trace);
         writeFrameTrace(
             trace_file,
@@ -3313,8 +3497,11 @@ fn logDebugCounters() void {
         );
         writeFrameTrace(trace_file, "damage", terminal_counts.damage_trace);
         writeFrameTrace(trace_file, "core_resize", terminal_counts.resize_trace);
-        writeFrameTrace(trace_file, "paint", paint_trace.snapshot());
-        writeFrameTrace(trace_file, "cache", cache_trace.snapshot());
+        writeFrameTrace(trace_file, "queue_delay", snapshot.queue_delay_trace);
+        writeFrameTrace(trace_file, "frame_delay", snapshot.frame_delay_trace);
+        writeFrameTrace(trace_file, "output_to_present", snapshot.output_to_present_trace);
+        writeFrameTrace(trace_file, "paint", snapshot.paint_trace);
+        writeFrameTrace(trace_file, "cache", snapshot.cache_trace);
         writeFrameTrace(trace_file, "gpu", renderer_counts.gpu_paint_trace);
         writeFrameTrace(trace_file, "scene", renderer_counts.scene_trace);
         writeFrameTrace(trace_file, "layout", renderer_counts.layout_trace);
@@ -3322,13 +3509,16 @@ fn logDebugCounters() void {
         writeFrameTrace(trace_file, "present", renderer_counts.present_trace);
         writeFrameTrace(trace_file, "surface_resize", renderer_counts.surface_resize_trace);
     }
-    logFrameTrace("output", output_trace.snapshot());
+    logFrameTrace("output", snapshot.output_trace);
     logFrameTrace("parse", terminal_counts.parse_trace);
     logFrameTrace("render_state", terminal_counts.render_state_trace);
     logFrameTrace("damage", terminal_counts.damage_trace);
     logFrameTrace("core_resize", terminal_counts.resize_trace);
-    logFrameTrace("paint", paint_trace.snapshot());
-    logFrameTrace("cache", cache_trace.snapshot());
+    logFrameTrace("queue_delay", snapshot.queue_delay_trace);
+    logFrameTrace("frame_delay", snapshot.frame_delay_trace);
+    logFrameTrace("output_to_present", snapshot.output_to_present_trace);
+    logFrameTrace("paint", snapshot.paint_trace);
+    logFrameTrace("cache", snapshot.cache_trace);
     logFrameTrace("gpu", renderer_counts.gpu_paint_trace);
     logFrameTrace("scene", renderer_counts.scene_trace);
     logFrameTrace("layout", renderer_counts.layout_trace);
@@ -3373,16 +3563,30 @@ fn writeTraceLine(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    var buffer: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, format ++ "\r\n", args) catch return;
-    var written: u32 = 0;
-    _ = kernel32.WriteFile(
-        file,
-        line.ptr,
-        @intCast(line.len),
-        &written,
-        null,
-    );
+    const line = std.fmt.allocPrint(
+        std.heap.smp_allocator,
+        format ++ "\r\n",
+        args,
+    ) catch |err| {
+        std.log.err("formatting the frame trace failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer std.heap.smp_allocator.free(line);
+    var offset: usize = 0;
+    while (offset < line.len) {
+        var written: u32 = 0;
+        if (kernel32.WriteFile(
+            file,
+            line.ptr + offset,
+            @intCast(@min(line.len - offset, std.math.maxInt(u32))),
+            &written,
+            null,
+        ) == 0 or written == 0) {
+            std.log.err("writing the frame trace failed", .{});
+            return;
+        }
+        offset += written;
+    }
 }
 
 fn applyOutputBatch(window: foundation.HWND, chunks: []const []const u8) !void {
@@ -3410,12 +3614,7 @@ fn applyOutputBatchForSession(
 }
 
 fn scheduleOutputFrame(window: foundation.HWND) void {
-    if (output_frame_pending) return;
-    output_frame_pending = true;
-    if (user32.SetTimer(window, output_frame_timer_id, output_frame_interval_ms, null) == 0) {
-        output_frame_pending = false;
-        invalidateRenderDamage(window);
-    }
+    invalidateRenderDamage(window);
 }
 
 fn applyTerminalEffectsForSession(window: foundation.HWND, session: *workspace.TerminalSession) void {
@@ -3446,8 +3645,7 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     const initial = active_renderer.diagnostics();
     if (initial.frames_requested != before_initial.frames_requested + 1 or
         initial.frames_presented != before_initial.frames_presented + 1 or
-        initial.gpu_present_count != before_initial.gpu_present_count + 1 or
-        initial.layout_build_count == 0)
+        initial.gpu_present_count != before_initial.gpu_present_count + 1)
         return error.InitialGpuPaintDiagnosticsMismatch;
 
     try paintForTesting(window);
@@ -3566,7 +3764,7 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         after_selection.layout_build_count)
         return error.SelectionClearRebuiltLayout;
 
-    const clean_row_generation = active_renderer.layoutGenerationForTesting(2) orelse
+    const clean_row_generation = active_renderer.textPlanGenerationForTesting(2) orelse
         return error.RowLayoutGenerationUnavailable;
     const chunks = [_][]const u8{
         "\x1b[2;1Hphase-",
@@ -3578,10 +3776,62 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     const after_batch = active_renderer.diagnostics();
     if (after_batch.gpu_present_count != before_batch.gpu_present_count + 1)
         return error.OutputBatchPresentedMoreThanOnce;
-    if (after_batch.layout_build_count != before_batch.layout_build_count + 1)
+    if (after_batch.layout_build_count != before_batch.layout_build_count)
         return error.DirtyRowLayoutRebuildWasNotProportional;
-    if (active_renderer.layoutGenerationForTesting(2) != clean_row_generation)
+    if (active_renderer.textPlanGenerationForTesting(2) != clean_row_generation)
         return error.CleanRowLayoutGenerationChanged;
+
+    // Warm a viewport made entirely of primary-font glyphs (including box
+    // drawing), then mutate one cell in every row for several frames. No
+    // DirectWrite layout should be constructed for these changes.
+    var sequence_buffer: [64]u8 = undefined;
+    for (0..model.rows()) |row_index| {
+        const sequence = try std.fmt.bufPrint(
+            &sequence_buffer,
+            "\x1b[{d};1HASCII-{s}",
+            .{ row_index + 1, "─" },
+        );
+        try model.write(sequence);
+    }
+    try paintForTesting(window);
+    const before_direct_mutations = active_renderer.diagnostics();
+    for (0..3) |frame| {
+        for (0..model.rows()) |row_index| {
+            const sequence = try std.fmt.bufPrint(
+                &sequence_buffer,
+                "\x1b[{d};2H{c}",
+                .{ row_index + 1, @as(u8, @intCast('a' + frame)) },
+            );
+            try model.write(sequence);
+        }
+        try paintForTesting(window);
+    }
+    const after_direct_mutations = active_renderer.diagnostics();
+    if (after_direct_mutations.gpu_present_count != before_direct_mutations.gpu_present_count + 3 or
+        after_direct_mutations.direct_glyph_cells <= before_direct_mutations.direct_glyph_cells or
+        after_direct_mutations.layout_build_count != before_direct_mutations.layout_build_count)
+        return error.DirectGlyphMutationBuiltLayout;
+
+    // Identical combining spans in separate rows share one shaped cache key.
+    // Editing the neighboring direct glyph does not disturb that key; editing
+    // the complex span introduces exactly one new key.
+    try model.write("\x1b[1;1HAe\xcc\x81\x1b[2;1HBe\xcc\x81");
+    const before_mixed_warm = active_renderer.diagnostics();
+    try paintForTesting(window);
+    const after_mixed_warm = active_renderer.diagnostics();
+    if (after_mixed_warm.layout_build_count != before_mixed_warm.layout_build_count + 1 or
+        after_mixed_warm.layout_pool_hits <= before_mixed_warm.layout_pool_hits)
+        return error.IdenticalComplexSpansDidNotShareLayout;
+    try model.write("\x1b[1;1HC");
+    try paintForTesting(window);
+    const after_direct_neighbor = active_renderer.diagnostics();
+    if (after_direct_neighbor.layout_build_count != after_mixed_warm.layout_build_count)
+        return error.DirectNeighborRebuiltComplexSpan;
+    try model.write("\x1b[1;2Ha\xcc\x81");
+    try paintForTesting(window);
+    if (active_renderer.diagnostics().layout_build_count !=
+        after_direct_neighbor.layout_build_count + 1)
+        return error.ComplexMutationDidNotBuildOneLayout;
 
     for (0..3) |iteration| {
         _ = user32.SendMessageW(window, wm.WM_SIZE, wm.SIZE_MINIMIZED, 0);
@@ -3627,9 +3877,8 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     const before_dpi_paint = active_renderer.diagnostics();
     try paintForTesting(window);
     const after_dpi_paint = active_renderer.diagnostics();
-    if (after_dpi_paint.layout_build_count <=
-        before_dpi_paint.layout_build_count)
-        return error.DpiChangeDidNotRebuildLayouts;
+    if (after_dpi_paint.gpu_present_count != before_dpi_paint.gpu_present_count + 1)
+        return error.DpiChangeDidNotPresent;
 
     var frequency: foundation.LARGE_INTEGER = undefined;
     var scroll_start: foundation.LARGE_INTEGER = undefined;
@@ -3659,13 +3908,32 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     if (scroll_milliseconds > 3_000)
         return error.DebugScrollingNotResponsive;
 
+    // Thousands of coalesced cursor movements must remain overlay-only after
+    // the retained rows and DirectWrite layouts are warm.
+    const cursor_fixture = ("\x1b[2;2H\x1b[3;3H" ** 1000) ++ "\x1b[4;5H";
+    const before_cursor_cache = render_cache.diagnostics();
+    const before_cursor = active_renderer.diagnostics();
+    try model.write(cursor_fixture);
+    try paintForTesting(window);
+    const after_cursor_cache = render_cache.diagnostics();
+    const after_cursor = active_renderer.diagnostics();
+    if (model.cursor().row != 3 or model.cursor().column != 4)
+        return error.CursorFixturePositionMismatch;
+    if (after_cursor_cache.rebuilt_rows != before_cursor_cache.rebuilt_rows or
+        after_cursor.layout_build_count != before_cursor.layout_build_count or
+        after_cursor.scene_redraw_count != before_cursor.scene_redraw_count or
+        after_cursor.cursor_only_frames != before_cursor.cursor_only_frames + 1 or
+        after_cursor.cursor_overlay_draws != before_cursor.cursor_overlay_draws + 1)
+        return error.CursorFixtureRebuiltRetainedContent;
+
     const before_loss = active_renderer.diagnostics();
     if (!active_renderer.simulateDeviceLossForTesting())
         return error.GpuRendererUnavailable;
     try paintForTesting(window);
     const after_loss = active_renderer.diagnostics();
     if (after_loss.gpu_recreation_count != before_loss.gpu_recreation_count + 1 or
-        after_loss.gpu_present_count != before_loss.gpu_present_count + 1)
+        after_loss.gpu_present_count != before_loss.gpu_present_count + 1 or
+        after_loss.scene_redraw_count == 0)
         return error.DeviceLossRecoveryDiagnosticsMismatch;
 }
 
@@ -3679,7 +3947,6 @@ fn paintForTesting(window: foundation.HWND) !void {
 
 fn isSmokeMode(mode: Mode) bool {
     return mode == .smoke or
-        mode == .smoke_gdi or
         mode == .smoke_phase5 or
         mode == .smoke_tabs or
         mode == .smoke_shortcuts or

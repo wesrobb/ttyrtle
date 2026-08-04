@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const frame_trace_override = b.option(bool, "frame-trace", "Enable frame and performance tracing");
     const test_filter = b.option([]const u8, "test-filter", "Run only integration tests whose names contain this text");
 
     if (target.result.os.tag != .windows or target.result.cpu.arch != .x86_64)
@@ -13,6 +14,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .smoke_test = false,
+        .frame_trace = frame_trace_override orelse (optimize == .Debug),
     });
     b.installArtifact(exe);
     installBundledFonts(b, exe);
@@ -28,7 +30,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/test_root.zig"),
             .target = target,
             .optimize = .Debug,
-            .include_win32 = false,
+            .include_win32 = true,
+            .frame_trace = true,
         }),
         .use_llvm = true,
     });
@@ -42,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
         .ghostty_optimize = .ReleaseSafe,
         .include_win32 = true,
+        .frame_trace = true,
     });
     const app_tests = b.addTest(.{
         .name = "app-tests",
@@ -84,6 +88,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .Debug,
         .smoke_test = true,
+        .frame_trace = true,
     });
     installBundledFonts(b, smoke_exe);
     const run_smoke = b.addRunArtifact(smoke_exe);
@@ -98,12 +103,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .Debug,
         .smoke_test = false,
+        .frame_trace = frame_trace_override orelse true,
     });
     const check_release = addExecutable(b, .{
         .name = "ttyrtle-check-release",
         .target = target,
         .optimize = .ReleaseFast,
         .smoke_test = false,
+        .frame_trace = frame_trace_override orelse false,
     });
     const check_step = b.step("check", "Compile Debug and ReleaseFast");
     check_step.dependOn(&check_debug.step);
@@ -141,6 +148,7 @@ const ExecutableOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     smoke_test: bool,
+    frame_trace: bool,
 };
 
 fn addExecutable(
@@ -158,10 +166,9 @@ fn addExecutable(
         else
             options.optimize,
         .include_win32 = true,
+        .frame_trace = options.frame_trace,
+        .smoke_test = options.smoke_test,
     });
-    const build_options = b.addOptions();
-    build_options.addOption(bool, "smoke_test", options.smoke_test);
-    root_module.addOptions("build_options", build_options);
 
     const exe = b.addExecutable(.{
         .name = options.name,
@@ -178,6 +185,8 @@ const ModuleOptions = struct {
     optimize: std.builtin.OptimizeMode,
     ghostty_optimize: ?std.builtin.OptimizeMode = null,
     include_win32: bool,
+    frame_trace: bool,
+    smoke_test: bool = false,
 };
 
 fn createModule(
@@ -189,6 +198,10 @@ fn createModule(
         .target = options.target,
         .optimize = options.optimize,
     });
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "smoke_test", options.smoke_test);
+    build_options.addOption(bool, "frame_trace", options.frame_trace);
+    module.addOptions("build_options", build_options);
 
     const ghostty = b.dependency("ghostty", .{
         .target = options.target,

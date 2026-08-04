@@ -12,10 +12,6 @@ test "GPU renderer caches layouts and recovers across Phase 5 lifecycles" {
     try app.run(.smoke_phase5);
 }
 
-test "hidden window retains the GDI fallback path" {
-    try app.run(.smoke_gdi);
-}
-
 test "native tab control mirrors the active workspace tab" {
     try app.run(.smoke_tabs);
 }

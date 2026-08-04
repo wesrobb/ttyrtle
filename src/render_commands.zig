@@ -1,7 +1,7 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const geometry = @import("geometry.zig");
 const terminal = @import("terminal.zig");
+const frame_trace = @import("frame_trace.zig");
 
 pub const TextRun = struct {
     x: i32,
@@ -25,7 +25,18 @@ pub const CellMetadata = struct {
     utf16_len: usize,
     spacer: bool,
     selected: bool,
-    cursor: bool,
+};
+
+pub const CursorOverlay = struct {
+    visible: bool = false,
+    row: u32 = 0,
+    column: u32 = 0,
+    style: terminal.CursorStyle = .block,
+    color: terminal.Rgb = .{ .red = 0, .green = 0, .blue = 0 },
+    bounds: Rectangle = .{ .left = 0, .top = 0, .right = 0, .bottom = 0, .color = .{ .red = 0, .green = 0, .blue = 0 } },
+    underlying_background: terminal.Rgb = .{ .red = 0, .green = 0, .blue = 0 },
+    glyph_text_start: usize = 0,
+    glyph_text_len: usize = 0,
 };
 
 /// One complete terminal grapheme in the row shaping buffer.
@@ -41,8 +52,8 @@ pub const CachedRow = struct {
     fingerprint: u64 = 0,
     shape_fingerprint: u64 = 0,
     /// Number of terminal columns represented by the DirectWrite payload.
-    /// Cells and rectangles retain the full viewport so blank selection and
-    /// cursor geometry is never lost.
+    /// Cells and rectangles retain the full viewport so blank selection
+    /// geometry is never lost.
     shaped_columns: u16 = 0,
     utf16: std.ArrayListUnmanaged(u16) = .empty,
     utf16_to_cell: std.ArrayListUnmanaged(u16) = .empty,
@@ -88,7 +99,7 @@ pub const CachedRow = struct {
     }
 };
 
-const counters_enabled = builtin.mode == .Debug or builtin.is_test;
+const counters_enabled = frame_trace.enabled;
 
 pub const RenderCache = struct {
     pub const Diagnostics = struct {
@@ -99,12 +110,15 @@ pub const RenderCache = struct {
         full_rebuilds: u64,
         rectangle_requests: u64,
         rectangle_commands: u64,
+        unchanged_dirty_rows_skipped: u64,
     };
     allocator: std.mem.Allocator,
     background: terminal.Rgb = .{ .red = 12, .green = 16, .blue = 20 },
     rows: std.ArrayListUnmanaged(CachedRow) = .empty,
     columns: u16 = 0,
     metrics: ?geometry.Metrics = null,
+    cursor_overlay: CursorOverlay = .{},
+    effective_rows: std.ArrayListUnmanaged(u16) = .empty,
     /// Positive means the terminal viewport scrolled upward by this many rows
     /// during the most recent full-damage update.
     scroll_up_rows: u16 = 0,
@@ -118,6 +132,7 @@ pub const RenderCache = struct {
     scroll_reuse_count: if (counters_enabled) u64 else void,
     scroll_reused_row_count: if (counters_enabled) u64 else void,
     full_rebuild_count: if (counters_enabled) u64 else void,
+    unchanged_dirty_row_count: if (counters_enabled) u64 else void,
 
     pub fn init(allocator: std.mem.Allocator) RenderCache {
         return .{
@@ -129,12 +144,14 @@ pub const RenderCache = struct {
             .scroll_reuse_count = if (counters_enabled) 0 else {},
             .scroll_reused_row_count = if (counters_enabled) 0 else {},
             .full_rebuild_count = if (counters_enabled) 0 else {},
+            .unchanged_dirty_row_count = if (counters_enabled) 0 else {},
         };
     }
 
     pub fn deinit(self: *RenderCache) void {
         for (self.rows.items) |*row| row.deinit(self.allocator);
         self.rows.deinit(self.allocator);
+        self.effective_rows.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -146,6 +163,17 @@ pub const RenderCache = struct {
         metrics: geometry.Metrics,
         damage: terminal.RenderDamage,
     ) !void {
+        _ = try self.updateEffective(model, metrics, damage);
+    }
+
+    pub fn updateEffective(
+        self: *RenderCache,
+        model: *const terminal.TerminalModel,
+        metrics: geometry.Metrics,
+        damage: terminal.RenderDamage,
+    ) !terminal.RenderDamage {
+        self.effective_rows.clearRetainingCapacity();
+        defer self.updateCursorOverlay(model, metrics);
         const dimensions_changed =
             self.rows.items.len != model.rows() or self.columns != model.columns();
         const metrics_changed = self.metrics == null or
@@ -161,10 +189,10 @@ pub const RenderCache = struct {
             try self.rebuildAll(model, metrics);
             self.recordDirtyRows(self.rows.items.len);
             if (counters_enabled) self.full_rebuild_count +|= 1;
-            return;
+            return .{ .rows = .full, .cursor = damage.cursor };
         }
 
-        switch (damage) {
+        switch (damage.rows) {
             .none => {},
             .full => {
                 if (!try self.reuseScrolledRows(model, metrics)) {
@@ -172,6 +200,7 @@ pub const RenderCache = struct {
                     self.recordDirtyRows(self.rows.items.len);
                     if (counters_enabled) self.full_rebuild_count +|= 1;
                 }
+                return .{ .rows = .full, .cursor = damage.cursor };
             },
             .partial => |dirty_rows| {
                 // Ghostty commonly marks every row except one as dirty for a
@@ -180,19 +209,29 @@ pub const RenderCache = struct {
                 if (dirty_rows.len * 4 >= self.rows.items.len * 3 and
                     try self.reuseScrolledRows(model, metrics))
                 {
-                    return;
+                    return .{ .rows = .full, .cursor = damage.cursor };
                 } else {
-                    var accepted: usize = 0;
                     for (dirty_rows) |row| {
                         if (row < self.rows.items.len) {
+                            if (self.rows.items[row].fingerprint == model.rowFingerprint(row)) {
+                                if (counters_enabled) self.unchanged_dirty_row_count +|= 1;
+                                continue;
+                            }
                             try self.rebuildRow(model, metrics, row);
-                            accepted += 1;
+                            try self.effective_rows.append(self.allocator, row);
                         }
                     }
-                    self.recordDirtyRows(accepted);
+                    self.recordDirtyRows(self.effective_rows.items.len);
                 }
             },
         }
+        return .{
+            .rows = if (self.effective_rows.items.len == 0)
+                .none
+            else
+                .{ .partial = self.effective_rows.items },
+            .cursor = damage.cursor,
+        };
     }
 
     pub fn diagnostics(self: *const RenderCache) Diagnostics {
@@ -204,6 +243,7 @@ pub const RenderCache = struct {
             .full_rebuilds = 0,
             .rectangle_requests = 0,
             .rectangle_commands = 0,
+            .unchanged_dirty_rows_skipped = 0,
         };
         return .{
             .dirty_rows = self.dirty_row_count,
@@ -214,6 +254,7 @@ pub const RenderCache = struct {
             .rectangle_requests = self.rectangle_request_count,
             .rectangle_commands = self.rectangle_request_count -
                 self.rectangle_merge_count,
+            .unchanged_dirty_rows_skipped = self.unchanged_dirty_row_count,
         };
     }
 
@@ -252,17 +293,6 @@ pub const RenderCache = struct {
         try self.rebuildRowWithCount(model, metrics, row_index, true);
     }
 
-    /// Rebuild a row whose cached geometry depends on the cursor, without
-    /// counting it as content damage in the scroll-reuse diagnostics.
-    fn refreshCursorRow(
-        self: *RenderCache,
-        model: *const terminal.TerminalModel,
-        metrics: geometry.Metrics,
-        row_index: u16,
-    ) !void {
-        try self.rebuildRowWithCount(model, metrics, row_index, false);
-    }
-
     fn rebuildRowWithCount(
         self: *RenderCache,
         model: *const terminal.TerminalModel,
@@ -273,7 +303,6 @@ pub const RenderCache = struct {
         const row = &self.rows.items[row_index];
         row.clearRetainingCapacity();
         row.shaped_columns = 0;
-        const cursor = model.cursor();
         var active_run: ?usize = null;
 
         for (0..model.columns()) |column| {
@@ -292,7 +321,6 @@ pub const RenderCache = struct {
                     .utf16_len = 1,
                     .spacer = false,
                     .selected = false,
-                    .cursor = false,
                 });
                 continue;
             };
@@ -322,15 +350,6 @@ pub const RenderCache = struct {
                 });
             }
 
-            const cursor_here = cursor.visible and
-                cursor.row == row_index and cursor.column == column;
-            if (cursor_here) try self.appendCursor(
-                row,
-                cursor,
-                x,
-                y,
-                metrics,
-            );
             if (cell.underline) {
                 try self.appendRectangle(row, .{
                     .left = x,
@@ -348,10 +367,7 @@ pub const RenderCache = struct {
             if (cell.spacer) {
                 active_run = null;
             } else if (cell.codepoint) |codepoint| {
-                const text_color = if (cursor_here and cursor.style == .block)
-                    cell_background
-                else
-                    cell_foreground;
+                const text_color = cell_foreground;
                 if (active_run == null or
                     !std.meta.eql(row.text_runs.items[active_run.?].color, text_color))
                 {
@@ -403,7 +419,6 @@ pub const RenderCache = struct {
                 .utf16_len = row.utf16.items.len - text_start,
                 .spacer = cell.spacer,
                 .selected = cell.selected,
-                .cursor = cursor_here,
             });
         }
         row.generation +%= 1;
@@ -466,12 +481,6 @@ pub const RenderCache = struct {
         }
     }
 
-    fn rowHasCursor(row: *const CachedRow) bool {
-        for (row.cells.items) |cell|
-            if (cell.cursor) return true;
-        return false;
-    }
-
     fn reuseScrolledRows(
         self: *RenderCache,
         model: *const terminal.TerminalModel,
@@ -495,14 +504,6 @@ pub const RenderCache = struct {
         const delta_y: i32 = -@as(i32, @intCast(rows * metrics.cell_height));
         for (self.rows.items[0..start]) |*row| rebaseRowGeometry(row, delta_y);
 
-        // Retained rows still contain absolute drawing commands and the prior
-        // cursor marker. Rebuild only the rows affected by cursor movement;
-        // all other rows retain their rebased geometry.
-        const cursor = model.cursor();
-        for (self.rows.items[0..start], 0..) |*row, index| {
-            if (rowHasCursor(row) or (cursor.visible and cursor.row == index))
-                try self.refreshCursorRow(model, metrics, @intCast(index));
-        }
         for (start..self.rows.items.len) |row|
             try self.rebuildRow(model, metrics, @intCast(row));
         self.scroll_up_rows = @intCast(rows);
@@ -524,11 +525,6 @@ pub const RenderCache = struct {
         const delta_y: i32 = @intCast(rows * metrics.cell_height);
         for (self.rows.items[rows..]) |*row| rebaseRowGeometry(row, delta_y);
 
-        const cursor = model.cursor();
-        for (self.rows.items[rows..], rows..) |*row, index| {
-            if (rowHasCursor(row) or (cursor.visible and cursor.row == index))
-                try self.refreshCursorRow(model, metrics, @intCast(index));
-        }
         for (0..rows) |row|
             try self.rebuildRow(model, metrics, @intCast(row));
         self.scroll_down_rows = @intCast(rows);
@@ -562,47 +558,35 @@ pub const RenderCache = struct {
         try row.rectangles.append(self.allocator, rectangle);
     }
 
-    fn appendCursor(
-        self: *RenderCache,
-        row: *CachedRow,
-        cursor: terminal.Cursor,
-        x: i32,
-        y: i32,
-        metrics: geometry.Metrics,
-    ) !void {
-        const width: i32 = @intCast(metrics.cell_width);
-        const height: i32 = @intCast(metrics.cell_height);
-        try self.appendRectangle(row, switch (cursor.style) {
-            .block => .{
+    fn updateCursorOverlay(self: *RenderCache, model: *const terminal.TerminalModel, metrics: geometry.Metrics) void {
+        const cursor = model.cursor();
+        self.cursor_overlay = .{};
+        if (!cursor.visible or cursor.row >= self.rows.items.len or cursor.column >= self.columns) return;
+        const cell = model.cell(cursor.row, cursor.column) orelse return;
+        const row = &self.rows.items[cursor.row];
+        if (cursor.column >= row.cells.items.len) return;
+        const x: i32 = @intCast(metrics.margin_x + cursor.column * metrics.cell_width);
+        const y: i32 = @intCast(metrics.margin_y + cursor.row * metrics.cell_height);
+        var metadata = row.cells.items[cursor.column];
+        if (metadata.spacer and cursor.column != 0)
+            metadata = row.cells.items[cursor.column - 1];
+        self.cursor_overlay = .{
+            .visible = true,
+            .row = cursor.row,
+            .column = cursor.column,
+            .style = cursor.style,
+            .color = cursor.color,
+            .bounds = .{
                 .left = x,
                 .top = y,
-                .right = x + width,
-                .bottom = y + height,
+                .right = x + @as(i32, @intCast(metrics.cell_width)),
+                .bottom = y + @as(i32, @intCast(metrics.cell_height)),
                 .color = cursor.color,
             },
-            .block_hollow => .{
-                .left = x,
-                .top = y,
-                .right = x + width,
-                .bottom = y + height,
-                .color = cursor.color,
-                .outline = true,
-            },
-            .bar => .{
-                .left = x,
-                .top = y,
-                .right = x + @max(1, @divTrunc(width, 6)),
-                .bottom = y + height,
-                .color = cursor.color,
-            },
-            .underline => .{
-                .left = x,
-                .top = y + height - @max(1, @divTrunc(height, 8)),
-                .right = x + width,
-                .bottom = y + height,
-                .color = cursor.color,
-            },
-        });
+            .underlying_background = if (cell.selected) cell.foreground else cell.background,
+            .glyph_text_start = metadata.utf16_start,
+            .glyph_text_len = metadata.utf16_len,
+        };
     }
 };
 
@@ -697,8 +681,51 @@ test "cache rebuilds only dirty rows" {
     try std.testing.expect(cache.rows.items[2].generation > generations[2]);
     try std.testing.expectEqual(generations[3], cache.rows.items[3].generation);
     const after = cache.diagnostics();
-    try std.testing.expectEqual(before.dirty_rows + 2, after.dirty_rows);
-    try std.testing.expectEqual(before.rebuilt_rows + 2, after.rebuilt_rows);
+    try std.testing.expectEqual(before.dirty_rows + 1, after.dirty_rows);
+    try std.testing.expectEqual(before.rebuilt_rows + 1, after.rebuilt_rows);
+}
+
+test "cache filters unchanged dirty rows" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 2, 10);
+    defer model.deinit();
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    const before = cache.diagnostics();
+    const unchanged = [_]u16{0};
+    const effective = try cache.updateEffective(&model, metrics, .{
+        .rows = .{ .partial = &unchanged },
+    });
+    try std.testing.expect(effective.rows == .none);
+    try std.testing.expectEqual(
+        before.unchanged_dirty_rows_skipped + 1,
+        cache.diagnostics().unchanged_dirty_rows_skipped,
+    );
+}
+
+test "cursor-only cache updates preserve rows and layouts inputs" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 3, 10);
+    defer model.deinit();
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    model.acknowledgeDamage();
+    const generation = cache.rows.items[0].generation;
+    const fingerprint = cache.rows.items[0].fingerprint;
+    const before = cache.diagnostics();
+    model.render_state.cursor.blinking = true;
+    model.toggleCursorBlink();
+
+    const effective = try cache.updateEffective(&model, metrics, model.damage());
+    try std.testing.expect(effective.rows == .none);
+    try std.testing.expect(effective.cursor);
+    try std.testing.expectEqual(generation, cache.rows.items[0].generation);
+    try std.testing.expectEqual(fingerprint, cache.rows.items[0].fingerprint);
+    try std.testing.expectEqual(before.rebuilt_rows, cache.diagnostics().rebuilt_rows);
 }
 
 test "cache reuses retained rows when live output scrolls a full viewport" {
@@ -715,7 +742,7 @@ test "cache reuses retained rows when live output scrolls a full viewport" {
     const old_second_generation = cache.rows.items[1].generation;
 
     try model.write("\r\nfour");
-    try std.testing.expect(model.damage() == .full);
+    try std.testing.expect(model.damage().rows == .full);
     try cache.update(&model, metrics, model.damage());
 
     try std.testing.expectEqual(@as(u16, 1), cache.scroll_up_rows);
@@ -773,7 +800,7 @@ test "reused scroll rows update absolute drawing coordinates" {
     }
 }
 
-test "scroll reuse leaves exactly one cursor at the model cursor" {
+test "scroll reuse updates the cursor overlay without row cursor state" {
     var model: terminal.TerminalModel = undefined;
     try model.init(std.testing.allocator, 4, 20);
     defer model.deinit();
@@ -787,15 +814,10 @@ test "scroll reuse leaves exactly one cursor at the model cursor" {
     try model.write("\r\nfour");
     try cache.update(&model, metrics, model.damage());
 
-    var cursor_count: usize = 0;
-    for (cache.rows.items) |row| {
-        for (row.cells.items) |cell| {
-            cursor_count += @intFromBool(cell.cursor);
-        }
-    }
     const cursor = model.cursor();
-    try std.testing.expect(cache.rows.items[cursor.row].cells.items[cursor.column].cursor);
-    try std.testing.expectEqual(@as(usize, 1), cursor_count);
+    try std.testing.expect(cache.cursor_overlay.visible);
+    try std.testing.expectEqual(cursor.row, cache.cursor_overlay.row);
+    try std.testing.expectEqual(cursor.column, cache.cursor_overlay.column);
 }
 
 test "cache reuses retained rows for a coalesced multi-line scroll burst" {
@@ -904,7 +926,7 @@ test "cache retains UTF-16 cell mapping and combining graphemes" {
     try std.testing.expectEqual(@as(usize, 2), row.cells.items[1].utf16_len);
 }
 
-test "cache preserves wide selection inverse underline and cursor metadata" {
+test "cache preserves wide selection inverse underline and cursor overlay" {
     var model: terminal.TerminalModel = undefined;
     try model.init(std.testing.allocator, 2, 12);
     defer model.deinit();
@@ -922,12 +944,12 @@ test "cache preserves wide selection inverse underline and cursor metadata" {
     try std.testing.expect(row.cells.items[0].selected);
     try std.testing.expect(!row.cells.items[1].selected);
     try std.testing.expect(row.cells.items[3].spacer);
-    try std.testing.expect(row.cells.items[4].cursor);
+    try std.testing.expect(cache.cursor_overlay.visible);
+    try std.testing.expectEqual(@as(u32, 4), cache.cursor_overlay.column);
     const inverse = model.cell(0, 1).?;
     const inverse_x: i32 = @intCast(metrics.margin_x + metrics.cell_width);
     var found_inverse_background = false;
     var found_underline = false;
-    var found_cursor = false;
     for (row.rectangles.items) |rectangle| {
         if (rectangle.left <= inverse_x and rectangle.right > inverse_x and
             std.meta.eql(rectangle.color, inverse.background))
@@ -935,14 +957,9 @@ test "cache preserves wide selection inverse underline and cursor metadata" {
         if (rectangle.left == inverse_x and
             rectangle.bottom - rectangle.top == metrics.underline_thickness)
             found_underline = true;
-        if (rectangle.left ==
-            @as(i32, @intCast(metrics.margin_x + 4 * metrics.cell_width)) and
-            std.meta.eql(rectangle.color, model.cursor().color))
-            found_cursor = true;
     }
     try std.testing.expect(found_inverse_background);
     try std.testing.expect(found_underline);
-    try std.testing.expect(found_cursor);
 }
 
 test "selection changes visual fingerprint without changing row shape" {

@@ -296,8 +296,16 @@ pub const Session = struct {
         allocator.destroy(self);
     }
 
-    pub fn drainOutput(self: *Session) output_queue.Batch {
-        return self.output.drain();
+    pub fn drainOutput(self: *Session) !output_queue.Batch {
+        return self.output.drainUpTo(output_queue.ui_batch_bytes);
+    }
+
+    pub fn postOutputContinuation(self: *Session) bool {
+        return self.postOutputMessage();
+    }
+
+    pub fn outputDiagnostics(self: *Session) output_queue.Diagnostics {
+        return self.output.diagnostics();
     }
 
     /// Takes ownership of bytes encoded by the UI thread.
@@ -339,6 +347,20 @@ pub const Session = struct {
     /// Requests the single teardown path. The first caller owns the state
     /// transition; later child, window, and worker notifications are no-ops.
     pub fn beginClosing(self: *Session) bool {
+        // The normal close path means the UI consumer is gone or going away.
+        // Reject and discard output even if a child-exit path already changed
+        // the lifecycle state.
+        self.output.abandon();
+        return self.beginClosingPreservingOutput();
+    }
+
+    /// A child exit must close the pseudoconsole to produce output EOF, while
+    /// retaining its final bytes for the still-live UI consumer.
+    pub fn beginClosingAfterChildExit(self: *Session) bool {
+        return self.beginClosingPreservingOutput();
+    }
+
+    fn beginClosingPreservingOutput(self: *Session) bool {
         var current = self.state.load(.acquire);
         while (true) {
             switch (current) {
@@ -433,7 +455,8 @@ pub const Session = struct {
             }
             if (bytes_read == 0) break;
 
-            const should_post = self.output.push(buffer[0..bytes_read]) catch {
+            const should_post = self.output.push(buffer[0..bytes_read]) catch |err| {
+                if (err == error.Closed) break;
                 if (failure == null) {
                     failure = .out_of_memory;
                     std.log.err("queuing ConPTY output ran out of memory", .{});
@@ -451,6 +474,9 @@ pub const Session = struct {
                         .post_message = code,
                     };
                 }
+                self.markFailed();
+                _ = self.beginClosing();
+                break;
             }
         }
 

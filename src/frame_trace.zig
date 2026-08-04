@@ -1,10 +1,11 @@
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const win32 = @import("win32");
 
 const foundation = win32.foundation;
 const kernel32 = win32.kernel32;
 
-pub const enabled = builtin.mode == .Debug and !builtin.is_test;
+pub const enabled = build_options.frame_trace or builtin.is_test;
 
 pub const Stats = struct {
     samples: u64 = 0,
@@ -22,7 +23,11 @@ pub const Counter = struct {
 
     pub fn recordSince(self: *Counter, start: i64) void {
         if (!enabled) return;
-        const elapsed = @max(timestamp() - start, 0);
+        self.recordTicks(@max(timestamp() - start, 0));
+    }
+
+    pub fn recordTicks(self: *Counter, elapsed: i64) void {
+        if (!enabled) return;
         self.stats.samples +|= 1;
         self.stats.total_ticks +|= elapsed;
         self.stats.max_ticks = @max(self.stats.max_ticks, elapsed);
@@ -47,5 +52,21 @@ pub fn ticksToMicroseconds(ticks: i64) i64 {
     if (kernel32.QueryPerformanceFrequency(&frequency) == 0 or
         frequency.QuadPart <= 0)
         return 0;
-    return @divTrunc(ticks * 1_000_000, frequency.QuadPart);
+    return ticksToMicrosecondsAtFrequency(ticks, frequency.QuadPart);
+}
+
+pub fn ticksToMicrosecondsAtFrequency(ticks: i64, frequency: i64) i64 {
+    if (ticks <= 0 or frequency <= 0) return 0;
+    const scaled: i128 = @as(i128, ticks) * 1_000_000;
+    const result = @divTrunc(scaled, @as(i128, frequency));
+    return @intCast(@min(result, std.math.maxInt(i64)));
+}
+
+const std = @import("std");
+
+test "tick conversion uses widened arithmetic" {
+    try std.testing.expectEqual(
+        std.math.maxInt(i64),
+        ticksToMicrosecondsAtFrequency(std.math.maxInt(i64), 1),
+    );
 }

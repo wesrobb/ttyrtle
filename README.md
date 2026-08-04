@@ -20,12 +20,13 @@ A deliberately small native Windows terminal prototype:
 
 Normal mode launches `pwsh.exe`, feeds its UTF-8/VT output through the Ghostty
 terminal model, and paints retained dirty rows with Direct2D/DirectWrite on a
-DXGI swap chain. Hardware D3D11 is preferred, WARP is the software GPU fallback,
-and GDI remains available if GPU creation or recovery fails. The UI remains
-responsive while the output reader blocks on an idle shell. Keyboard input is
-encoded on the UI thread from the active Ghostty terminal modes, then written
-to ConPTY by a dedicated worker so a blocked child cannot stall painting or
-output.
+DXGI swap chain. This is the only rendering backend. Hardware D3D11 is
+preferred and WARP is the software device fallback. If both device paths fail,
+ttyrtle reports a native error and closes only the affected window. The UI
+remains responsive while the output reader blocks on an idle shell. Keyboard
+input is encoded on the UI thread from the active Ghostty terminal modes, then
+written to ConPTY by a dedicated worker so a blocked child cannot stall
+painting or output.
 
 Ghostty-generated replies use the same ordered ConPTY input queue as keyboard
 input. Device attributes, cursor and mode reports, terminal size reports, and
@@ -81,6 +82,7 @@ Using Zig 0.16:
 ```powershell
 zig build
 zig build run
+zig build -Doptimize=ReleaseFast -Dframe-trace=true run
 ```
 
 ttyrtle currently targets 64-bit x86 Windows. Per-Monitor V2 DPI awareness is
@@ -106,8 +108,9 @@ The smoke path requests a paint synchronously and then exits through the normal
 interaction. On normal Debug-session shutdown, diagnostics report aggregated
 output batches/chunks, Ghostty refreshes, dirty and rebuilt rows, DirectWrite
 layout rebuilds, requested and presented frames, GPU presents, and device
-recreations. The counter storage and increments are omitted from optimized
-builds. The integration path launches finite ConPTY children, verifies
+recreations. Tracing defaults on in Debug and off in optimized builds; the
+`-Dframe-trace=true` option enables the same counters in ReleaseFast. The
+integration path launches finite ConPTY children, verifies
 known truecolor VT output and queued Unicode input in the Ghostty model,
 confirms reader teardown, requires a hosted process to observe an exact
 window-driven terminal resize, and exercises multiple inactive sessions,

@@ -9,4 +9,5 @@ test {
     _ = @import("session_lifecycle.zig");
     _ = @import("workspace.zig");
     _ = @import("renderer/resource_cache.zig");
+    _ = @import("renderer/text_plan.zig");
 }

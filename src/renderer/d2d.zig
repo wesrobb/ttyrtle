@@ -1,11 +1,11 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const win32 = @import("win32");
 const frame_trace = @import("../frame_trace.zig");
 const geometry = @import("../geometry.zig");
 const render_commands = @import("../render_commands.zig");
 const terminal = @import("../terminal.zig");
 const resource_cache = @import("resource_cache.zig");
+const text_plan = @import("text_plan.zig");
 
 const foundation = win32.foundation;
 const d2d = win32.graphics.direct2d;
@@ -23,13 +23,37 @@ const nerd_font_relative_path = std.unicode.utf8ToUtf16LeStringLiteral(
 );
 const locale_name = std.unicode.utf8ToUtf16LeStringLiteral("en-US");
 const max_brushes = 64;
+const max_shaped_layouts = 512;
+const max_glyph_indices = 4096;
 const max_orphan_layouts = 128;
-const counters_enabled = builtin.mode == .Debug or builtin.is_test;
+const ascii_first = 0x20;
+const ascii_count = 0x7f - ascii_first;
+const counters_enabled = frame_trace.enabled;
 
 const BrushEntry = struct {
     brush: *d2d.ID2D1SolidColorBrush,
 };
 
+const ShapedLayout = struct {
+    hash: u64,
+    font_generation: u64,
+    layout_width: u32,
+    layout_height: u32,
+    text: []u16,
+    cell_widths: []u8,
+    layout: *dwrite.IDWriteTextLayout,
+    last_used: u64,
+
+    fn deinit(self: *ShapedLayout) void {
+        release(self.layout);
+        std.heap.smp_allocator.free(self.text);
+        std.heap.smp_allocator.free(self.cell_widths);
+        self.* = undefined;
+    }
+};
+
+// Kept temporarily as a zero-ownership compatibility shell for the old helper
+// functions below; the active renderer stores TextPlans instead.
 const RowLayouts = struct {
     row_generation: u64 = 0,
     font_generation: u64 = 0,
@@ -37,20 +61,12 @@ const RowLayouts = struct {
     shape_fingerprint: u64 = 0,
     layout_width: u32 = 0,
     layout: ?*dwrite.IDWriteTextLayout = null,
-
     fn clear(self: *RowLayouts) void {
         if (self.layout) |layout| release(layout);
-        self.layout = null;
-        self.row_generation = 0;
-        self.font_generation = 0;
-        self.content_fingerprint = 0;
-        self.shape_fingerprint = 0;
-        self.layout_width = 0;
+        self.* = .{};
     }
-
     fn deinit(self: *RowLayouts) void {
         self.clear();
-        self.* = undefined;
     }
 };
 
@@ -65,6 +81,11 @@ pub const DeviceResources = struct {
     d2d_context: *d2d.ID2D1DeviceContext,
     dwrite_factory: *dwrite.IDWriteFactory,
     dwrite_factory2: *dwrite.IDWriteFactory2,
+    primary_font_face: *dwrite.IDWriteFontFace,
+    glyph_index_cache: text_plan.GlyphIndexCache(max_glyph_indices),
+    ascii_glyph_indices: [ascii_count:0]u16,
+    glyph_index_scratch: std.ArrayListUnmanaged(u16),
+    glyph_advance_scratch: std.ArrayListUnmanaged(f32),
     font_fallback: *dwrite.IDWriteFontFallback,
     typography: *dwrite.IDWriteTypography,
     target_bitmap: ?*d2d.ID2D1Bitmap1,
@@ -81,10 +102,10 @@ pub const DeviceResources = struct {
     text_format: ?*dwrite.IDWriteTextFormat,
     font_state: resource_cache.FontState,
     font_generation: u64,
+    text_plans: std.ArrayListUnmanaged(text_plan.TextPlan),
+    shaped_layouts: std.ArrayListUnmanaged(ShapedLayout),
+    shaped_use_clock: u64,
     row_layouts: std.ArrayListUnmanaged(RowLayouts),
-    /// Bounded ownership pool for layouts displaced by viewport/grid changes.
-    /// Layouts are position independent; drawing effects are reapplied after a
-    /// layout is exclusively taken from this pool.
     orphan_layouts: std.ArrayListUnmanaged(RowLayouts),
     layout_pool_hit_count: if (counters_enabled) u64 else void,
     layout_pool_evict_count: if (counters_enabled) u64 else void,
@@ -98,6 +119,9 @@ pub const DeviceResources = struct {
     surface_resize_count: if (counters_enabled) u64 else void,
     scene_recreation_count: if (counters_enabled) u64 else void,
     scene_redraw_count: if (counters_enabled) u64 else void,
+    cursor_overlay_draw_count: if (counters_enabled) u64 else void,
+    cursor_only_frame_count: if (counters_enabled) u64 else void,
+    direct_glyph_cell_count: if (counters_enabled) u64 else void,
     brushes: [max_brushes]BrushEntry,
     brush_slots: resource_cache.KeySlots(max_brushes),
     simulate_device_loss: bool,
@@ -124,8 +148,14 @@ pub const DeviceResources = struct {
         resources.text_format = null;
         resources.font_state = .{};
         resources.font_generation = 0;
+        resources.text_plans = .empty;
+        resources.shaped_layouts = .empty;
+        resources.shaped_use_clock = 0;
+        resources.glyph_index_cache = .{};
         resources.row_layouts = .empty;
         resources.orphan_layouts = .empty;
+        resources.glyph_index_scratch = .empty;
+        resources.glyph_advance_scratch = .empty;
         resources.layout_pool_hit_count = if (counters_enabled) 0 else {};
         resources.layout_pool_evict_count = if (counters_enabled) 0 else {};
         resources.layout_build_count = if (counters_enabled) 0 else {};
@@ -138,6 +168,9 @@ pub const DeviceResources = struct {
         resources.surface_resize_count = if (counters_enabled) 0 else {};
         resources.scene_recreation_count = if (counters_enabled) 0 else {};
         resources.scene_redraw_count = if (counters_enabled) 0 else {};
+        resources.cursor_overlay_draw_count = if (counters_enabled) 0 else {};
+        resources.cursor_only_frame_count = if (counters_enabled) 0 else {};
+        resources.direct_glyph_cell_count = if (counters_enabled) 0 else {};
         resources.brush_slots = .{};
         resources.simulate_device_loss = false;
 
@@ -249,6 +282,8 @@ pub const DeviceResources = struct {
         ).failed) return error.CreateDWriteFactoryFailed;
         resources.dwrite_factory = @ptrCast(@alignCast(dwrite_raw));
         errdefer release(resources.dwrite_factory);
+        resources.primary_font_face = try createPrimaryFontFace(resources.dwrite_factory);
+        errdefer release(resources.primary_font_face);
         resources.dwrite_factory2 = try queryInterface(
             dwrite.IDWriteFactory2,
             resources.dwrite_factory,
@@ -314,42 +349,14 @@ pub const DeviceResources = struct {
     }
 
     pub fn metricsForDpi(self: *DeviceResources, dpi: u32) !geometry.Metrics {
-        var collection: *dwrite.IDWriteFontCollection = undefined;
-        if (self.dwrite_factory.GetSystemFontCollection(
-            &collection,
-            0,
-        ).failed) return error.GetSystemFontCollectionFailed;
-        defer release(collection);
-        var family_index: u32 = 0;
-        var family_exists: i32 = 0;
-        if (collection.FindFamilyName(
-            terminal_font_name,
-            &family_index,
-            &family_exists,
-        ).failed or family_exists == 0) return error.PrimaryFontUnavailable;
-        var family: *dwrite.IDWriteFontFamily = undefined;
-        if (collection.GetFontFamily(family_index, &family).failed)
-            return error.GetFontFamilyFailed;
-        defer release(family);
-        var font: *dwrite.IDWriteFont = undefined;
-        if (family.GetFirstMatchingFont(
-            .NORMAL,
-            .NORMAL,
-            .NORMAL,
-            &font,
-        ).failed) return error.GetFontFailed;
-        defer release(font);
-        var face: *dwrite.IDWriteFontFace = undefined;
-        if (font.CreateFontFace(&face).failed) return error.CreateFontFaceFailed;
-        defer release(face);
         var font_metrics: dwrite.DWRITE_FONT_METRICS = undefined;
-        face.GetMetrics(&font_metrics);
+        self.primary_font_face.GetMetrics(&font_metrics);
         const code_points = [_]u32{'0'};
         var glyph_indices: [1:0]u16 = undefined;
-        if (face.GetGlyphIndices(&code_points, 1, &glyph_indices).failed)
+        if (self.primary_font_face.GetGlyphIndices(&code_points, 1, &glyph_indices).failed)
             return error.GetGlyphIndicesFailed;
         var glyph_metrics: [1]dwrite.DWRITE_GLYPH_METRICS = undefined;
-        if (face.GetDesignGlyphMetrics(
+        if (self.primary_font_face.GetDesignGlyphMetrics(
             &glyph_indices,
             1,
             &glyph_metrics,
@@ -381,30 +388,33 @@ pub const DeviceResources = struct {
         }
         if (self.target_bitmap == null)
             return error.TargetUnavailable;
+        if (counters_enabled and damage.cursor and damage.rows == .none)
+            self.cursor_only_frame_count +|= 1;
 
         _ = try self.ensureTextFormat(metrics, dpi);
-        try self.resizeRowLayouts(cache.rows.items.len);
-        self.rotateRowLayoutsUp(cache.scroll_up_rows);
-        self.rotateRowLayoutsDown(cache.scroll_down_rows);
+        try self.resizeTextPlans(cache.rows.items.len);
+        self.rotateTextPlansUp(cache.scroll_up_rows);
+        self.rotateTextPlansDown(cache.scroll_down_rows);
         try self.ensureSceneBitmap(cache, metrics, dpi);
         if (!self.scene_valid) {
             try self.drawScene(cache, .full, metrics, dpi);
-        } else switch (damage) {
+        } else switch (damage.rows) {
             .none => {},
-            else => try self.drawScene(cache, damage, metrics, dpi),
+            else => try self.drawScene(cache, damage.rows, metrics, dpi),
         }
-        try self.presentScene(cache.background);
+        try self.presentScene(cache);
     }
 
     pub fn deinit(self: *DeviceResources) void {
         self.releaseTargetResources();
-        self.releaseRowLayouts();
+        self.releaseTextResources();
         self.releaseBrushes();
         if (self.text_format) |format| release(format);
         self.text_format = null;
         release(self.typography);
         release(self.font_fallback);
         release(self.dwrite_factory2);
+        release(self.primary_font_face);
         release(self.dwrite_factory);
         release(self.d2d_context);
         release(self.d2d_device);
@@ -425,8 +435,7 @@ pub const DeviceResources = struct {
     /// local to a terminal model, so a tab switch must discard them as well.
     pub fn invalidateTerminalContent(self: *DeviceResources) void {
         self.scene_valid = false;
-        for (self.row_layouts.items) |*layouts| layouts.clear();
-        self.clearOrphanLayouts();
+        self.clearTextPlans();
     }
 
     pub fn simulateDeviceLossForTesting(self: *DeviceResources) void {
@@ -523,7 +532,7 @@ pub const DeviceResources = struct {
     fn drawScene(
         self: *DeviceResources,
         cache: *const render_commands.RenderCache,
-        damage: terminal.RenderDamage,
+        damage: terminal.RowDamage,
         metrics: geometry.Metrics,
         dpi: u32,
     ) !void {
@@ -622,25 +631,326 @@ pub const DeviceResources = struct {
             }
         }
 
-        const layouts = try self.ensureRowLayouts(row_index, row, metrics, dpi);
-        const layout = layouts.layout orelse return;
-        const default_brush = try self.getBrush(.{
-            .red = 255,
-            .green = 255,
-            .blue = 255,
-        });
-        target.DrawTextLayout(
-            .{
-                .x = @as(f32, @floatFromInt(metrics.margin_x)) * scale,
-                .y = @as(f32, @floatFromInt(
-                    metrics.margin_y +
-                        @as(u32, @intCast(row_index)) * metrics.cell_height,
-                )) * scale,
-            },
-            layout,
-            @ptrCast(default_brush),
-            .{ .CLIP = 1, .ENABLE_COLOR_FONT = 1 },
+        const plan = try self.ensureTextPlan(row_index, row);
+        for (plan.spans.items) |span| switch (span.kind) {
+            .direct_glyph => try self.drawDirectGlyph(row_index, row, span, metrics, dpi, null),
+            .shaped => try self.drawShapedSpan(row_index, row, span, metrics, dpi, null),
+        };
+    }
+
+    fn glyphResolver(raw: *anyopaque, scalar: u21) !u16 {
+        const self: *DeviceResources = @ptrCast(@alignCast(raw));
+        return self.glyph_index_cache.getOrResolve(
+            std.heap.smp_allocator,
+            scalar,
+            .{ .context = self, .resolveFn = resolveUncachedGlyph },
         );
+    }
+
+    fn resolveUncachedGlyph(raw: *anyopaque, scalar: u21) !u16 {
+        const self: *DeviceResources = @ptrCast(@alignCast(raw));
+        const codepoints = [_]u32{scalar};
+        var indices: [1:0]u16 = undefined;
+        if (self.primary_font_face.GetGlyphIndices(&codepoints, 1, &indices).failed)
+            return error.GetGlyphIndicesFailed;
+        return indices[0];
+    }
+
+    fn ensureTextPlan(
+        self: *DeviceResources,
+        row_index: usize,
+        row: *const render_commands.CachedRow,
+    ) !*text_plan.TextPlan {
+        const plan = &self.text_plans.items[row_index];
+        if (plan.row_generation == row.generation and
+            plan.font_generation == self.font_generation)
+            return plan;
+        try text_plan.build(
+            plan,
+            std.heap.smp_allocator,
+            row.utf16.items[0..render_commands.shapedUtf16Length(row)],
+            row.graphemes.items,
+            row.generation,
+            self.font_generation,
+            .{ .context = self, .resolveFn = glyphResolver },
+        );
+        return plan;
+    }
+
+    fn colorAt(row: *const render_commands.CachedRow, text_position: usize) terminal.Rgb {
+        for (row.text_runs.items) |run| {
+            if (text_position >= run.text_start and text_position < run.text_start + run.text_len)
+                return run.color;
+        }
+        return .{ .red = 255, .green = 255, .blue = 255 };
+    }
+
+    fn drawDirectGlyph(
+        self: *DeviceResources,
+        row_index: usize,
+        row: *const render_commands.CachedRow,
+        span: text_plan.Span,
+        metrics: geometry.Metrics,
+        dpi: u32,
+        override_color: ?terminal.Rgb,
+    ) !void {
+        if (counters_enabled) self.direct_glyph_cell_count +|= span.cell_count;
+        const scale = dipScale(dpi);
+        const indices = [_]u16{span.glyph_index};
+        const advances = [_]f32{@as(f32, @floatFromInt(
+            @as(u32, span.cell_count) * metrics.cell_width,
+        )) * scale};
+        const brush = try self.getBrush(override_color orelse colorAt(row, span.utf16_start));
+        const run: dwrite.DWRITE_GLYPH_RUN = .{
+            .fontFace = self.primary_font_face,
+            .fontEmSize = 16.0,
+            .glyphCount = 1,
+            .glyphIndices = &indices[0],
+            .glyphAdvances = &advances[0],
+            .glyphOffsets = null,
+            .isSideways = 0,
+            .bidiLevel = 0,
+        };
+        self.d2d_context.ID2D1RenderTarget.DrawGlyphRun(
+            .{
+                .x = @as(f32, @floatFromInt(metrics.margin_x +
+                    @as(u32, span.cell_start) * metrics.cell_width)) * scale,
+                .y = @as(f32, @floatFromInt(metrics.margin_y +
+                    @as(u32, @intCast(row_index)) * metrics.cell_height + metrics.baseline)) * scale,
+            },
+            &run,
+            @ptrCast(brush),
+            .NATURAL,
+        );
+    }
+
+    fn spanCellWidths(
+        row: *const render_commands.CachedRow,
+        span: text_plan.Span,
+        output: *std.ArrayListUnmanaged(u8),
+    ) !void {
+        output.clearRetainingCapacity();
+        for (row.graphemes.items) |grapheme| {
+            if (grapheme.text_start < span.utf16_start) continue;
+            if (grapheme.text_start >= span.utf16_start + span.utf16_len) break;
+            try output.append(std.heap.smp_allocator, grapheme.cell_count);
+        }
+    }
+
+    fn shapedLayout(
+        self: *DeviceResources,
+        row: *const render_commands.CachedRow,
+        span: text_plan.Span,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !*ShapedLayout {
+        var widths: std.ArrayListUnmanaged(u8) = .empty;
+        defer widths.deinit(std.heap.smp_allocator);
+        try spanCellWidths(row, span, &widths);
+        const text = row.utf16.items[span.utf16_start .. span.utf16_start + span.utf16_len];
+        const layout_width = @as(u32, span.cell_count) * metrics.cell_width;
+        const hash = text_plan.fingerprint(text, &.{span.grid_width});
+        self.shaped_use_clock +%= 1;
+        const requested_key: text_plan.ShapedKeyView = .{
+            .hash = hash,
+            .font_generation = self.font_generation,
+            .layout_width = layout_width,
+            .layout_height = metrics.cell_height,
+            .text = text,
+            .cell_widths = widths.items,
+        };
+        for (self.shaped_layouts.items) |*entry| {
+            const entry_key: text_plan.ShapedKeyView = .{
+                .hash = entry.hash,
+                .font_generation = entry.font_generation,
+                .layout_width = entry.layout_width,
+                .layout_height = entry.layout_height,
+                .text = entry.text,
+                .cell_widths = entry.cell_widths,
+            };
+            if (entry_key.eql(requested_key)) {
+                entry.last_used = self.shaped_use_clock;
+                if (counters_enabled) self.layout_pool_hit_count +|= 1;
+                return entry;
+            }
+        }
+
+        if (self.shaped_layouts.items.len == max_shaped_layouts) {
+            var timestamps: [max_shaped_layouts]u64 = undefined;
+            for (self.shaped_layouts.items, 0..) |entry, index| timestamps[index] = entry.last_used;
+            const oldest = text_plan.leastRecentlyUsed(timestamps[0..self.shaped_layouts.items.len]).?;
+            self.shaped_layouts.items[oldest].deinit();
+            _ = self.shaped_layouts.swapRemove(oldest);
+            if (counters_enabled) self.layout_pool_evict_count +|= 1;
+        }
+
+        const trace_start = frame_trace.timestamp();
+        defer self.layout_trace.recordSince(trace_start);
+        const format = self.text_format orelse return error.TextFormatUnavailable;
+        const scale = dipScale(dpi);
+        var layout: *dwrite.IDWriteTextLayout = undefined;
+        if (self.dwrite_factory.CreateTextLayout(
+            @ptrCast(text.ptr),
+            @intCast(text.len),
+            format,
+            @max(1.0, @as(f32, @floatFromInt(layout_width)) * scale),
+            @as(f32, @floatFromInt(metrics.cell_height)) * scale,
+            &layout,
+        ).failed) return error.CreateTextLayoutFailed;
+        errdefer release(layout);
+        const full_range: dwrite.DWRITE_TEXT_RANGE = .{ .startPosition = 0, .length = @intCast(text.len) };
+        if (layout.SetTypography(self.typography, full_range).failed)
+            return error.ConfigureTextLayoutFailed;
+        const layout1 = try queryInterface(dwrite.IDWriteTextLayout1, layout, dwrite.IID_IDWriteTextLayout1);
+        defer release(layout1);
+        if (layout1.SetPairKerning(0, full_range).failed)
+            return error.ConfigureTextLayoutFailed;
+        var local_start: usize = 0;
+        var width_index: usize = 0;
+        for (row.graphemes.items) |grapheme| {
+            if (grapheme.text_start < span.utf16_start) continue;
+            if (grapheme.text_start >= span.utf16_start + span.utf16_len) break;
+            const measurement = try measureTextRange(layout, @intCast(local_start), @intCast(grapheme.text_len));
+            const grid_advance = @as(f32, @floatFromInt(
+                @as(u32, widths.items[width_index]) * metrics.cell_width,
+            )) * scale;
+            if (layout1.SetCharacterSpacing(0, (grid_advance - measurement.advance) /
+                @as(f32, @floatFromInt(measurement.hit_count)), 0, .{
+                .startPosition = @intCast(local_start),
+                .length = @intCast(grapheme.text_len),
+            }).failed) return error.ConfigureTextLayoutFailed;
+            local_start += grapheme.text_len;
+            width_index += 1;
+        }
+        const owned_text = try std.heap.smp_allocator.dupe(u16, text);
+        errdefer std.heap.smp_allocator.free(owned_text);
+        const owned_widths = try std.heap.smp_allocator.dupe(u8, widths.items);
+        errdefer std.heap.smp_allocator.free(owned_widths);
+        try self.shaped_layouts.append(std.heap.smp_allocator, .{
+            .hash = hash,
+            .font_generation = self.font_generation,
+            .layout_width = layout_width,
+            .layout_height = metrics.cell_height,
+            .text = owned_text,
+            .cell_widths = owned_widths,
+            .layout = layout,
+            .last_used = self.shaped_use_clock,
+        });
+        if (counters_enabled) self.layout_build_count +|= 1;
+        return &self.shaped_layouts.items[self.shaped_layouts.items.len - 1];
+    }
+
+    fn applySpanDrawingEffects(
+        self: *DeviceResources,
+        layout: *dwrite.IDWriteTextLayout,
+        row: *const render_commands.CachedRow,
+        span: text_plan.Span,
+    ) !void {
+        const full: dwrite.DWRITE_TEXT_RANGE = .{ .startPosition = 0, .length = @intCast(span.utf16_len) };
+        if (layout.SetDrawingEffect(null, full).failed) return error.ConfigureTextLayoutFailed;
+        const span_end = span.utf16_start + span.utf16_len;
+        for (row.text_runs.items) |run| {
+            const start = @max(run.text_start, span.utf16_start);
+            const end = @min(run.text_start + run.text_len, span_end);
+            if (start >= end) continue;
+            const brush = try self.getBrush(run.color);
+            if (layout.SetDrawingEffect(@ptrCast(&brush.IUnknown), .{
+                .startPosition = @intCast(start - span.utf16_start),
+                .length = @intCast(end - start),
+            }).failed) return error.ConfigureTextLayoutFailed;
+        }
+    }
+
+    fn drawShapedSpan(
+        self: *DeviceResources,
+        row_index: usize,
+        row: *const render_commands.CachedRow,
+        span: text_plan.Span,
+        metrics: geometry.Metrics,
+        dpi: u32,
+        override_color: ?terminal.Rgb,
+    ) !void {
+        const entry = try self.shapedLayout(row, span, metrics, dpi);
+        try self.applySpanDrawingEffects(entry.layout, row, span);
+        if (override_color) |color| {
+            const brush = try self.getBrush(color);
+            if (entry.layout.SetDrawingEffect(@ptrCast(&brush.IUnknown), .{
+                .startPosition = 0,
+                .length = @intCast(span.utf16_len),
+            }).failed) return error.ConfigureTextLayoutFailed;
+        }
+        const default_brush = try self.getBrush(.{ .red = 255, .green = 255, .blue = 255 });
+        const scale = dipScale(dpi);
+        self.d2d_context.ID2D1RenderTarget.DrawTextLayout(.{
+            .x = @as(f32, @floatFromInt(metrics.margin_x + @as(u32, span.cell_start) * metrics.cell_width)) * scale,
+            .y = @as(f32, @floatFromInt(metrics.margin_y + @as(u32, @intCast(row_index)) * metrics.cell_height)) * scale,
+        }, entry.layout, @ptrCast(default_brush), .{ .CLIP = 1, .ENABLE_COLOR_FONT = 1 });
+    }
+
+    fn drawAsciiRow(
+        self: *DeviceResources,
+        row_index: usize,
+        row: *const render_commands.CachedRow,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !void {
+        const layouts = &self.row_layouts.items[row_index];
+        if (layouts.layout != null) self.stashOrphan(layouts);
+        layouts.row_generation = row.generation;
+        layouts.font_generation = self.font_generation;
+        layouts.content_fingerprint = row.fingerprint;
+        layouts.shape_fingerprint = row.shape_fingerprint;
+        layouts.layout_width = metrics.cell_width * @as(u32, row.shaped_columns);
+        const text_length = render_commands.shapedUtf16Length(row);
+        if (text_length == 0) return;
+        try self.prepareAsciiGlyphs(row, text_length, metrics, dpi);
+        const target = &self.d2d_context.ID2D1RenderTarget;
+        const scale = dipScale(dpi);
+        for (row.text_runs.items) |text_run| {
+            if (text_run.text_start >= text_length) break;
+            const length = @min(text_run.text_len, text_length - text_run.text_start);
+            if (length == 0) continue;
+            const brush = try self.getBrush(text_run.color);
+            const glyph_run: dwrite.DWRITE_GLYPH_RUN = .{
+                .fontFace = self.primary_font_face,
+                .fontEmSize = 16.0,
+                .glyphCount = @intCast(length),
+                .glyphIndices = &self.glyph_index_scratch.items[text_run.text_start],
+                .glyphAdvances = &self.glyph_advance_scratch.items[text_run.text_start],
+                .glyphOffsets = null,
+                .isSideways = 0,
+                .bidiLevel = 0,
+            };
+            target.DrawGlyphRun(
+                .{
+                    .x = @as(f32, @floatFromInt(text_run.x)) * scale,
+                    .y = @as(f32, @floatFromInt(
+                        text_run.y + @as(i32, @intCast(metrics.baseline)),
+                    )) * scale,
+                },
+                &glyph_run,
+                @ptrCast(brush),
+                .NATURAL,
+            );
+        }
+    }
+
+    fn prepareAsciiGlyphs(
+        self: *DeviceResources,
+        row: *const render_commands.CachedRow,
+        text_length: usize,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) !void {
+        try self.glyph_index_scratch.resize(std.heap.smp_allocator, text_length);
+        try self.glyph_advance_scratch.resize(std.heap.smp_allocator, text_length);
+        const advance = @as(f32, @floatFromInt(metrics.cell_width)) * dipScale(dpi);
+        for (row.utf16.items[0..text_length], 0..) |code_unit, index| {
+            std.debug.assert(code_unit >= ascii_first and code_unit < ascii_first + ascii_count);
+            self.glyph_index_scratch.items[index] =
+                self.ascii_glyph_indices[code_unit - ascii_first];
+            self.glyph_advance_scratch.items[index] = advance;
+        }
     }
 
     fn resizeRowLayouts(self: *DeviceResources, row_count: usize) !void {
@@ -832,7 +1142,7 @@ pub const DeviceResources = struct {
         }
     }
 
-    fn presentScene(self: *DeviceResources, background_rgb: terminal.Rgb) !void {
+    fn presentScene(self: *DeviceResources, cache: *const render_commands.RenderCache) !void {
         const copy_start = frame_trace.timestamp();
         const target_bitmap = self.target_bitmap orelse
             return error.TargetUnavailable;
@@ -840,7 +1150,7 @@ pub const DeviceResources = struct {
         self.d2d_context.SetTarget(@ptrCast(target_bitmap));
         const target = &self.d2d_context.ID2D1RenderTarget;
         target.BeginDraw();
-        const background = toColor(background_rgb);
+        const background = toColor(cache.background);
         target.Clear(&background);
         // Do not rely on DrawBitmap's null-destination shorthand: after a
         // swap-chain resize it may round through DIPs and shift the terminal
@@ -866,6 +1176,7 @@ pub const DeviceResources = struct {
             d2d.D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
             &source,
         );
+        try self.drawCursorOverlay(cache);
         try checkDrawResult(target.EndDraw(null, null));
         self.copy_trace.recordSince(copy_start);
 
@@ -879,6 +1190,87 @@ pub const DeviceResources = struct {
         if (!result.failed) return;
         if (isDeviceLoss(result)) return error.DeviceLost;
         return error.PresentFailed;
+    }
+
+    fn drawCursorOverlay(
+        self: *DeviceResources,
+        cache: *const render_commands.RenderCache,
+    ) !void {
+        const overlay = cache.cursor_overlay;
+        if (!overlay.visible) return;
+        if (counters_enabled) self.cursor_overlay_draw_count +|= 1;
+        const metrics = cache.metrics orelse return;
+        const scale = dipScale(self.target_dpi);
+        var bounds: d2d_common.D2D_RECT_F = .{
+            .left = @as(f32, @floatFromInt(overlay.bounds.left)) * scale,
+            .top = @as(f32, @floatFromInt(overlay.bounds.top)) * scale,
+            .right = @as(f32, @floatFromInt(overlay.bounds.right)) * scale,
+            .bottom = @as(f32, @floatFromInt(overlay.bounds.bottom)) * scale,
+        };
+        const target = &self.d2d_context.ID2D1RenderTarget;
+        const cursor_brush = try self.getBrush(overlay.color);
+        switch (overlay.style) {
+            .block => {
+                target.FillRectangle(&bounds, @ptrCast(cursor_brush));
+                if (overlay.row >= self.text_plans.items.len or
+                    overlay.row >= cache.rows.items.len)
+                    return;
+                const row = &cache.rows.items[overlay.row];
+                const text_length = render_commands.shapedUtf16Length(row);
+                if (overlay.glyph_text_len == 0 or
+                    overlay.glyph_text_start >= text_length)
+                    return;
+                const background_brush = try self.getBrush(overlay.underlying_background);
+                const plan = &self.text_plans.items[overlay.row];
+                var containing: ?text_plan.Span = null;
+                for (plan.spans.items) |span| {
+                    if (overlay.glyph_text_start >= span.utf16_start and
+                        overlay.glyph_text_start < span.utf16_start + span.utf16_len)
+                    {
+                        containing = span;
+                        break;
+                    }
+                }
+                const span = containing orelse return;
+                target.PushAxisAlignedClip(&bounds, .ALIASED);
+                defer target.PopAxisAlignedClip();
+                if (span.kind == .direct_glyph) {
+                    try self.drawDirectGlyph(overlay.row, row, span, metrics, self.target_dpi, overlay.underlying_background);
+                    return;
+                }
+                const entry = try self.shapedLayout(row, span, metrics, self.target_dpi);
+                try self.applySpanDrawingEffects(entry.layout, row, span);
+                defer self.applySpanDrawingEffects(entry.layout, row, span) catch {};
+                const local_start = overlay.glyph_text_start - span.utf16_start;
+                const local_length = @min(overlay.glyph_text_len, span.utf16_len - local_start);
+                if (entry.layout.SetDrawingEffect(@ptrCast(&background_brush.IUnknown), .{
+                    .startPosition = @intCast(local_start),
+                    .length = @intCast(local_length),
+                }).failed) return error.ConfigureTextLayoutFailed;
+                target.DrawTextLayout(.{
+                    .x = @as(f32, @floatFromInt(metrics.margin_x + @as(u32, span.cell_start) * metrics.cell_width)) * scale,
+                    .y = @as(f32, @floatFromInt(metrics.margin_y + overlay.row * metrics.cell_height)) * scale,
+                }, entry.layout, @ptrCast(background_brush), .{ .CLIP = 1, .ENABLE_COLOR_FONT = 1 });
+            },
+            .block_hollow => target.DrawRectangle(
+                &bounds,
+                @ptrCast(cursor_brush),
+                scale,
+                null,
+            ),
+            .bar => {
+                bounds.right = bounds.left + @as(f32, @floatFromInt(
+                    @max(@as(u32, 1), @divTrunc(metrics.cell_width, 6)),
+                )) * scale;
+                target.FillRectangle(&bounds, @ptrCast(cursor_brush));
+            },
+            .underline => {
+                bounds.top = bounds.bottom - @as(f32, @floatFromInt(
+                    @max(@as(u32, 1), @divTrunc(metrics.cell_height, 8)),
+                )) * scale;
+                target.FillRectangle(&bounds, @ptrCast(cursor_brush));
+            },
+        }
     }
 
     fn ensureTextFormat(
@@ -927,8 +1319,8 @@ pub const DeviceResources = struct {
         self.font_state.commit(key);
         self.font_generation +%= 1;
         if (self.font_generation == 0) self.font_generation = 1;
-        self.clearRowLayouts();
-        self.clearOrphanLayouts();
+        self.clearTextPlans();
+        self.clearShapedLayouts();
         self.scene_valid = false;
         return replacement;
     }
@@ -960,6 +1352,53 @@ pub const DeviceResources = struct {
         for (self.brushes[0..self.brush_slots.count]) |entry|
             release(entry.brush);
         self.brush_slots = .{};
+    }
+
+    fn resizeTextPlans(self: *DeviceResources, row_count: usize) !void {
+        const old_length = self.text_plans.items.len;
+        if (row_count < old_length) {
+            for (self.text_plans.items[row_count..]) |*plan| plan.deinit(std.heap.smp_allocator);
+            self.text_plans.shrinkRetainingCapacity(row_count);
+        } else if (row_count > old_length) {
+            try self.text_plans.resize(std.heap.smp_allocator, row_count);
+            for (self.text_plans.items[old_length..]) |*plan| plan.* = .{};
+        }
+    }
+
+    fn rotateTextPlansUp(self: *DeviceResources, count: u16) void {
+        const rows = @min(@as(usize, count), self.text_plans.items.len);
+        for (0..rows) |_| {
+            const moved = self.text_plans.orderedRemove(0);
+            self.text_plans.appendAssumeCapacity(moved);
+        }
+    }
+
+    fn rotateTextPlansDown(self: *DeviceResources, count: u16) void {
+        const rows = @min(@as(usize, count), self.text_plans.items.len);
+        for (0..rows) |_| {
+            const moved = self.text_plans.pop().?;
+            self.text_plans.insertAssumeCapacity(0, moved);
+        }
+    }
+
+    fn clearTextPlans(self: *DeviceResources) void {
+        for (self.text_plans.items) |*plan| plan.clearRetainingCapacity();
+    }
+
+    fn clearShapedLayouts(self: *DeviceResources) void {
+        for (self.shaped_layouts.items) |*entry| entry.deinit();
+        self.shaped_layouts.clearRetainingCapacity();
+    }
+
+    fn releaseTextResources(self: *DeviceResources) void {
+        for (self.text_plans.items) |*plan| plan.deinit(std.heap.smp_allocator);
+        self.text_plans.deinit(std.heap.smp_allocator);
+        self.clearShapedLayouts();
+        self.shaped_layouts.deinit(std.heap.smp_allocator);
+        self.glyph_index_cache.deinit(std.heap.smp_allocator);
+        self.glyph_index_scratch.deinit(std.heap.smp_allocator);
+        self.glyph_advance_scratch.deinit(std.heap.smp_allocator);
+        self.releaseRowLayouts();
     }
 
     fn clearRowLayouts(self: *DeviceResources) void {
@@ -1177,6 +1616,31 @@ fn measureTextRange(
     var shaped_advance: f32 = 0;
     for (hit_metrics[0..hit_count]) |hit| shaped_advance += hit.width;
     return .{ .advance = shaped_advance, .hit_count = hit_count };
+}
+
+fn createPrimaryFontFace(factory: *dwrite.IDWriteFactory) !*dwrite.IDWriteFontFace {
+    var collection: *dwrite.IDWriteFontCollection = undefined;
+    if (factory.GetSystemFontCollection(&collection, 0).failed)
+        return error.GetSystemFontCollectionFailed;
+    defer release(collection);
+    var family_index: u32 = 0;
+    var family_exists: i32 = 0;
+    if (collection.FindFamilyName(
+        terminal_font_name,
+        &family_index,
+        &family_exists,
+    ).failed or family_exists == 0) return error.PrimaryFontUnavailable;
+    var family: *dwrite.IDWriteFontFamily = undefined;
+    if (collection.GetFontFamily(family_index, &family).failed)
+        return error.GetFontFamilyFailed;
+    defer release(family);
+    var font: *dwrite.IDWriteFont = undefined;
+    if (family.GetFirstMatchingFont(.NORMAL, .NORMAL, .NORMAL, &font).failed)
+        return error.GetFontFailed;
+    defer release(font);
+    var face: *dwrite.IDWriteFontFace = undefined;
+    if (font.CreateFontFace(&face).failed) return error.CreateFontFaceFailed;
+    return face;
 }
 
 fn checkDrawResult(result: win32.zig.HRESULT) !void {

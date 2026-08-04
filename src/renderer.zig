@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const win32 = @import("win32");
 const frame_trace = @import("frame_trace.zig");
 const geometry = @import("geometry.zig");
@@ -7,14 +6,11 @@ const render_commands = @import("render_commands.zig");
 const terminal = @import("terminal.zig");
 
 const d2d = @import("renderer/d2d.zig");
-const gdi = @import("renderer/gdi.zig");
 
 const foundation = win32.foundation;
-const graphics_gdi = win32.graphics.gdi;
-const counters_enabled = builtin.mode == .Debug or builtin.is_test;
+const counters_enabled = frame_trace.enabled;
 
 pub const Renderer = struct {
-    fallback: gdi.Renderer = .{},
     gpu: ?d2d.DeviceResources = null,
     window: ?foundation.HWND = null,
     frame_request_count: if (counters_enabled) u64 else void = if (counters_enabled) 0 else {},
@@ -42,27 +38,23 @@ pub const Renderer = struct {
         copy_trace: frame_trace.Stats,
         present_trace: frame_trace.Stats,
         surface_resize_trace: frame_trace.Stats,
+        cursor_overlay_draws: u64,
+        cursor_only_frames: u64,
+        direct_glyph_cells: u64,
     };
 
-    pub fn initialize(self: *Renderer, window: foundation.HWND) void {
+    pub fn initialize(self: *Renderer, window: foundation.HWND) !void {
         self.window = window;
-        self.gpu = d2d.DeviceResources.create(window) catch |err| {
-            // The GDI renderer remains usable when Direct3D is unavailable.
-            std.log.warn("GPU renderer initialization failed: {s}", .{
-                @errorName(err),
-            });
-            return;
-        };
+        self.gpu = try d2d.DeviceResources.create(window);
     }
 
     pub fn deinit(self: *Renderer) void {
         self.releaseGpu();
         self.window = null;
-        self.fallback.deinit();
     }
 
     pub fn metricsForDpi(self: *Renderer, dpi: u32) geometry.Metrics {
-        const resources = &(self.gpu orelse return .forDpi(dpi));
+        const resources = &(self.gpu orelse unreachable);
         return resources.metricsForDpi(dpi) catch |err| {
             std.log.warn("DirectWrite font metrics unavailable: {s}", .{
                 @errorName(err),
@@ -75,83 +67,35 @@ pub const Renderer = struct {
         width: u32,
         height: u32,
         dpi: u32,
-    ) bool {
-        const resources = &(self.gpu orelse return false);
-        return resources.resizeTarget(width, height, dpi) catch |err| {
-            std.log.warn("GPU target recreation failed: {s}", .{
-                @errorName(err),
-            });
-            self.recreateGpu(width, height, dpi);
+    ) !bool {
+        const resources = &(self.gpu orelse return error.RendererUnavailable);
+        return resources.resizeTarget(width, height, dpi) catch {
+            try self.recreateGpu(width, height, dpi);
             return true;
         };
     }
 
     pub fn paint(
         self: *Renderer,
-        window_dc: graphics_gdi.HDC,
-        paint_rect: foundation.RECT,
-        client_rect: foundation.RECT,
         cache: *const render_commands.RenderCache,
         damage: terminal.RenderDamage,
         metrics: geometry.Metrics,
         dpi: u32,
-    ) bool {
-        if (self.gpu) |*resources| {
-            resources.paint(cache, damage, metrics, dpi) catch |err| {
-                std.log.warn("GPU paint failed: {s}", .{@errorName(err)});
-                const width: u32 = @intCast(@max(
-                    client_rect.right - client_rect.left,
-                    0,
-                ));
-                const height: u32 = @intCast(@max(
-                    client_rect.bottom - client_rect.top,
-                    0,
-                ));
-                self.recreateGpu(width, height, dpi);
-                if (self.gpu) |*replacement| {
-                    replacement.paint(
-                        cache,
-                        .full,
-                        metrics,
-                        dpi,
-                    ) catch |retry_err| {
-                        std.log.warn("GPU recovery paint failed: {s}", .{
-                            @errorName(retry_err),
-                        });
-                        if (counters_enabled) self.retired_layout_build_count +|=
-                            replacement.layout_build_count;
-                        replacement.deinit();
-                        self.gpu = null;
-                    };
-                    if (self.gpu != null) {
-                        if (counters_enabled) {
-                            self.gpu_present_count +|= 1;
-                            self.frame_presented_count +|= 1;
-                        }
-                        return true;
-                    }
-                }
-            };
-            if (self.gpu != null) {
-                if (counters_enabled) {
-                    self.gpu_present_count +|= 1;
-                    self.frame_presented_count +|= 1;
-                }
-                return true;
-            }
+    ) !bool {
+        const resources = &(self.gpu orelse return error.RendererUnavailable);
+        resources.paint(cache, damage, metrics, dpi) catch {
+            const width = resources.target_width;
+            const height = resources.target_height;
+            try self.recreateGpu(width, height, dpi);
+            const replacement = &(self.gpu orelse return error.RendererUnavailable);
+            replacement.invalidateTerminalContent();
+            try replacement.paint(cache, .{ .rows = .full, .cursor = true }, metrics, dpi);
+        };
+        if (counters_enabled) {
+            self.gpu_present_count +|= 1;
+            self.frame_presented_count +|= 1;
         }
-
-        const presented = self.fallback.paint(
-            window_dc,
-            paint_rect,
-            client_rect,
-            cache,
-            damage,
-            metrics,
-            dpi,
-        );
-        if (counters_enabled and presented) self.frame_presented_count +|= 1;
-        return presented;
+        return true;
     }
 
     pub fn requestFrame(self: *Renderer) void {
@@ -182,6 +126,9 @@ pub const Renderer = struct {
             .copy_trace = .{},
             .present_trace = .{},
             .surface_resize_trace = .{},
+            .cursor_overlay_draws = 0,
+            .cursor_only_frames = 0,
+            .direct_glyph_cells = 0,
         };
         const gpu_traces = if (self.gpu) |*resources| .{
             resources.paint_trace.snapshot(),
@@ -218,13 +165,16 @@ pub const Renderer = struct {
             .copy_trace = gpu_traces[3],
             .present_trace = gpu_traces[4],
             .surface_resize_trace = gpu_traces[5],
+            .cursor_overlay_draws = if (self.gpu) |resources| resources.cursor_overlay_draw_count else 0,
+            .cursor_only_frames = if (self.gpu) |resources| resources.cursor_only_frame_count else 0,
+            .direct_glyph_cells = if (self.gpu) |resources| resources.direct_glyph_cell_count else 0,
         };
     }
 
-    pub fn layoutGenerationForTesting(self: *const Renderer, row: usize) ?u64 {
+    pub fn textPlanGenerationForTesting(self: *const Renderer, row: usize) ?u64 {
         const resources = &(self.gpu orelse return null);
-        if (row >= resources.row_layouts.items.len) return null;
-        return resources.row_layouts.items[row].row_generation;
+        if (row >= resources.text_plans.items.len) return null;
+        return resources.text_plans.items[row].row_generation;
     }
     pub fn invalidateGpuSceneForTesting(self: *Renderer) bool {
         const resources = &(self.gpu orelse return false);
@@ -243,21 +193,13 @@ pub const Renderer = struct {
         width: u32,
         height: u32,
         dpi: u32,
-    ) void {
+    ) !void {
         self.releaseGpu();
-        const window = self.window orelse return;
-        var replacement = d2d.DeviceResources.create(window) catch |err| {
-            std.log.warn("GPU device recreation failed: {s}", .{
-                @errorName(err),
-            });
-            return;
-        };
+        const window = self.window orelse return error.RendererUnavailable;
+        var replacement = try d2d.DeviceResources.create(window);
         _ = replacement.resizeTarget(width, height, dpi) catch |err| {
-            std.log.warn("GPU target recovery failed: {s}", .{
-                @errorName(err),
-            });
             replacement.deinit();
-            return;
+            return err;
         };
         self.gpu = replacement;
         if (counters_enabled) self.gpu_recreation_count +|= 1;
