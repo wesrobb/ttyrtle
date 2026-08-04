@@ -3222,8 +3222,10 @@ fn finishMultiSessionIntegration(window: foundation.HWND) void {
 }
 
 fn logDebugCounters() void {
-    if (builtin.mode != .Debug or active_mode != .normal or
-        !model_initialized or !render_cache_initialized)
+    // Window shutdown clears model_initialized before this deferred diagnostic
+    // writer runs. The model and render cache remain owned by Application until
+    // the surrounding scope finishes, so do not use that lifecycle flag here.
+    if (builtin.mode != .Debug or active_mode != .normal or !render_cache_initialized)
         return;
     const terminal_counts = model.diagnostics();
     const cache_counts = render_cache.diagnostics();
