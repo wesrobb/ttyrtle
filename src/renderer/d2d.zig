@@ -25,9 +25,6 @@ const locale_name = std.unicode.utf8ToUtf16LeStringLiteral("en-US");
 const max_brushes = 64;
 const max_shaped_layouts = 512;
 const max_glyph_indices = 4096;
-const max_orphan_layouts = 128;
-const ascii_first = 0x20;
-const ascii_count = 0x7f - ascii_first;
 const counters_enabled = frame_trace.enabled;
 
 const BrushEntry = struct {
@@ -52,24 +49,6 @@ const ShapedLayout = struct {
     }
 };
 
-// Kept temporarily as a zero-ownership compatibility shell for the old helper
-// functions below; the active renderer stores TextPlans instead.
-const RowLayouts = struct {
-    row_generation: u64 = 0,
-    font_generation: u64 = 0,
-    content_fingerprint: u64 = 0,
-    shape_fingerprint: u64 = 0,
-    layout_width: u32 = 0,
-    layout: ?*dwrite.IDWriteTextLayout = null,
-    fn clear(self: *RowLayouts) void {
-        if (self.layout) |layout| release(layout);
-        self.* = .{};
-    }
-    fn deinit(self: *RowLayouts) void {
-        self.clear();
-    }
-};
-
 pub const DeviceResources = struct {
     d3d_device: *d3d11.ID3D11Device,
     d3d_context: *d3d11.ID3D11DeviceContext,
@@ -83,7 +62,6 @@ pub const DeviceResources = struct {
     dwrite_factory2: *dwrite.IDWriteFactory2,
     primary_font_face: *dwrite.IDWriteFontFace,
     glyph_index_cache: text_plan.GlyphIndexCache(max_glyph_indices),
-    ascii_glyph_indices: [ascii_count:0]u16,
     glyph_index_scratch: std.ArrayListUnmanaged(u16),
     glyph_advance_scratch: std.ArrayListUnmanaged(f32),
     font_fallback: *dwrite.IDWriteFontFallback,
@@ -105,8 +83,6 @@ pub const DeviceResources = struct {
     text_plans: std.ArrayListUnmanaged(text_plan.TextPlan),
     shaped_layouts: std.ArrayListUnmanaged(ShapedLayout),
     shaped_use_clock: u64,
-    row_layouts: std.ArrayListUnmanaged(RowLayouts),
-    orphan_layouts: std.ArrayListUnmanaged(RowLayouts),
     layout_pool_hit_count: if (counters_enabled) u64 else void,
     layout_pool_evict_count: if (counters_enabled) u64 else void,
     layout_build_count: if (counters_enabled) u64 else void,
@@ -122,6 +98,7 @@ pub const DeviceResources = struct {
     cursor_overlay_draw_count: if (counters_enabled) u64 else void,
     cursor_only_frame_count: if (counters_enabled) u64 else void,
     direct_glyph_cell_count: if (counters_enabled) u64 else void,
+    direct_glyph_run_draw_count: if (counters_enabled) u64 else void,
     brushes: [max_brushes]BrushEntry,
     brush_slots: resource_cache.KeySlots(max_brushes),
     simulate_device_loss: bool,
@@ -152,8 +129,6 @@ pub const DeviceResources = struct {
         resources.shaped_layouts = .empty;
         resources.shaped_use_clock = 0;
         resources.glyph_index_cache = .{};
-        resources.row_layouts = .empty;
-        resources.orphan_layouts = .empty;
         resources.glyph_index_scratch = .empty;
         resources.glyph_advance_scratch = .empty;
         resources.layout_pool_hit_count = if (counters_enabled) 0 else {};
@@ -171,6 +146,7 @@ pub const DeviceResources = struct {
         resources.cursor_overlay_draw_count = if (counters_enabled) 0 else {};
         resources.cursor_only_frame_count = if (counters_enabled) 0 else {};
         resources.direct_glyph_cell_count = if (counters_enabled) 0 else {};
+        resources.direct_glyph_run_draw_count = if (counters_enabled) 0 else {};
         resources.brush_slots = .{};
         resources.simulate_device_loss = false;
 
@@ -632,10 +608,33 @@ pub const DeviceResources = struct {
         }
 
         const plan = try self.ensureTextPlan(row_index, row);
-        for (plan.spans.items) |span| switch (span.kind) {
-            .direct_glyph => try self.drawDirectGlyph(row_index, row, span, metrics, dpi, null),
-            .shaped => try self.drawShapedSpan(row_index, row, span, metrics, dpi, null),
-        };
+        var span_index: usize = 0;
+        while (span_index < plan.spans.items.len) {
+            const span = plan.spans.items[span_index];
+            switch (span.kind) {
+                .direct_glyph => {
+                    const end = text_plan.directRunEnd(
+                        plan.spans.items,
+                        span_index,
+                        row,
+                        sameForeground,
+                    );
+                    try self.drawDirectRun(
+                        row_index,
+                        row,
+                        plan.spans.items[span_index..end],
+                        metrics,
+                        dpi,
+                        null,
+                    );
+                    span_index = end;
+                },
+                .shaped => {
+                    try self.drawShapedSpan(row_index, row, span, metrics, dpi, null);
+                    span_index += 1;
+                },
+            }
+        }
     }
 
     fn glyphResolver(raw: *anyopaque, scalar: u21) !u16 {
@@ -685,36 +684,57 @@ pub const DeviceResources = struct {
         return .{ .red = 255, .green = 255, .blue = 255 };
     }
 
-    fn drawDirectGlyph(
+    fn sameForeground(
+        row: *const render_commands.CachedRow,
+        first_position: usize,
+        next_position: usize,
+    ) bool {
+        return std.meta.eql(colorAt(row, first_position), colorAt(row, next_position));
+    }
+
+    fn drawDirectRun(
         self: *DeviceResources,
         row_index: usize,
         row: *const render_commands.CachedRow,
-        span: text_plan.Span,
+        spans: []const text_plan.Span,
         metrics: geometry.Metrics,
         dpi: u32,
         override_color: ?terminal.Rgb,
     ) !void {
-        if (counters_enabled) self.direct_glyph_cell_count +|= span.cell_count;
+        std.debug.assert(spans.len != 0);
+        self.glyph_index_scratch.clearRetainingCapacity();
+        self.glyph_advance_scratch.clearRetainingCapacity();
         const scale = dipScale(dpi);
-        const indices = [_]u16{span.glyph_index};
-        const advances = [_]f32{@as(f32, @floatFromInt(
-            @as(u32, span.cell_count) * metrics.cell_width,
-        )) * scale};
-        const brush = try self.getBrush(override_color orelse colorAt(row, span.utf16_start));
+        var cell_count: u64 = 0;
+        for (spans) |span| {
+            std.debug.assert(span.kind == .direct_glyph);
+            try self.glyph_index_scratch.append(std.heap.smp_allocator, span.glyph_index);
+            try self.glyph_advance_scratch.append(
+                std.heap.smp_allocator,
+                text_plan.directGlyphAdvance(span.cell_count, metrics.cell_width, scale),
+            );
+            cell_count += span.cell_count;
+        }
+        const first = spans[0];
+        const brush = try self.getBrush(override_color orelse colorAt(row, first.utf16_start));
         const run: dwrite.DWRITE_GLYPH_RUN = .{
             .fontFace = self.primary_font_face,
             .fontEmSize = 16.0,
-            .glyphCount = 1,
-            .glyphIndices = &indices[0],
-            .glyphAdvances = &advances[0],
+            .glyphCount = @intCast(spans.len),
+            .glyphIndices = &self.glyph_index_scratch.items[0],
+            .glyphAdvances = &self.glyph_advance_scratch.items[0],
             .glyphOffsets = null,
             .isSideways = 0,
             .bidiLevel = 0,
         };
+        if (counters_enabled) {
+            self.direct_glyph_cell_count +|= cell_count;
+            self.direct_glyph_run_draw_count +|= 1;
+        }
         self.d2d_context.ID2D1RenderTarget.DrawGlyphRun(
             .{
                 .x = @as(f32, @floatFromInt(metrics.margin_x +
-                    @as(u32, span.cell_start) * metrics.cell_width)) * scale,
+                    @as(u32, first.cell_start) * metrics.cell_width)) * scale,
                 .y = @as(f32, @floatFromInt(metrics.margin_y +
                     @as(u32, @intCast(row_index)) * metrics.cell_height + metrics.baseline)) * scale,
             },
@@ -887,261 +907,6 @@ pub const DeviceResources = struct {
         }, entry.layout, @ptrCast(default_brush), .{ .CLIP = 1, .ENABLE_COLOR_FONT = 1 });
     }
 
-    fn drawAsciiRow(
-        self: *DeviceResources,
-        row_index: usize,
-        row: *const render_commands.CachedRow,
-        metrics: geometry.Metrics,
-        dpi: u32,
-    ) !void {
-        const layouts = &self.row_layouts.items[row_index];
-        if (layouts.layout != null) self.stashOrphan(layouts);
-        layouts.row_generation = row.generation;
-        layouts.font_generation = self.font_generation;
-        layouts.content_fingerprint = row.fingerprint;
-        layouts.shape_fingerprint = row.shape_fingerprint;
-        layouts.layout_width = metrics.cell_width * @as(u32, row.shaped_columns);
-        const text_length = render_commands.shapedUtf16Length(row);
-        if (text_length == 0) return;
-        try self.prepareAsciiGlyphs(row, text_length, metrics, dpi);
-        const target = &self.d2d_context.ID2D1RenderTarget;
-        const scale = dipScale(dpi);
-        for (row.text_runs.items) |text_run| {
-            if (text_run.text_start >= text_length) break;
-            const length = @min(text_run.text_len, text_length - text_run.text_start);
-            if (length == 0) continue;
-            const brush = try self.getBrush(text_run.color);
-            const glyph_run: dwrite.DWRITE_GLYPH_RUN = .{
-                .fontFace = self.primary_font_face,
-                .fontEmSize = 16.0,
-                .glyphCount = @intCast(length),
-                .glyphIndices = &self.glyph_index_scratch.items[text_run.text_start],
-                .glyphAdvances = &self.glyph_advance_scratch.items[text_run.text_start],
-                .glyphOffsets = null,
-                .isSideways = 0,
-                .bidiLevel = 0,
-            };
-            target.DrawGlyphRun(
-                .{
-                    .x = @as(f32, @floatFromInt(text_run.x)) * scale,
-                    .y = @as(f32, @floatFromInt(
-                        text_run.y + @as(i32, @intCast(metrics.baseline)),
-                    )) * scale,
-                },
-                &glyph_run,
-                @ptrCast(brush),
-                .NATURAL,
-            );
-        }
-    }
-
-    fn prepareAsciiGlyphs(
-        self: *DeviceResources,
-        row: *const render_commands.CachedRow,
-        text_length: usize,
-        metrics: geometry.Metrics,
-        dpi: u32,
-    ) !void {
-        try self.glyph_index_scratch.resize(std.heap.smp_allocator, text_length);
-        try self.glyph_advance_scratch.resize(std.heap.smp_allocator, text_length);
-        const advance = @as(f32, @floatFromInt(metrics.cell_width)) * dipScale(dpi);
-        for (row.utf16.items[0..text_length], 0..) |code_unit, index| {
-            std.debug.assert(code_unit >= ascii_first and code_unit < ascii_first + ascii_count);
-            self.glyph_index_scratch.items[index] =
-                self.ascii_glyph_indices[code_unit - ascii_first];
-            self.glyph_advance_scratch.items[index] = advance;
-        }
-    }
-
-    fn resizeRowLayouts(self: *DeviceResources, row_count: usize) !void {
-        const old_length = self.row_layouts.items.len;
-        if (row_count < old_length) {
-            for (self.row_layouts.items[row_count..]) |*layouts| self.stashOrphan(layouts);
-            self.row_layouts.shrinkRetainingCapacity(row_count);
-        } else if (row_count > old_length) {
-            try self.row_layouts.resize(std.heap.smp_allocator, row_count);
-            for (self.row_layouts.items[old_length..]) |*layouts| layouts.* = .{};
-        }
-    }
-
-    /// Keep DirectWrite layouts paired with the cached content when a terminal
-    /// line scrolls off the top. The bottom row is rebuilt by the normal
-    /// generation check in ensureRowLayouts.
-    fn rotateRowLayoutsUp(self: *DeviceResources, count: u16) void {
-        const rows = @min(@as(usize, count), self.row_layouts.items.len);
-        for (0..rows) |_| {
-            const moved = self.row_layouts.orderedRemove(0);
-            self.row_layouts.appendAssumeCapacity(moved);
-        }
-    }
-
-    /// Keep DirectWrite layouts paired with cached content when scrolling into
-    /// history moves retained terminal lines toward the bottom.
-    fn rotateRowLayoutsDown(self: *DeviceResources, count: u16) void {
-        const rows = @min(@as(usize, count), self.row_layouts.items.len);
-        for (0..rows) |_| {
-            const moved = self.row_layouts.pop().?;
-            self.row_layouts.insertAssumeCapacity(0, moved);
-        }
-    }
-
-    fn ensureRowLayouts(
-        self: *DeviceResources,
-        row_index: usize,
-        row: *const render_commands.CachedRow,
-        metrics: geometry.Metrics,
-        dpi: u32,
-    ) !*RowLayouts {
-        const layouts = &self.row_layouts.items[row_index];
-        const layout_width = metrics.cell_width * @as(u32, row.shaped_columns);
-        if (layouts.row_generation == row.generation and
-            layouts.font_generation == self.font_generation)
-            return layouts;
-
-        const text_length = render_commands.shapedUtf16Length(row);
-        if (text_length == 0) {
-            self.stashOrphan(layouts);
-            layouts.row_generation = row.generation;
-            layouts.font_generation = self.font_generation;
-            layouts.content_fingerprint = row.fingerprint;
-            layouts.shape_fingerprint = row.shape_fingerprint;
-            layouts.layout_width = layout_width;
-            return layouts;
-        }
-
-        // Selection, cursor, and color changes only alter drawing effects.
-        // Keep the expensive shaped layout when its text and cell advances
-        // are unchanged, and update the brush ranges in place.
-        if (layouts.layout) |layout| {
-            if (layouts.font_generation == self.font_generation and
-                layouts.shape_fingerprint == row.shape_fingerprint and
-                layouts.layout_width == layout_width)
-            {
-                try self.applyDrawingEffects(layout, row, text_length);
-                layouts.row_generation = row.generation;
-                layouts.content_fingerprint = row.fingerprint;
-                return layouts;
-            }
-        }
-
-        // Broad terminal damage can move unchanged rows to new viewport
-        // positions. Transfer a matching layout with exclusive ownership, then
-        // apply current colors/selection/cursor effects in place.
-        if (self.takeMatchingLayout(row_index, row, layout_width)) |replacement| {
-            self.stashOrphan(layouts);
-            layouts.* = replacement;
-            try self.applyDrawingEffects(layouts.layout.?, row, text_length);
-            layouts.row_generation = row.generation;
-            layouts.content_fingerprint = row.fingerprint;
-            if (counters_enabled) self.layout_pool_hit_count +|= 1;
-            return layouts;
-        }
-
-        const trace_start = frame_trace.timestamp();
-        defer self.layout_trace.recordSince(trace_start);
-        self.stashOrphan(layouts);
-        errdefer layouts.clear();
-        const format = self.text_format orelse return error.TextFormatUnavailable;
-        const scale = dipScale(dpi);
-        var layout: *dwrite.IDWriteTextLayout = undefined;
-        if (self.dwrite_factory.CreateTextLayout(
-            @ptrCast(row.utf16.items.ptr),
-            @intCast(text_length),
-            format,
-            @max(1.0, @as(f32, @floatFromInt(layout_width)) * scale),
-            @as(f32, @floatFromInt(metrics.cell_height)) * scale,
-            &layout,
-        ).failed) return error.CreateTextLayoutFailed;
-        errdefer release(layout);
-        const full_range: dwrite.DWRITE_TEXT_RANGE = .{
-            .startPosition = 0,
-            .length = @intCast(text_length),
-        };
-        if (layout.SetTypography(self.typography, full_range).failed)
-            return error.ConfigureTextLayoutFailed;
-        const layout1 = try queryInterface(
-            dwrite.IDWriteTextLayout1,
-            layout,
-            dwrite.IID_IDWriteTextLayout1,
-        );
-        defer release(layout1);
-        if (layout1.SetPairKerning(0, full_range).failed)
-            return error.ConfigureTextLayoutFailed;
-        if (row.hasUniformAsciiGrid()) {
-            const first = row.graphemes.items[0];
-            const measurement = try measureTextRange(
-                layout,
-                @intCast(first.text_start),
-                @intCast(first.text_len),
-            );
-            const grid_advance =
-                @as(f32, @floatFromInt(metrics.cell_width)) * scale;
-            if (layout1.SetCharacterSpacing(
-                0,
-                (grid_advance - measurement.advance) /
-                    @as(f32, @floatFromInt(measurement.hit_count)),
-                0,
-                full_range,
-            ).failed) return error.ConfigureTextLayoutFailed;
-        } else for (row.graphemes.items) |grapheme| {
-            if (grapheme.cell_start + grapheme.cell_count > row.shaped_columns) break;
-            const range: dwrite.DWRITE_TEXT_RANGE = .{
-                .startPosition = @intCast(grapheme.text_start),
-                .length = @intCast(grapheme.text_len),
-            };
-            const measurement = try measureTextRange(
-                layout,
-                range.startPosition,
-                range.length,
-            );
-            const grid_advance = @as(f32, @floatFromInt(
-                @as(u32, grapheme.cell_count) * metrics.cell_width,
-            )) * scale;
-            const trailing = (grid_advance - measurement.advance) /
-                @as(f32, @floatFromInt(measurement.hit_count));
-            if (layout1.SetCharacterSpacing(0, trailing, 0, range).failed)
-                return error.ConfigureTextLayoutFailed;
-        }
-        try self.applyDrawingEffects(layout, row, text_length);
-        layouts.layout = layout;
-        if (counters_enabled) self.layout_build_count +|= 1;
-        layouts.row_generation = row.generation;
-        layouts.font_generation = self.font_generation;
-        layouts.content_fingerprint = row.fingerprint;
-        layouts.shape_fingerprint = row.shape_fingerprint;
-        layouts.layout_width = layout_width;
-        return layouts;
-    }
-
-    fn applyDrawingEffects(
-        self: *DeviceResources,
-        layout: *dwrite.IDWriteTextLayout,
-        row: *const render_commands.CachedRow,
-        text_length: usize,
-    ) !void {
-        const full_range: dwrite.DWRITE_TEXT_RANGE = .{
-            .startPosition = 0,
-            .length = @intCast(text_length),
-        };
-        if (layout.SetDrawingEffect(null, full_range).failed)
-            return error.ConfigureTextLayoutFailed;
-        for (row.text_runs.items) |text_run| {
-            if (text_run.text_start >= text_length) break;
-            const effect_length = @min(
-                text_run.text_len,
-                text_length - text_run.text_start,
-            );
-            const brush = try self.getBrush(text_run.color);
-            if (layout.SetDrawingEffect(
-                @ptrCast(&brush.IUnknown),
-                .{
-                    .startPosition = @intCast(text_run.text_start),
-                    .length = @intCast(effect_length),
-                },
-            ).failed) return error.ConfigureTextLayoutFailed;
-        }
-    }
-
     fn presentScene(self: *DeviceResources, cache: *const render_commands.RenderCache) !void {
         const copy_start = frame_trace.timestamp();
         const target_bitmap = self.target_bitmap orelse
@@ -1235,7 +1000,7 @@ pub const DeviceResources = struct {
                 target.PushAxisAlignedClip(&bounds, .ALIASED);
                 defer target.PopAxisAlignedClip();
                 if (span.kind == .direct_glyph) {
-                    try self.drawDirectGlyph(overlay.row, row, span, metrics, self.target_dpi, overlay.underlying_background);
+                    try self.drawDirectRun(overlay.row, row, &.{span}, metrics, self.target_dpi, overlay.underlying_background);
                     return;
                 }
                 const entry = try self.shapedLayout(row, span, metrics, self.target_dpi);
@@ -1398,64 +1163,6 @@ pub const DeviceResources = struct {
         self.glyph_index_cache.deinit(std.heap.smp_allocator);
         self.glyph_index_scratch.deinit(std.heap.smp_allocator);
         self.glyph_advance_scratch.deinit(std.heap.smp_allocator);
-        self.releaseRowLayouts();
-    }
-
-    fn clearRowLayouts(self: *DeviceResources) void {
-        for (self.row_layouts.items) |*layouts| layouts.clear();
-    }
-
-    fn releaseRowLayouts(self: *DeviceResources) void {
-        for (self.row_layouts.items) |*layouts| layouts.deinit();
-        self.row_layouts.deinit(std.heap.smp_allocator);
-        self.row_layouts = .empty;
-        self.clearOrphanLayouts();
-        self.orphan_layouts.deinit(std.heap.smp_allocator);
-        self.orphan_layouts = .empty;
-    }
-
-    fn clearOrphanLayouts(self: *DeviceResources) void {
-        for (self.orphan_layouts.items) |*layouts| layouts.deinit();
-        self.orphan_layouts.clearRetainingCapacity();
-    }
-
-    fn stashOrphan(self: *DeviceResources, layouts: *RowLayouts) void {
-        if (layouts.layout == null) return;
-        if (self.orphan_layouts.items.len == max_orphan_layouts) {
-            self.orphan_layouts.items[0].deinit();
-            _ = self.orphan_layouts.orderedRemove(0);
-            if (counters_enabled) self.layout_pool_evict_count +|= 1;
-        }
-        self.orphan_layouts.append(std.heap.smp_allocator, layouts.*) catch {
-            layouts.deinit();
-            return;
-        };
-        layouts.* = .{};
-    }
-
-    fn takeMatchingLayout(
-        self: *DeviceResources,
-        row_index: usize,
-        row: *const render_commands.CachedRow,
-        layout_width: u32,
-    ) ?RowLayouts {
-        for (self.row_layouts.items, 0..) |candidate, index| {
-            if (index == row_index or candidate.layout == null or
-                candidate.font_generation != self.font_generation or
-                candidate.shape_fingerprint != row.shape_fingerprint or
-                candidate.layout_width != layout_width)
-                continue;
-            self.row_layouts.items[index] = .{};
-            return candidate;
-        }
-        for (self.orphan_layouts.items, 0..) |candidate, index| {
-            if (candidate.font_generation != self.font_generation or
-                candidate.shape_fingerprint != row.shape_fingerprint or
-                candidate.layout_width != layout_width)
-                continue;
-            return self.orphan_layouts.orderedRemove(index);
-        }
-        return null;
     }
 
     fn releaseTargetResources(self: *DeviceResources) void {

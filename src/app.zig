@@ -3405,7 +3405,7 @@ fn logDebugCounters() void {
             "rectangle_requests={d} rectangle_commands={d} " ++
             "frames_requested={d} frames_presented={d} " ++
             "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d} " ++
-            "direct_glyph_cells={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
+            "direct_glyph_cells={d} direct_glyph_run_draws={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
         .{
             terminal_counts.output_batches,
             terminal_counts.chunks_parsed,
@@ -3430,6 +3430,7 @@ fn logDebugCounters() void {
             renderer_counts.scene_recreation_count,
             renderer_counts.scene_redraw_count,
             renderer_counts.direct_glyph_cells,
+            renderer_counts.direct_glyph_run_draws,
             renderer_counts.cursor_overlay_draws,
             renderer_counts.cursor_only_frames,
             cache_counts.unchanged_dirty_rows_skipped,
@@ -3453,7 +3454,7 @@ fn logDebugCounters() void {
                 "rectangle_requests={d} rectangle_commands={d} " ++
                 "frames_requested={d} frames_presented={d} " ++
                 "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d} " ++
-                "direct_glyph_cells={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
+                "direct_glyph_cells={d} direct_glyph_run_draws={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
             .{
                 terminal_counts.output_batches,
                 terminal_counts.chunks_parsed,
@@ -3478,6 +3479,7 @@ fn logDebugCounters() void {
                 renderer_counts.scene_recreation_count,
                 renderer_counts.scene_redraw_count,
                 renderer_counts.direct_glyph_cells,
+                renderer_counts.direct_glyph_run_draws,
                 renderer_counts.cursor_overlay_draws,
                 renderer_counts.cursor_only_frames,
                 cache_counts.unchanged_dirty_rows_skipped,
@@ -3785,6 +3787,7 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     // drawing), then mutate one cell in every row for several frames. No
     // DirectWrite layout should be constructed for these changes.
     var sequence_buffer: [64]u8 = undefined;
+    try model.write("\x1b[?25l\x1b[2J");
     for (0..model.rows()) |row_index| {
         const sequence = try std.fmt.bufPrint(
             &sequence_buffer,
@@ -3807,10 +3810,14 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         try paintForTesting(window);
     }
     const after_direct_mutations = active_renderer.diagnostics();
+    const expected_direct_runs = @as(u64, model.rows()) * 3;
     if (after_direct_mutations.gpu_present_count != before_direct_mutations.gpu_present_count + 3 or
         after_direct_mutations.direct_glyph_cells <= before_direct_mutations.direct_glyph_cells or
+        after_direct_mutations.direct_glyph_run_draws !=
+            before_direct_mutations.direct_glyph_run_draws + expected_direct_runs or
         after_direct_mutations.layout_build_count != before_direct_mutations.layout_build_count)
         return error.DirectGlyphMutationBuiltLayout;
+    try model.write("\x1b[?25h");
 
     // Identical combining spans in separate rows share one shaped cache key.
     // Editing the neighboring direct glyph does not disturb that key; editing

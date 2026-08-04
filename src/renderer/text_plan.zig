@@ -39,6 +39,36 @@ pub const TextPlan = struct {
     }
 };
 
+/// Returns the exclusive end of the maximal direct-glyph run beginning at
+/// `start`. Callers supply the effective-color comparison because color runs
+/// are owned by the retained renderer row rather than the text plan.
+pub fn directRunEnd(
+    spans: []const Span,
+    start: usize,
+    color_context: anytype,
+    comptime same_color: fn (@TypeOf(color_context), usize, usize) bool,
+) usize {
+    std.debug.assert(start < spans.len);
+    std.debug.assert(spans[start].kind == .direct_glyph);
+    const first = spans[start];
+    var end = start + 1;
+    var previous = first;
+    while (end < spans.len) : (end += 1) {
+        const next = spans[end];
+        if (next.kind != .direct_glyph or
+            previous.utf16_start + previous.utf16_len != next.utf16_start or
+            previous.cell_start + previous.cell_count != next.cell_start or
+            !same_color(color_context, first.utf16_start, next.utf16_start))
+            break;
+        previous = next;
+    }
+    return end;
+}
+
+pub fn directGlyphAdvance(cell_count: u16, cell_width: u32, scale: f32) f32 {
+    return @as(f32, @floatFromInt(@as(u32, cell_count) * cell_width)) * scale;
+}
+
 pub const GlyphResolver = struct {
     context: *anyopaque,
     resolveFn: *const fn (*anyopaque, u21) anyerror!u16,
@@ -334,4 +364,120 @@ test "clearing glyph cache invalidates its generation worth of results" {
     cache.clear();
     _ = try cache.getOrResolve(std.testing.allocator, 'A', resolver.interface());
     try std.testing.expectEqual(@as(usize, 2), resolver.calls);
+}
+
+const RunColorContext = struct {
+    boundaries: []const usize,
+    colors: []const u8,
+
+    fn same(self: RunColorContext, first: usize, next: usize) bool {
+        return self.at(first) == self.at(next);
+    }
+
+    fn at(self: RunColorContext, position: usize) u8 {
+        var result: u8 = 0;
+        for (self.boundaries, self.colors) |boundary, color| {
+            if (position < boundary) break;
+            result = color;
+        }
+        return result;
+    }
+};
+
+fn directSpan(utf16_start: usize, utf16_len: usize, cell_start: u16, cell_count: u16) Span {
+    return .{
+        .kind = .direct_glyph,
+        .utf16_start = utf16_start,
+        .utf16_len = utf16_len,
+        .cell_start = cell_start,
+        .cell_count = cell_count,
+        .grid_width = cell_count,
+        .shape_fingerprint = 0,
+        .glyph_index = @intCast(utf16_start + 1),
+    };
+}
+
+test "uniform ASCII and box-drawing sequence forms one direct run" {
+    var resolver: TestResolver = .{};
+    var plan: TextPlan = .{};
+    defer plan.deinit(std.testing.allocator);
+    const text = [_]u16{ 'A', 0x2500, 0x2502, 'B' };
+    const graphemes = [_]TestGrapheme{
+        .{ .text_start = 0, .text_len = 1, .cell_start = 0, .cell_count = 1 },
+        .{ .text_start = 1, .text_len = 1, .cell_start = 1, .cell_count = 1 },
+        .{ .text_start = 2, .text_len = 1, .cell_start = 2, .cell_count = 1 },
+        .{ .text_start = 3, .text_len = 1, .cell_start = 3, .cell_count = 1 },
+    };
+    try build(&plan, std.testing.allocator, &text, &graphemes, 1, 1, resolver.interface());
+    const colors = RunColorContext{ .boundaries = &.{0}, .colors = &.{1} };
+    try std.testing.expectEqual(plan.spans.items.len, directRunEnd(plan.spans.items, 0, colors, RunColorContext.same));
+}
+
+test "foreground change splits a direct run at its boundary" {
+    const spans = [_]Span{
+        directSpan(0, 1, 0, 1),
+        directSpan(1, 1, 1, 1),
+        directSpan(2, 1, 2, 1),
+        directSpan(3, 1, 3, 1),
+    };
+    const colors = RunColorContext{ .boundaries = &.{ 0, 2 }, .colors = &.{ 1, 2 } };
+    try std.testing.expectEqual(@as(usize, 2), directRunEnd(&spans, 0, colors, RunColorContext.same));
+    try std.testing.expectEqual(@as(usize, 4), directRunEnd(&spans, 2, colors, RunColorContext.same));
+}
+
+test "wide direct glyph stays in a run with a two-cell advance" {
+    const spans = [_]Span{
+        directSpan(0, 1, 0, 1),
+        directSpan(1, 1, 1, 2),
+        directSpan(2, 1, 3, 1),
+    };
+    const colors = RunColorContext{ .boundaries = &.{0}, .colors = &.{1} };
+    try std.testing.expectEqual(spans.len, directRunEnd(&spans, 0, colors, RunColorContext.same));
+    try std.testing.expectEqual(@as(f32, 25), directGlyphAdvance(spans[1].cell_count, 10, 1.25));
+}
+
+test "shaped and noncontiguous spans terminate direct runs" {
+    const shaped: Span = .{
+        .kind = .shaped,
+        .utf16_start = 1,
+        .utf16_len = 2,
+        .cell_start = 1,
+        .cell_count = 1,
+        .grid_width = 1,
+        .shape_fingerprint = 0,
+    };
+    const spans = [_]Span{
+        directSpan(0, 1, 0, 1),
+        shaped,
+        directSpan(3, 1, 2, 1),
+        directSpan(4, 1, 4, 1),
+    };
+    const colors = RunColorContext{ .boundaries = &.{0}, .colors = &.{1} };
+    try std.testing.expectEqual(@as(usize, 1), directRunEnd(&spans, 0, colors, RunColorContext.same));
+    try std.testing.expectEqual(@as(usize, 3), directRunEnd(&spans, 2, colors, RunColorContext.same));
+}
+
+test "noncontiguous UTF-16 ranges terminate a direct run" {
+    const spans = [_]Span{
+        directSpan(0, 1, 0, 1),
+        directSpan(2, 1, 1, 1),
+    };
+    const colors = RunColorContext{ .boundaries = &.{0}, .colors = &.{1} };
+    try std.testing.expectEqual(@as(usize, 1), directRunEnd(&spans, 0, colors, RunColorContext.same));
+}
+
+test "UTF-16 surrogate scalar contributes one direct glyph entry" {
+    var resolver: TestResolver = .{};
+    var plan: TextPlan = .{};
+    defer plan.deinit(std.testing.allocator);
+    const text = [_]u16{ 0xd83d, 0xde00, 'A' };
+    const graphemes = [_]TestGrapheme{
+        .{ .text_start = 0, .text_len = 2, .cell_start = 0, .cell_count = 2 },
+        .{ .text_start = 2, .text_len = 1, .cell_start = 2, .cell_count = 1 },
+    };
+    try build(&plan, std.testing.allocator, &text, &graphemes, 1, 1, resolver.interface());
+    const colors = RunColorContext{ .boundaries = &.{0}, .colors = &.{1} };
+    try std.testing.expectEqual(@as(usize, 2), plan.spans.items.len);
+    try std.testing.expectEqual(@as(usize, 2), plan.spans.items[0].utf16_len);
+    try std.testing.expectEqual(@as(usize, 2), directRunEnd(plan.spans.items, 0, colors, RunColorContext.same));
 }

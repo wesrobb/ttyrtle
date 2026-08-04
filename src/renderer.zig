@@ -41,6 +41,7 @@ pub const Renderer = struct {
         cursor_overlay_draws: u64,
         cursor_only_frames: u64,
         direct_glyph_cells: u64,
+        direct_glyph_run_draws: u64,
     };
 
     pub fn initialize(self: *Renderer, window: foundation.HWND) !void {
@@ -129,6 +130,7 @@ pub const Renderer = struct {
             .cursor_overlay_draws = 0,
             .cursor_only_frames = 0,
             .direct_glyph_cells = 0,
+            .direct_glyph_run_draws = 0,
         };
         const gpu_traces = if (self.gpu) |*resources| .{
             resources.paint_trace.snapshot(),
@@ -168,6 +170,7 @@ pub const Renderer = struct {
             .cursor_overlay_draws = if (self.gpu) |resources| resources.cursor_overlay_draw_count else 0,
             .cursor_only_frames = if (self.gpu) |resources| resources.cursor_only_frame_count else 0,
             .direct_glyph_cells = if (self.gpu) |resources| resources.direct_glyph_cell_count else 0,
+            .direct_glyph_run_draws = if (self.gpu) |resources| resources.direct_glyph_run_draw_count else 0,
         };
     }
 
