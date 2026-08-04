@@ -44,10 +44,13 @@ sound.
 - Right-click a tab, or invoke the keyboard context menu, for New Tab, Rename,
   and Close actions.
 - Drag a tab with the left mouse button to reorder same-window tabs.
+- Drag a tab onto another ttyrtle window's tab strip to insert it at the shown
+  marker, or release it sufficiently outside every eligible strip to tear it
+  into a new window near the pointer. Press `Escape` to cancel and restore the
+  original order.
 - A tab's context menu provides **Move Tab to New Window** and a **Move Tab to
   Window** submenu. A move preserves the existing terminal, ConPTY child,
   title, selection, and scrollback.
-- Cross-window drag and tear-out are intentionally not implemented.
 - Terminal output continues to be parsed while its tab is inactive. OSC titles
   label the corresponding tab and window; an explicit tab name takes priority.
 - `Ctrl+Shift+C` copies the current selection as Unicode text.
@@ -115,8 +118,8 @@ known truecolor VT output and queued Unicode input in the Ghostty model,
 confirms reader teardown, requires a hosted process to observe an exact
 window-driven terminal resize, and exercises multiple inactive sessions,
 background OSC labels, resize/DPI propagation, stale notifications,
-independent windows, command-driven transfers, asynchronous retirement, and
-keyboard routing.
+independent windows, indexed cross-window drag/tear-out transactions,
+command-driven transfers, asynchronous retirement, and keyboard routing.
 GitHub Actions runs `zig build verify` on Windows with pinned Ghostty and
 zigwin32 revisions.
 

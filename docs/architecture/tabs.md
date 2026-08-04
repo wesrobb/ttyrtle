@@ -149,8 +149,17 @@ ConPTY notification receiver is created before sessions and outlives retiring
 workers. A close removes its visible UI immediately and retires terminal work
 asynchronously. `Ctrl+Shift+N`, **New Window**, **Move Tab to New Window**, and
 the keyboard-accessible **Move Tab to Window** submenu are available; transfer
-keeps the terminal model and process intact. Cross-window dragging and tear-out
-remain deferred.
+keeps the terminal model and process intact.
+
+Cross-window dragging and tear-out are implemented through one application-wide
+coordinator. It keeps capture and transient insertion feedback outside the
+workspace ownership model, discovers the topmost eligible native strip in
+screen coordinates, and posts stable-ID drop requests to the notification
+window. Existing-window drops use indexed `prepareTransfer`; tear-out creates a
+hidden, monitor-clamped receiver only on release. Escape, capture loss, and
+pre-commit failures restore provisional local order. Automated coverage is
+complete; the mixed-DPI and accessibility manual matrix is tracked in the
+[cross-window drag plan](cross-window-tab-dragging-plan.md).
 
 The required real-monitor, Narrator/Inspect, high-contrast, system-menu,
 taskbar, and renderer-fallback manual QA matrix has been completed; see the

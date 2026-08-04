@@ -43,11 +43,18 @@ constraints, but they do not replace this tracker.
   caching, batched direct-glyph runs, detailed frame tracing, and an automated
   live-output GPU smoke benchmark.
 
+## In progress
+
+- **In progress** — [Cross-window tab dragging and tear-out](docs/architecture/cross-window-tab-dragging-plan.md):
+  native tab-control capture, cross-HWND and mixed-DPI target discovery, indexed
+  transfer through the existing command-driven transaction, cancellation and
+  rollback, and new-window tear-out placement. Implementation and automated
+  coverage are complete; the required real-monitor/accessibility QA remains.
+
 ## Needs planning
 
 ### Windows, tabs, and panes
 
-- Cross-window tab dragging and tear-out, built on command-driven tab transfer.
 - Pane splits: horizontal/vertical splits, focus movement, resizing, closing,
   and tab/pane ownership rules.
 - Tab process or working-directory status.

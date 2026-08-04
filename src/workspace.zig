@@ -418,6 +418,22 @@ pub const Application = struct {
         return true;
     }
 
+    /// Removes a receiver whose native construction failed before it became
+    /// live. A constructing window cannot own routed tabs or sessions.
+    pub fn discardConstructingWindow(self: *Application, id: WindowId) bool {
+        for (self.windows.items, 0..) |value, index| {
+            if (value.id != id) continue;
+            if ((value.lifecycle != .constructing and value.lifecycle != .destroyed) or
+                value.workspace.tabs.items.len != 0)
+                return false;
+            _ = self.windows.orderedRemove(index);
+            value.workspace.deinit();
+            self.allocator.destroy(value);
+            return true;
+        }
+        return false;
+    }
+
     pub fn window(self: *Application, id: WindowId) ?*Window {
         for (self.windows.items) |value| if (value.id == id) return value;
         return null;
@@ -568,6 +584,18 @@ pub const TransferTransaction = struct {
 };
 
 fn noOpTabSetup(_: *TerminalSession, _: void) !void {}
+
+test "failed constructing window can be discarded without affecting live windows" {
+    var application = Application.init(std.testing.allocator);
+    defer application.deinit();
+    const live = try application.createWindow();
+    try std.testing.expect(application.markLive(live.id));
+    const failed = try application.createWindow();
+    try std.testing.expect(application.discardConstructingWindow(failed.id));
+    try std.testing.expect(application.window(failed.id) == null);
+    try std.testing.expect(application.window(live.id) == live);
+    try std.testing.expect(!application.discardConstructingWindow(live.id));
+}
 
 const TestProcess = struct {
     destroy_count: usize = 0,

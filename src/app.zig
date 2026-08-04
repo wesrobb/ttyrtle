@@ -8,6 +8,7 @@ const render_commands = @import("render_commands.zig");
 const renderer = @import("renderer.zig");
 const retirement = @import("retirement.zig");
 const terminal = @import("terminal.zig");
+const tab_drag_geometry = @import("tab_drag.zig");
 const workspace = @import("workspace.zig");
 
 const foundation = win32.foundation;
@@ -53,6 +54,7 @@ pub const Mode = enum {
     smoke_rename,
     smoke_tab_interactions,
     smoke_tab_drag,
+    smoke_cross_window_drag,
     smoke_multi_window,
     smoke_transfer_hardening,
     integration,
@@ -88,7 +90,6 @@ var test_modifiers: ?input.Mods = null;
 var test_context_menu_command: ?usize = null;
 var rename_editor: ?RenameEditor = null;
 var terminal_metrics: *geometry.Metrics = undefined;
-var tab_drag: *TabDrag = undefined;
 var selection_dragging = false;
 var selection_anchor: ?terminal.Cursor = null;
 var selection_head: ?terminal.Cursor = null;
@@ -111,6 +112,7 @@ var active_application: ?*Application = null;
 const cursor_timer_id = 1;
 const frame_message = wm.WM_APP + 10;
 const renderer_failure_message = wm.WM_APP + 11;
+const tab_drop_message = wm.WM_APP + 12;
 
 const integration_marker = "CONPTY_STEP_1_OK";
 const integration_command =
@@ -177,6 +179,9 @@ const Application = struct {
     integration_resize_target: geometry.Dimensions = .{ .columns = 1, .rows = 1 },
     integration_multi_session: MultiSessionIntegration = .{},
     final_window_destroyed_while_retiring: bool = false,
+    tab_drag: TabDragCoordinator = .idle,
+    tab_drag_diagnostics: TabDragDiagnostics = .{},
+    suppress_drag_escape_character: bool = false,
 
     fn init(allocator: std.mem.Allocator, mode: Mode) Application {
         return .{ .allocator = allocator, .model = .init(allocator), .mode = mode };
@@ -217,6 +222,11 @@ const Application = struct {
         return null;
     }
 
+    fn stateForId(self: *Application, id: workspace.WindowId) ?*WindowState {
+        for (self.windows.items) |state| if (state.model_window.id == id) return state;
+        return null;
+    }
+
     fn stateForSession(self: *Application, id: workspace.SessionId) ?*WindowState {
         const owner = self.model.sessionOwner(id) orelse return null;
         const window_id = switch (owner) {
@@ -252,7 +262,6 @@ const WindowState = struct {
     rename_editor: ?RenameEditor = null,
     terminal_metrics: geometry.Metrics = .forDpi(geometry.base_dpi),
     dpi: u32 = geometry.base_dpi,
-    tab_drag: TabDrag = .{},
     selection_dragging: bool = false,
     selection_anchor: ?terminal.Cursor = null,
     selection_head: ?terminal.Cursor = null,
@@ -318,7 +327,6 @@ fn bindWindowState(state: *WindowState) void {
     test_context_menu_command = state.test_context_menu_command;
     rename_editor = state.rename_editor;
     terminal_metrics = &state.terminal_metrics;
-    tab_drag = &state.tab_drag;
     selection_dragging = state.selection_dragging;
     selection_anchor = state.selection_anchor;
     selection_head = state.selection_head;
@@ -397,7 +405,6 @@ pub fn run(mode: Mode) !void {
     test_context_menu_command = null;
     rename_editor = null;
     terminal_metrics = &state.terminal_metrics;
-    tab_drag = &state.tab_drag;
     selection_dragging = false;
     selection_anchor = null;
     selection_head = null;
@@ -521,6 +528,7 @@ pub fn run(mode: Mode) !void {
     if (mode == .smoke_rename) try verifyInlineRename(window);
     if (mode == .smoke_tab_interactions) try verifyTabInteractions(window);
     if (mode == .smoke_tab_drag) try verifyTabDragReordering(window);
+    if (mode == .smoke_cross_window_drag) try verifyCrossWindowTabDrag(state, instance);
 
     var integration_resize_command: ?[]u8 = null;
     defer if (integration_resize_command) |command| allocator.free(command);
@@ -788,10 +796,71 @@ const RenameEditor = struct {
     tab_id: workspace.TabId,
 };
 
-const TabDrag = struct {
-    candidate_id: ?workspace.TabId = null,
-    anchor: foundation.POINT = .{ .x = 0, .y = 0 },
-    dragging: bool = false,
+const TabDragCandidate = struct {
+    source_window_id: workspace.WindowId,
+    tab_id: workspace.TabId,
+    original_index: usize,
+    anchor_screen: foundation.POINT,
+    grab_offset_dip: foundation.POINT,
+    source_client_width_dip: i32,
+    source_client_height_dip: i32,
+};
+
+const TabHoverTarget = union(enum) {
+    none,
+    source: usize,
+    window: struct { window_id: workspace.WindowId, insertion_index: usize },
+    tear_out,
+};
+
+const TabDragActive = struct {
+    candidate: TabDragCandidate,
+    capture_hwnd: foundation.HWND,
+    hover: TabHoverTarget = .none,
+    local_order_changed: bool = false,
+};
+
+const TabDropRequest = union(enum) {
+    reorder: struct { source_window_id: workspace.WindowId, tab_id: workspace.TabId, index: usize },
+    transfer: struct {
+        source_window_id: workspace.WindowId,
+        tab_id: workspace.TabId,
+        destination_window_id: workspace.WindowId,
+        insertion_index: usize,
+        original_index: usize,
+    },
+    tear_out: struct {
+        source_window_id: workspace.WindowId,
+        tab_id: workspace.TabId,
+        original_index: usize,
+        point: foundation.POINT,
+        grab_offset_dip: foundation.POINT,
+        source_client_width_dip: i32,
+        source_client_height_dip: i32,
+    },
+};
+
+const TabDragCoordinator = union(enum) {
+    idle,
+    candidate: TabDragCandidate,
+    active: TabDragActive,
+    finishing: struct {
+        request: ?TabDropRequest,
+        capture_hwnd: ?foundation.HWND = null,
+    },
+};
+
+const TabDragDiagnostics = struct {
+    candidates: u64 = 0,
+    started: u64 = 0,
+    canceled: u64 = 0,
+    completed: u64 = 0,
+    target_changes: u64 = 0,
+    indexed_transfers: u64 = 0,
+    tear_outs: u64 = 0,
+    rollback_attempts: u64 = 0,
+    rollback_failures: u64 = 0,
+    stale_requests: u64 = 0,
 };
 
 fn beginRenameTab(id: workspace.TabId) !void {
@@ -952,25 +1021,38 @@ fn tabControlProc(
     }
     if (message == wm.WM_LBUTTONDOWN) {
         const hwnd = control orelse return 0;
+        const result = comctl32.DefSubclassProc(control, message, wparam, lparam);
         var hit: controls.TCHITTESTINFO = .{
             .pt = messagePoint(lparam),
             .flags = controls.TCHT_NOWHERE,
         };
         const index = user32.SendMessageW(hwnd, controls.TCM_HITTEST, 0, @bitCast(@intFromPtr(&hit)));
-        if (index >= 0) {
-            if (nativeTabIdAt(@intCast(index))) |id| {
-                tab_drag.* = .{ .candidate_id = id, .anchor = hit.pt };
-            } else {
-                cancelTabDrag();
-            }
-        } else {
-            cancelTabDrag();
+        if (index >= 0 and reference_data != 0) {
+            const state: *WindowState = @ptrFromInt(reference_data);
+            if (nativeTabIdAt(@intCast(index))) |id|
+                beginTabDragCandidate(state, hwnd, id, @intCast(index), hit.pt)
+            else
+                cancelCandidateOrActiveDrag(state.application);
+        } else if (reference_data != 0) {
+            const state: *WindowState = @ptrFromInt(reference_data);
+            cancelCandidateOrActiveDrag(state.application);
+        }
+        return result;
+    }
+    if (message == wm.WM_MOUSEMOVE) {
+        if (reference_data != 0) {
+            const state: *WindowState = @ptrFromInt(reference_data);
+            updateApplicationTabDrag(state.application, state, messagePoint(lparam), wparam);
         }
         return comctl32.DefSubclassProc(control, message, wparam, lparam);
     }
-    if (message == wm.WM_MOUSEMOVE) {
-        updateTabDrag(messagePoint(lparam));
-        return comctl32.DefSubclassProc(control, message, wparam, lparam);
+    if (message == wm.WM_PAINT) {
+        const result = comctl32.DefSubclassProc(control, message, wparam, lparam);
+        if (reference_data != 0) {
+            const state: *WindowState = @ptrFromInt(reference_data);
+            drawTabInsertionMarker(state.application, state);
+        }
+        return result;
     }
     if (message == wm.WM_CONTEXTMENU) {
         const hwnd = control orelse return 0;
@@ -1023,14 +1105,36 @@ fn tabControlProc(
         return 0;
     }
     if (message == wm.WM_LBUTTONUP) {
+        if (reference_data != 0) {
+            const state: *WindowState = @ptrFromInt(reference_data);
+            finishApplicationTabDrag(state.application, state, messagePoint(lparam));
+        }
         const result = comctl32.DefSubclassProc(control, message, wparam, lparam);
-        cancelTabDrag();
+        releaseFinishedTabCapture();
         if (app_window) |window| _ = user32.SetFocus(window);
         return result;
     }
-    if (message == wm.WM_CANCELMODE or message == wm.WM_CAPTURECHANGED) {
-        tab_drag.* = .{};
+    if (message == wm.WM_KEYDOWN and wparam == 0x1b and reference_data != 0) {
+        const state: *WindowState = @ptrFromInt(reference_data);
+        cancelApplicationTabDrag(state.application, true);
+        return 0;
+    }
+    if (message == wm.WM_CANCELMODE and reference_data != 0) {
+        const state: *WindowState = @ptrFromInt(reference_data);
+        cancelApplicationTabDrag(state.application, true);
         return comctl32.DefSubclassProc(control, message, wparam, lparam);
+    }
+    if (message == wm.WM_CAPTURECHANGED and reference_data != 0) {
+        const state: *WindowState = @ptrFromInt(reference_data);
+        switch (state.application.tab_drag) {
+            .active => cancelApplicationTabDrag(state.application, false),
+            else => {},
+        }
+        return comctl32.DefSubclassProc(control, message, wparam, lparam);
+    }
+    if (message == wm.WM_NCDESTROY and reference_data != 0) {
+        const state: *WindowState = @ptrFromInt(reference_data);
+        cancelDragIfSource(state.application, state.model_window.id);
     }
     return comctl32.DefSubclassProc(control, message, wparam, lparam);
 }
@@ -1187,13 +1291,34 @@ fn createNewWindow() !void {
 
 /// Creates the complete native receiver required by a transfer, but leaves it
 /// hidden and empty until the allocation-free model commit succeeds.
-fn createTransferDestination(application: *Application, instance: foundation.HINSTANCE) !*WindowState {
+const TearOutPlacement = struct {
+    point: foundation.POINT,
+    grab_offset_dip: foundation.POINT,
+    client_width_dip: i32,
+    client_height_dip: i32,
+};
+
+fn createTransferDestination(
+    application: *Application,
+    instance: foundation.HINSTANCE,
+    placement: ?TearOutPlacement,
+) !*WindowState {
     const model_window = try application.model.createWindow();
+    errdefer _ = application.model.discardConstructingWindow(model_window.id);
     const state = try application.allocator.create(WindowState);
     errdefer application.allocator.destroy(state);
     state.* = .init(application, model_window);
     state.auto_close_on_paint = false;
     try application.windows.append(application.allocator, state);
+    errdefer {
+        for (application.windows.items, 0..) |candidate, index| {
+            if (candidate == state) {
+                _ = application.windows.orderedRemove(index);
+                break;
+            }
+        }
+        state.deinit();
+    }
 
     var style = wm.WS_OVERLAPPEDWINDOW;
     style.CLIPCHILDREN = 1;
@@ -1202,8 +1327,8 @@ fn createTransferDestination(application: *Application, instance: foundation.HIN
         class_name,
         window_title,
         style,
-        wm.CW_USEDEFAULT,
-        wm.CW_USEDEFAULT,
+        if (placement) |value| value.point.x else wm.CW_USEDEFAULT,
+        if (placement) |value| value.point.y else wm.CW_USEDEFAULT,
         900,
         560,
         null,
@@ -1222,16 +1347,67 @@ fn createTransferDestination(application: *Application, instance: foundation.HIN
     bindWindowState(state);
     try initializeRenderer(window, &state.renderer);
     state.terminal_metrics = state.renderer.metricsForDpi(user32.GetDpiForWindow(window));
+    state.dpi = user32.GetDpiForWindow(window);
+    if (placement) |value| try positionTearOutWindow(window, style, value);
     _ = user32.SetTimer(window, cursor_timer_id, 500, null);
     if (!application.model.markLive(model_window.id)) return error.WindowDidNotBecomeLive;
     storeWindowState(state);
     return state;
 }
 
+fn positionTearOutWindow(
+    window: foundation.HWND,
+    style: wm.WINDOW_STYLE,
+    placement: TearOutPlacement,
+) !void {
+    const dpi = @max(user32.GetDpiForWindow(window), geometry.base_dpi);
+    var outer: foundation.RECT = .{
+        .left = 0,
+        .top = 0,
+        .right = @max(tab_drag_geometry.scale(placement.client_width_dip, geometry.base_dpi, dpi), 1),
+        .bottom = @max(tab_drag_geometry.scale(placement.client_height_dip, geometry.base_dpi, dpi), 1),
+    };
+    if (user32.AdjustWindowRectExForDpi(&outer, style, 0, .{}, dpi) == 0)
+        return error.AdjustTearOutWindowRectFailed;
+    const width = outer.right - outer.left;
+    const height = outer.bottom - outer.top;
+    const grab_x = tab_drag_geometry.scale(placement.grab_offset_dip.x, geometry.base_dpi, dpi);
+    const desired: tab_drag_geometry.Rect = .{
+        .left = placement.point.x - grab_x,
+        .top = placement.point.y - @max(tab_drag_geometry.scale(16, geometry.base_dpi, dpi), 1),
+        .right = placement.point.x - grab_x + width,
+        .bottom = placement.point.y - @max(tab_drag_geometry.scale(16, geometry.base_dpi, dpi), 1) + height,
+    };
+    const monitor = user32.MonitorFromPoint(placement.point, gdi.MONITOR_DEFAULTTONEAREST) orelse
+        return error.MonitorForTearOutUnavailable;
+    var info: gdi.MONITORINFO = .{
+        .cbSize = @sizeOf(gdi.MONITORINFO),
+        .rcMonitor = undefined,
+        .rcWork = undefined,
+        .dwFlags = 0,
+    };
+    if (user32.GetMonitorInfoW(monitor, &info) == 0) return error.GetTearOutMonitorInfoFailed;
+    const bounded = tab_drag_geometry.clampToWorkArea(
+        desired,
+        dragRect(info.rcWork),
+        tab_drag_geometry.scale(120, geometry.base_dpi, dpi),
+        tab_drag_geometry.scale(48, geometry.base_dpi, dpi),
+    );
+    if (user32.SetWindowPos(
+        window,
+        null,
+        bounded.left,
+        bounded.top,
+        bounded.right - bounded.left,
+        bounded.bottom - bounded.top,
+        .{ .NOZORDER = 1, .NOACTIVATE = 1 },
+    ) == 0) return error.PositionTearOutWindowFailed;
+}
+
 fn moveTabToNewWindow(source: *WindowState, id: workspace.TabId) !void {
     const instance = kernel32.GetModuleHandleW(null) orelse return error.GetModuleHandleFailed;
-    const destination = try createTransferDestination(source.application, instance);
-    moveTabToState(source, id, destination) catch |err| {
+    const destination = try createTransferDestination(source.application, instance, null);
+    moveTabToState(source, id, destination, 0, true) catch |err| {
         if (destination.hwnd) |window| beginWindowClose(window);
         return err;
     };
@@ -1247,10 +1423,16 @@ fn moveTabToWindow(source: *WindowState, id: workspace.TabId, destination_id: wo
             if (candidate.model_window == destination) break :blk candidate;
         return;
     };
-    try moveTabToState(source, id, destination_state);
+    try moveTabToState(source, id, destination_state, destination_state.ownedWorkspace().tabs.items.len, true);
 }
 
-fn moveTabToState(source: *WindowState, id: workspace.TabId, destination: *WindowState) !void {
+fn moveTabToState(
+    source: *WindowState,
+    id: workspace.TabId,
+    destination: *WindowState,
+    destination_index: usize,
+    activate: bool,
+) !void {
     if (source == destination) return;
     const source_window = source.hwnd orelse return error.SourceWindowUnavailable;
     const destination_window = destination.hwnd orelse return error.DestinationWindowUnavailable;
@@ -1258,7 +1440,7 @@ fn moveTabToState(source: *WindowState, id: workspace.TabId, destination: *Windo
         source.model_window.id,
         destination.model_window.id,
         id,
-        destination.ownedWorkspace().tabs.items.len,
+        destination_index,
     );
     defer transaction.deinit();
 
@@ -1266,20 +1448,105 @@ fn moveTabToState(source: *WindowState, id: workspace.TabId, destination: *Windo
     // ownership. Presentation is rebuilt only after the stable identities are
     // routed to their new window.
     _ = transaction.commit();
-    try refreshTransferredPresentation(destination, destination_window);
+    refreshTransferredPresentation(destination, destination_window) catch |err|
+        std.log.err("failed to refresh destination after committed tab transfer: {}", .{err});
     if (source.ownedWorkspace().activeTab() != null) {
-        try refreshTransferredPresentation(source, source_window);
+        refreshTransferredPresentation(source, source_window) catch |err|
+            std.log.err("failed to refresh source after committed tab transfer: {}", .{err});
     } else {
         bindWindowState(source);
         beginWindowClose(source_window);
     }
 
-    if (user32.IsIconic(destination_window) != 0)
-        _ = user32.ShowWindow(destination_window, wm.SW_RESTORE)
-    else
-        _ = user32.ShowWindow(destination_window, wm.SW_SHOW);
-    _ = user32.SetForegroundWindow(destination_window);
-    _ = user32.SetFocus(destination_window);
+    if (activate) {
+        if (user32.IsIconic(destination_window) != 0)
+            _ = user32.ShowWindow(destination_window, wm.SW_RESTORE)
+        else
+            _ = user32.ShowWindow(destination_window, wm.SW_SHOW);
+        _ = user32.SetForegroundWindow(destination_window);
+        _ = user32.SetFocus(destination_window);
+    }
+}
+
+fn processPendingTabDrop(application: *Application) void {
+    const request = switch (application.tab_drag) {
+        .finishing => |*finishing| blk: {
+            const value = finishing.request orelse {
+                application.tab_drag = .idle;
+                return;
+            };
+            finishing.request = null;
+            break :blk value;
+        },
+        else => {
+            application.tab_drag_diagnostics.stale_requests +|= 1;
+            return;
+        },
+    };
+    application.tab_drag = .idle;
+
+    switch (request) {
+        .reorder => |value| {
+            const source = application.stateForId(value.source_window_id) orelse return staleTabDrop(application);
+            if (source.model_window.lifecycle != .live or
+                source.ownedWorkspace().indexOfTab(value.tab_id) != value.index)
+                return staleTabDrop(application);
+            if (source.hwnd) |window| _ = user32.SetFocus(window);
+            application.tab_drag_diagnostics.completed +|= 1;
+        },
+        .transfer => |value| {
+            const source = application.stateForId(value.source_window_id) orelse return staleTabDrop(application);
+            const destination = application.stateForId(value.destination_window_id) orelse {
+                rollbackStableRequest(application, value.source_window_id, value.tab_id, value.original_index);
+                return staleTabDrop(application);
+            };
+            if (source.model_window.lifecycle != .live or destination.model_window.lifecycle != .live or
+                source.ownedWorkspace().tab(value.tab_id) == null or
+                value.insertion_index > destination.ownedWorkspace().tabs.items.len)
+            {
+                rollbackStableRequest(application, value.source_window_id, value.tab_id, value.original_index);
+                return staleTabDrop(application);
+            }
+            moveTabToState(source, value.tab_id, destination, value.insertion_index, true) catch |err| {
+                std.log.err("cross-window tab drop failed before commit: {}", .{err});
+                rollbackStableRequest(application, value.source_window_id, value.tab_id, value.original_index);
+                return;
+            };
+            application.tab_drag_diagnostics.indexed_transfers +|= 1;
+            application.tab_drag_diagnostics.completed +|= 1;
+        },
+        .tear_out => |value| {
+            const source = application.stateForId(value.source_window_id) orelse return staleTabDrop(application);
+            if (source.model_window.lifecycle != .live or source.ownedWorkspace().tab(value.tab_id) == null)
+                return staleTabDrop(application);
+            const instance = kernel32.GetModuleHandleW(null) orelse {
+                rollbackStableRequest(application, value.source_window_id, value.tab_id, value.original_index);
+                return;
+            };
+            const destination = createTransferDestination(application, instance, .{
+                .point = value.point,
+                .grab_offset_dip = value.grab_offset_dip,
+                .client_width_dip = value.source_client_width_dip,
+                .client_height_dip = value.source_client_height_dip,
+            }) catch |err| {
+                std.log.err("failed to construct tear-out window: {}", .{err});
+                rollbackStableRequest(application, value.source_window_id, value.tab_id, value.original_index);
+                return;
+            };
+            moveTabToState(source, value.tab_id, destination, 0, true) catch |err| {
+                std.log.err("tear-out transfer failed before commit: {}", .{err});
+                if (destination.hwnd) |window| beginWindowClose(window);
+                rollbackStableRequest(application, value.source_window_id, value.tab_id, value.original_index);
+                return;
+            };
+            application.tab_drag_diagnostics.tear_outs +|= 1;
+            application.tab_drag_diagnostics.completed +|= 1;
+        },
+    }
+}
+
+fn staleTabDrop(application: *Application) void {
+    application.tab_drag_diagnostics.stale_requests +|= 1;
 }
 
 fn refreshTransferredPresentation(state: *WindowState, window: foundation.HWND) !void {
@@ -1448,7 +1715,10 @@ fn createIntegrationTerminalTab(window: foundation.HWND, command: []const u8) !v
 }
 
 fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
-    cancelTabDrag();
+    if (windowStateFromHwnd(window)) |state| {
+        cancelDragIfSource(state.application, state.model_window.id);
+        clearDragDestination(state.application, state.model_window.id);
+    }
     if (rename_editor) |editor| if (editor.tab_id == id) cancelRename();
     const tab = workspace_state.tab(id) orelse return;
     retireTab(tab);
@@ -1471,61 +1741,492 @@ fn closeTerminalTab(window: foundation.HWND, id: workspace.TabId) void {
 }
 
 fn cancelTabDrag() void {
-    const was_dragging = tab_drag.dragging;
-    tab_drag.* = .{};
-    if (was_dragging) _ = user32.ReleaseCapture();
+    const application = active_application orelse return;
+    cancelApplicationTabDrag(application, true);
 }
 
 fn tabDragExceededThreshold(anchor: foundation.POINT, point: foundation.POINT) bool {
-    const horizontal = @abs(point.x - anchor.x);
-    const vertical = @abs(point.y - anchor.y);
-    const minimum_horizontal: u32 = @intCast(@max(user32.GetSystemMetrics(wm.SM_CXDRAG), 1));
-    const minimum_vertical: u32 = @intCast(@max(user32.GetSystemMetrics(wm.SM_CYDRAG), 1));
-    return horizontal >= minimum_horizontal or vertical >= minimum_vertical;
+    return tab_drag_geometry.exceededThreshold(
+        dragPoint(anchor),
+        dragPoint(point),
+        @max(user32.GetSystemMetrics(wm.SM_CXDRAG), 1),
+        @max(user32.GetSystemMetrics(wm.SM_CYDRAG), 1),
+    );
 }
 
-fn tabDragTargetIndex(point: foundation.POINT) ?usize {
-    const control = tab_control orelse return null;
+fn tabDragTargetSlot(control: foundation.HWND, point: foundation.POINT) ?usize {
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(control, &client) == 0) return null;
+    if (!tab_drag_geometry.contains(dragRect(client), dragPoint(point))) return null;
     const count = user32.SendMessageW(control, controls.TCM_GETITEMCOUNT, 0, 0);
-    if (count <= 0) return null;
-    const last_index: usize = @intCast(count - 1);
-
-    var first: foundation.RECT = undefined;
-    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, 0, @bitCast(@intFromPtr(&first))) == 0)
-        return null;
-    if (point.x < first.left) return 0;
-
-    var last: foundation.RECT = undefined;
-    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, last_index, @bitCast(@intFromPtr(&last))) == 0)
-        return null;
-    if (point.x >= last.right) return last_index;
-
+    if (count < 0) return null;
+    if (count == 0) return 0;
     for (0..@as(usize, @intCast(count))) |index| {
         var bounds: foundation.RECT = undefined;
         if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, index, @bitCast(@intFromPtr(&bounds))) == 0)
             return null;
-        if (point.x < bounds.left + @divTrunc(bounds.right - bounds.left, 2)) return index;
+        const left = @max(bounds.left, client.left);
+        const right = @min(bounds.right, client.right);
+        if (right > left and point.x < left + @divTrunc(right - left, 2)) return index;
     }
-    return last_index;
+    return @intCast(count);
 }
 
-fn updateTabDrag(point: foundation.POINT) void {
-    const candidate_id = tab_drag.candidate_id orelse return;
-    if (!tab_drag.dragging) {
-        if (!tabDragExceededThreshold(tab_drag.anchor, point)) return;
-        if (workspace_state.tab(candidate_id) == null) return cancelTabDrag();
-        if (rename_editor != null) cancelRename();
-        tab_drag.dragging = true;
-        _ = user32.SetCapture(tab_control);
+fn dragPoint(point: foundation.POINT) tab_drag_geometry.Point {
+    return .{ .x = point.x, .y = point.y };
+}
+
+fn dragRect(rect: foundation.RECT) tab_drag_geometry.Rect {
+    return .{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.bottom };
+}
+
+fn screenRect(hwnd: foundation.HWND) ?foundation.RECT {
+    var rect: foundation.RECT = undefined;
+    if (user32.GetWindowRect(hwnd, &rect) == 0) return null;
+    return rect;
+}
+
+fn dragThresholdFor(control: foundation.HWND) foundation.POINT {
+    const dpi = @max(user32.GetDpiForWindow(control), geometry.base_dpi);
+    return .{
+        .x = @max(user32.GetSystemMetricsForDpi(wm.SM_CXDRAG, dpi), 1),
+        .y = @max(user32.GetSystemMetricsForDpi(wm.SM_CYDRAG, dpi), 1),
+    };
+}
+
+fn beginTabDragCandidate(
+    state: *WindowState,
+    control: foundation.HWND,
+    id: workspace.TabId,
+    index: usize,
+    client_point: foundation.POINT,
+) void {
+    const application = state.application;
+    switch (application.tab_drag) {
+        .idle => {},
+        else => return,
+    }
+    if (state.model_window.lifecycle != .live or state.rename_editor != null or
+        state.ownedWorkspace().tab(id) == null)
+        return;
+    var anchor_screen = client_point;
+    if (user32.ClientToScreen(control, &anchor_screen) == 0) return;
+    var item: foundation.RECT = undefined;
+    if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, index, @bitCast(@intFromPtr(&item))) == 0) return;
+    var client: foundation.RECT = undefined;
+    const source_dpi = @max(user32.GetDpiForWindow(state.hwnd), geometry.base_dpi);
+    if (user32.GetClientRect(state.hwnd, &client) == 0) return;
+    application.tab_drag = .{ .candidate = .{
+        .source_window_id = state.model_window.id,
+        .tab_id = id,
+        .original_index = index,
+        .anchor_screen = anchor_screen,
+        .grab_offset_dip = .{
+            .x = tab_drag_geometry.scale(client_point.x - item.left, source_dpi, geometry.base_dpi),
+            .y = tab_drag_geometry.scale(client_point.y - item.top, source_dpi, geometry.base_dpi),
+        },
+        .source_client_width_dip = tab_drag_geometry.scale(client.right - client.left, source_dpi, geometry.base_dpi),
+        .source_client_height_dip = tab_drag_geometry.scale(client.bottom - client.top, source_dpi, geometry.base_dpi),
+    } };
+    application.tab_drag_diagnostics.candidates +|= 1;
+}
+
+fn updateApplicationTabDrag(
+    application: *Application,
+    callback_state: *WindowState,
+    client_point: foundation.POINT,
+    mouse_keys: usize,
+) void {
+    var screen_point = client_point;
+    const callback_control = callback_state.tab_control orelse return;
+    if (user32.ClientToScreen(callback_control, &screen_point) == 0) return;
+
+    switch (application.tab_drag) {
+        .idle, .finishing => return,
+        .candidate => |candidate| {
+            if (candidate.source_window_id != callback_state.model_window.id) return;
+            const threshold = dragThresholdFor(callback_control);
+            if (!tab_drag_geometry.exceededThreshold(
+                dragPoint(candidate.anchor_screen),
+                dragPoint(screen_point),
+                threshold.x,
+                threshold.y,
+            )) return;
+            if (callback_state.model_window.lifecycle != .live or
+                callback_state.ownedWorkspace().tab(candidate.tab_id) == null)
+                return cancelApplicationTabDrag(application, false);
+            if ((mouse_keys & 1) == 0)
+                return cancelApplicationTabDrag(application, false);
+            if (callback_state.rename_editor != null) {
+                bindWindowState(callback_state);
+                cancelRename();
+            }
+            _ = user32.SetCapture(callback_control);
+            if (user32.GetCapture() != callback_control)
+                return cancelApplicationTabDrag(application, false);
+            application.tab_drag = .{ .active = .{
+                .candidate = candidate,
+                .capture_hwnd = callback_control,
+            } };
+            application.tab_drag_diagnostics.started +|= 1;
+        },
+        .active => {},
     }
 
-    const target_index = tabDragTargetIndex(point) orelse return;
-    if (workspace_state.indexOfTab(candidate_id) == target_index) return;
-    if (!workspace_state.reorderTab(candidate_id, target_index)) return cancelTabDrag();
-    syncNativeTabs() catch |err| {
-        std.log.err("failed to synchronize reordered tabs: {}", .{err});
-        cancelTabDrag();
+    var active = switch (application.tab_drag) {
+        .active => |value| value,
+        else => return,
     };
+    if (active.capture_hwnd != callback_control or
+        active.candidate.source_window_id != callback_state.model_window.id)
+        return cancelApplicationTabDrag(application, true);
+    if ((mouse_keys & 1) == 0)
+        return cancelApplicationTabDrag(application, true);
+
+    const next_hover = discoverTabHover(application, &active, screen_point);
+    if (!hoverTargetEqual(active.hover, next_hover)) {
+        invalidateHover(application, active.hover);
+        active.hover = next_hover;
+        invalidateHover(application, active.hover);
+        application.tab_drag_diagnostics.target_changes +|= 1;
+    }
+
+    if (switch (active.hover) {
+        .source => true,
+        else => false,
+    }) {
+        const slot = switch (active.hover) {
+            .source => |value| value,
+            else => unreachable,
+        };
+        const current = callback_state.ownedWorkspace().indexOfTab(active.candidate.tab_id) orelse
+            return cancelApplicationTabDrag(application, true);
+        const target = tab_drag_geometry.localIndexForSlot(current, slot, callback_state.ownedWorkspace().tabs.items.len);
+        if (current != target) {
+            bindWindowState(callback_state);
+            if (!callback_state.ownedWorkspace().reorderTab(active.candidate.tab_id, target))
+                return cancelApplicationTabDrag(application, true);
+            active.local_order_changed = true;
+            syncNativeTabs() catch |err| {
+                std.log.err("failed to synchronize reordered tabs: {}", .{err});
+                return cancelApplicationTabDrag(application, true);
+            };
+        }
+    }
+    application.tab_drag = .{ .active = active };
+    updateDragCursor(application, screen_point, active.hover);
+}
+
+fn discoverTabHover(
+    application: *Application,
+    active: *const TabDragActive,
+    screen_point: foundation.POINT,
+) TabHoverTarget {
+    const source = application.stateForId(active.candidate.source_window_id) orelse return .none;
+    const source_control = source.tab_control orelse return .none;
+    const threshold = dragThresholdFor(source_control);
+    const source_bounds = screenRect(source_control) orelse return .none;
+
+    const top = user32.WindowFromPoint(screen_point);
+    if (top) |top_window| {
+        const root = user32.GetAncestor(top_window, wm.GA_ROOT);
+        if (root) |root_window| if (application.stateForWindow(root_window)) |candidate| {
+            if (candidate.model_window.lifecycle == .live and
+                candidate.hwnd != null and candidate.tab_control != null and
+                user32.IsWindow(candidate.tab_control) != 0 and
+                user32.IsWindowVisible(candidate.tab_control) != 0 and
+                user32.IsWindowEnabled(candidate.tab_control) != 0)
+            {
+                const control = candidate.tab_control.?;
+                // A rename editor or native overflow child is deliberately a
+                // no-drop surface. Ordinary tab hits resolve to the control.
+                if (top_window == control) {
+                    var local = screen_point;
+                    if (user32.ScreenToClient(control, &local) != 0) {
+                        if (tabDragTargetSlot(control, local)) |slot| {
+                            if (candidate == source) return .{ .source = slot };
+                            return .{ .window = .{
+                                .window_id = candidate.model_window.id,
+                                .insertion_index = slot,
+                            } };
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    // Hidden-window smoke tests have no z-order hit. Keep local reorder
+    // testable while production-visible windows still use WindowFromPoint.
+    if (user32.IsWindowVisible(source_control) == 0 and
+        tab_drag_geometry.contains(dragRect(source_bounds), dragPoint(screen_point)))
+    {
+        var local = screen_point;
+        if (user32.ScreenToClient(source_control, &local) != 0)
+            if (tabDragTargetSlot(source_control, local)) |slot| return .{ .source = slot };
+    }
+
+    return if (tab_drag_geometry.tearOutArmed(
+        dragRect(source_bounds),
+        dragPoint(screen_point),
+        threshold.x,
+        threshold.y,
+    )) .tear_out else .none;
+}
+
+fn hoverTargetEqual(a: TabHoverTarget, b: TabHoverTarget) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .none, .tear_out => true,
+        .source => |slot| slot == b.source,
+        .window => |target| target.window_id == b.window.window_id and
+            target.insertion_index == b.window.insertion_index,
+    };
+}
+
+fn hoverState(application: *Application, hover: TabHoverTarget) ?*WindowState {
+    return switch (hover) {
+        .source => switch (application.tab_drag) {
+            .active => |active| application.stateForId(active.candidate.source_window_id),
+            else => null,
+        },
+        .window => |target| application.stateForId(target.window_id),
+        else => null,
+    };
+}
+
+fn invalidateHover(application: *Application, hover: TabHoverTarget) void {
+    const state = hoverState(application, hover) orelse return;
+    if (state.tab_control) |control| _ = user32.InvalidateRect(control, null, 0);
+}
+
+fn markerSlotForState(application: *Application, state: *WindowState) ?usize {
+    return switch (application.tab_drag) {
+        .active => |active| switch (active.hover) {
+            .source => |slot| if (active.candidate.source_window_id == state.model_window.id) slot else null,
+            .window => |target| if (target.window_id == state.model_window.id) target.insertion_index else null,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn drawTabInsertionMarker(application: *Application, state: *WindowState) void {
+    const slot = markerSlotForState(application, state) orelse return;
+    const control = state.tab_control orelse return;
+    const count_raw = user32.SendMessageW(control, controls.TCM_GETITEMCOUNT, 0, 0);
+    if (count_raw < 0) return;
+    const count: usize = @intCast(count_raw);
+    if (slot > count) return;
+    var client: foundation.RECT = undefined;
+    if (user32.GetClientRect(control, &client) == 0) return;
+    var x = client.left;
+    var top = client.top;
+    var bottom = client.bottom;
+    if (count != 0) {
+        var item: foundation.RECT = undefined;
+        const item_index = if (slot == count) count - 1 else slot;
+        if (user32.SendMessageW(control, controls.TCM_GETITEMRECT, item_index, @bitCast(@intFromPtr(&item))) == 0) return;
+        x = if (slot == count) item.right else item.left;
+        top = @max(item.top, client.top);
+        bottom = @min(item.bottom, client.bottom);
+    }
+    const thickness: i32 = @max(tab_drag_geometry.scale(2, geometry.base_dpi, user32.GetDpiForWindow(control)), 2);
+    var marker: foundation.RECT = .{
+        .left = std.math.clamp(x - @divTrunc(thickness, 2), client.left, @max(client.right - thickness, client.left)),
+        .top = top,
+        .right = 0,
+        .bottom = bottom,
+    };
+    marker.right = marker.left + thickness;
+    const dc = user32.GetDC(control) orelse return;
+    defer _ = user32.ReleaseDC(control, dc);
+    _ = user32.FillRect(dc, &marker, user32.GetSysColorBrush(gdi.COLOR_HIGHLIGHT));
+}
+
+fn updateDragCursor(application: *Application, point: foundation.POINT, hover: TabHoverTarget) void {
+    _ = application;
+    const cursor = switch (hover) {
+        .none => blk: {
+            if (user32.WindowFromPoint(point)) |hit| {
+                if (user32.GetAncestor(hit, wm.GA_ROOT)) |root|
+                    if (active_application) |app| if (app.stateForWindow(root) != null)
+                        break :blk user32.LoadCursorW(null, wm.IDC_NO);
+            }
+            break :blk user32.LoadCursorW(null, wm.IDC_ARROW);
+        },
+        else => user32.LoadCursorW(null, wm.IDC_ARROW),
+    };
+    if (cursor) |value| _ = user32.SetCursor(value);
+}
+
+fn finishApplicationTabDrag(
+    application: *Application,
+    callback_state: *WindowState,
+    client_point: foundation.POINT,
+) void {
+    var screen_point = client_point;
+    const control = callback_state.tab_control orelse return cancelApplicationTabDrag(application, true);
+    if (user32.ClientToScreen(control, &screen_point) == 0)
+        return cancelApplicationTabDrag(application, true);
+    const active = switch (application.tab_drag) {
+        .candidate => {
+            application.tab_drag = .idle;
+            return;
+        },
+        .active => |value| value,
+        else => return,
+    };
+    const final_hover = discoverTabHover(application, &active, screen_point);
+    invalidateHover(application, active.hover);
+    const request: ?TabDropRequest = switch (final_hover) {
+        .source => |slot| .{ .reorder = .{
+            .source_window_id = active.candidate.source_window_id,
+            .tab_id = active.candidate.tab_id,
+            .index = tab_drag_geometry.localIndexForSlot(
+                callback_state.ownedWorkspace().indexOfTab(active.candidate.tab_id) orelse active.candidate.original_index,
+                slot,
+                callback_state.ownedWorkspace().tabs.items.len,
+            ),
+        } },
+        .window => |target| .{ .transfer = .{
+            .source_window_id = active.candidate.source_window_id,
+            .tab_id = active.candidate.tab_id,
+            .destination_window_id = target.window_id,
+            .insertion_index = target.insertion_index,
+            .original_index = active.candidate.original_index,
+        } },
+        .tear_out => .{ .tear_out = .{
+            .source_window_id = active.candidate.source_window_id,
+            .tab_id = active.candidate.tab_id,
+            .original_index = active.candidate.original_index,
+            .point = screen_point,
+            .grab_offset_dip = active.candidate.grab_offset_dip,
+            .source_client_width_dip = active.candidate.source_client_width_dip,
+            .source_client_height_dip = active.candidate.source_client_height_dip,
+        } },
+        .none => null,
+    };
+    if (request == null) {
+        rollbackTabDrag(application, active.candidate, active.local_order_changed);
+        application.tab_drag = .idle;
+        application.tab_drag_diagnostics.canceled +|= 1;
+        return;
+    }
+    application.tab_drag = .{ .finishing = .{
+        .request = request,
+        .capture_hwnd = active.capture_hwnd,
+    } };
+}
+
+fn releaseFinishedTabCapture() void {
+    const application = active_application orelse return;
+    const finishing = switch (application.tab_drag) {
+        .finishing => |value| value,
+        else => return,
+    };
+    if (finishing.capture_hwnd) |capture| {
+        if (user32.GetCapture() == capture) _ = user32.ReleaseCapture();
+    }
+    if (finishing.request == null) {
+        application.tab_drag = .idle;
+        return;
+    }
+    const receiver = application.notification_window orelse {
+        cancelApplicationTabDrag(application, false);
+        return;
+    };
+    if (user32.PostMessageW(receiver, tab_drop_message, 0, 0) == 0)
+        cancelApplicationTabDrag(application, false);
+}
+
+fn rollbackTabDrag(application: *Application, candidate: TabDragCandidate, changed: bool) void {
+    if (!changed) return;
+    application.tab_drag_diagnostics.rollback_attempts +|= 1;
+    const source = application.stateForId(candidate.source_window_id) orelse return;
+    if (source.model_window.lifecycle != .live or source.ownedWorkspace().tab(candidate.tab_id) == null) return;
+    bindWindowState(source);
+    if (!source.ownedWorkspace().reorderTab(candidate.tab_id, candidate.original_index)) {
+        application.tab_drag_diagnostics.rollback_failures +|= 1;
+        return;
+    }
+    syncNativeTabs() catch {
+        application.tab_drag_diagnostics.rollback_failures +|= 1;
+        if (source.hwnd) |window| _ = user32.InvalidateRect(window, null, 0);
+    };
+    if (source.hwnd) |window| _ = user32.SetFocus(window);
+}
+
+fn cancelApplicationTabDrag(application: *Application, release_capture: bool) void {
+    const state = application.tab_drag;
+    switch (state) {
+        .idle => return,
+        .candidate => {},
+        .active => |active| {
+            invalidateHover(application, active.hover);
+            rollbackTabDrag(application, active.candidate, active.local_order_changed);
+            if (release_capture and user32.GetCapture() == active.capture_hwnd)
+                _ = user32.ReleaseCapture();
+        },
+        .finishing => |finishing| if (finishing.request) |request| switch (request) {
+            .transfer => |value| rollbackStableRequest(application, value.source_window_id, value.tab_id, value.original_index),
+            .tear_out => |value| rollbackStableRequest(application, value.source_window_id, value.tab_id, value.original_index),
+            .reorder => {},
+        },
+    }
+    application.tab_drag = .idle;
+    application.tab_drag_diagnostics.canceled +|= 1;
+    if (user32.LoadCursorW(null, wm.IDC_ARROW)) |cursor| _ = user32.SetCursor(cursor);
+}
+
+fn cancelCandidateOrActiveDrag(application: *Application) void {
+    switch (application.tab_drag) {
+        .candidate, .active => cancelApplicationTabDrag(application, true),
+        .idle, .finishing => {},
+    }
+}
+
+fn rollbackStableRequest(application: *Application, window_id: workspace.WindowId, tab_id: workspace.TabId, index: usize) void {
+    const state = application.stateForId(window_id) orelse return;
+    const candidate: TabDragCandidate = .{
+        .source_window_id = window_id,
+        .tab_id = tab_id,
+        .original_index = index,
+        .anchor_screen = .{ .x = 0, .y = 0 },
+        .grab_offset_dip = .{ .x = 0, .y = 0 },
+        .source_client_width_dip = 0,
+        .source_client_height_dip = 0,
+    };
+    rollbackTabDrag(application, candidate, state.ownedWorkspace().indexOfTab(tab_id) != index);
+}
+
+fn cancelDragIfSource(application: *Application, id: workspace.WindowId) void {
+    const is_source = switch (application.tab_drag) {
+        .candidate => |candidate| candidate.source_window_id == id,
+        .active => |active| active.candidate.source_window_id == id,
+        .finishing => |finishing| if (finishing.request) |request| switch (request) {
+            .reorder => |value| value.source_window_id == id,
+            .transfer => |value| value.source_window_id == id,
+            .tear_out => |value| value.source_window_id == id,
+        } else false,
+        .idle => false,
+    };
+    if (is_source) cancelApplicationTabDrag(application, true);
+}
+
+fn clearDragDestination(application: *Application, id: workspace.WindowId) void {
+    var active = switch (application.tab_drag) {
+        .active => |value| value,
+        else => return,
+    };
+    switch (active.hover) {
+        .window => |target| if (target.window_id == id) {
+            invalidateHover(application, active.hover);
+            active.hover = .none;
+            application.tab_drag = .{ .active = active };
+        },
+        else => {},
+    }
 }
 
 fn nativeIndexForTab(id: workspace.TabId) ?usize {
@@ -1947,6 +2648,106 @@ fn verifyTabDragReordering(window: foundation.HWND) !void {
     try expectNativeActiveTab(first_id);
 }
 
+fn verifyCrossWindowTabDrag(source: *WindowState, instance: foundation.HINSTANCE) !void {
+    const source_window = source.hwnd orelse return error.SourceWindowUnavailable;
+    bindWindowState(source);
+    try createTerminalTab(source_window);
+    try createTerminalTab(source_window);
+    try createTerminalTab(source_window);
+    const first = source.ownedWorkspace().tabs.items[0];
+    const second = source.ownedWorkspace().tabs.items[1];
+    const third = source.ownedWorkspace().tabs.items[2];
+    const first_address = @intFromPtr(first);
+    const second_address = @intFromPtr(second);
+
+    const destination = try createVisibleWindow(source.application, instance);
+    const destination_window = destination.hwnd orelse return error.DestinationWindowUnavailable;
+    const original_destination_id = destination.ownedWorkspace().tabs.items[0].id;
+
+    const transfers = [_]struct { id: workspace.TabId, index: usize }{
+        .{ .id = first.id, .index = 0 },
+        .{ .id = second.id, .index = 1 },
+        .{ .id = third.id, .index = 3 },
+    };
+    for (transfers) |transfer| {
+        source.application.tab_drag = .{ .finishing = .{ .request = .{ .transfer = .{
+            .source_window_id = source.model_window.id,
+            .tab_id = transfer.id,
+            .destination_window_id = destination.model_window.id,
+            .insertion_index = transfer.index,
+            .original_index = source.ownedWorkspace().indexOfTab(transfer.id).?,
+        } } } };
+        processPendingTabDrop(source.application);
+    }
+    if (destination.ownedWorkspace().tabs.items.len != 4 or
+        destination.ownedWorkspace().tabs.items[0].id != first.id or
+        destination.ownedWorkspace().tabs.items[1].id != second.id or
+        destination.ownedWorkspace().tabs.items[2].id != original_destination_id or
+        destination.ownedWorkspace().tabs.items[3].id != third.id)
+        return error.IndexedDragTransferOrderMismatch;
+    if (@intFromPtr(destination.ownedWorkspace().tabs.items[0]) != first_address or
+        @intFromPtr(destination.ownedWorkspace().tabs.items[1]) != second_address)
+        return error.IndexedDragTransferChangedIdentity;
+    try verifyNativeTabPresentation(destination);
+
+    var release_point: foundation.POINT = .{ .x = 200, .y = 120 };
+    var destination_bounds: foundation.RECT = undefined;
+    if (user32.GetWindowRect(destination_window, &destination_bounds) != 0)
+        release_point = .{ .x = destination_bounds.left + 200, .y = destination_bounds.top + 80 };
+    const windows_before = source.application.windows.items.len;
+    source.application.tab_drag = .{ .finishing = .{ .request = .{ .tear_out = .{
+        .source_window_id = destination.model_window.id,
+        .tab_id = second.id,
+        .original_index = 1,
+        .point = release_point,
+        .grab_offset_dip = .{ .x = 20, .y = 10 },
+        .source_client_width_dip = 700,
+        .source_client_height_dip = 420,
+    } } } };
+    processPendingTabDrop(source.application);
+    if (source.application.windows.items.len != windows_before + 1)
+        return error.TearOutDidNotCreateDestination;
+    const torn = source.application.windows.items[source.application.windows.items.len - 1];
+    if (torn.ownedWorkspace().tabs.items.len != 1 or
+        @intFromPtr(torn.ownedWorkspace().tabs.items[0]) != second_address)
+        return error.TearOutChangedTabIdentity;
+    const torn_window = torn.hwnd orelse return error.TearOutWindowUnavailable;
+    var torn_bounds: foundation.RECT = undefined;
+    if (user32.GetWindowRect(torn_window, &torn_bounds) == 0 or
+        torn_bounds.right <= torn_bounds.left or torn_bounds.bottom <= torn_bounds.top)
+        return error.TearOutPlacementInvalid;
+
+    bindWindowState(source);
+    try createTerminalTab(source_window);
+    try createTerminalTab(source_window);
+    const rollback_id = source.ownedWorkspace().tabs.items[0].id;
+    if (!source.ownedWorkspace().reorderTab(rollback_id, 2)) return error.RollbackSetupFailed;
+    try syncNativeTabs();
+    source.application.tab_drag = .{ .active = .{
+        .candidate = .{
+            .source_window_id = source.model_window.id,
+            .tab_id = rollback_id,
+            .original_index = 0,
+            .anchor_screen = .{ .x = 0, .y = 0 },
+            .grab_offset_dip = .{ .x = 0, .y = 0 },
+            .source_client_width_dip = 700,
+            .source_client_height_dip = 420,
+        },
+        .capture_hwnd = source.tab_control.?,
+        .local_order_changed = true,
+    } };
+    cancelApplicationTabDrag(source.application, false);
+    if (source.ownedWorkspace().indexOfTab(rollback_id) != 0)
+        return error.CanceledDragDidNotRestoreOriginalOrder;
+    try verifyNativeTabPresentation(source);
+
+    bindWindowState(torn);
+    beginWindowClose(torn_window);
+    bindWindowState(destination);
+    beginWindowClose(destination_window);
+    bindWindowState(source);
+}
+
 const TabDragDirection = enum { left, right };
 
 fn dragNativeTabToPoint(
@@ -1971,15 +2772,18 @@ fn dragNativeTabToPoint(
         return error.GetTabItemRectFailed;
     const destination: foundation.POINT = .{
         .x = switch (direction) {
-            .left => boundary.left - 4,
+            .left => boundary.left + 1,
             .right => boundary.right + 4,
         },
         .y = anchor.y,
     };
 
     _ = user32.SendMessageW(control, wm.WM_LBUTTONDOWN, 0, packMessagePoint(anchor));
-    _ = user32.SendMessageW(control, wm.WM_MOUSEMOVE, 0, packMessagePoint(destination));
+    _ = user32.SendMessageW(control, wm.WM_MOUSEMOVE, 1, packMessagePoint(destination));
     _ = user32.SendMessageW(control, wm.WM_LBUTTONUP, 0, packMessagePoint(destination));
+    // SendMessage does not pump the deferred notification-window request as a
+    // real input loop would. Consume it here before starting the next gesture.
+    if (active_application) |application| processPendingTabDrop(application);
 }
 
 fn expectNativeTabOrder(expected: []const workspace.TabId) !void {
@@ -2050,9 +2854,9 @@ fn windowProcImpl(
         },
         wm.WM_SIZE => {
             if (frame_trace.enabled) resize_message_count +|= 1;
-            cancelTabDrag();
+            if (state) |value| cancelDragIfSource(value.application, value.model_window.id);
             if (wparam != wm.SIZE_MINIMIZED and
-                (state == null or state.?.renderer.gpu != null))
+                (state == null or (state.?.renderer.gpu != null and state.?.active_model != null)))
             {
                 resizeForClient(window) catch {
                     std.log.err("failed to resize terminal for client area", .{});
@@ -2085,7 +2889,7 @@ fn windowProcImpl(
             return user32.DefWindowProcW(window, message, wparam, lparam);
         },
         wm.WM_DPICHANGED => {
-            cancelTabDrag();
+            if (state) |value| cancelDragIfSource(value.application, value.model_window.id);
             const dpi: u16 = @truncate(wparam);
             if (state) |value| value.dpi = dpi;
             terminal_metrics.* = active_renderer.metricsForDpi(dpi);
@@ -2127,6 +2931,11 @@ fn windowProcImpl(
             const failure = renderer_failure orelse error.RendererUnavailable;
             showRendererFailure(window, failure);
             beginWindowClose(window);
+            return 0;
+        },
+        tab_drop_message => {
+            if (state == null) if (active_application) |application|
+                processPendingTabDrop(application);
             return 0;
         },
         conpty.output_message => {
@@ -2172,6 +2981,18 @@ fn windowProcImpl(
             return 0;
         },
         wm.WM_KEYDOWN, wm.WM_SYSKEYDOWN, wm.WM_KEYUP, wm.WM_SYSKEYUP => {
+            if (wparam == 0x1b) if (active_application) |application| {
+                if (switch (application.tab_drag) {
+                    .idle => false,
+                    else => true,
+                }) {
+                    if (message == wm.WM_KEYDOWN or message == wm.WM_SYSKEYDOWN) {
+                        application.suppress_drag_escape_character = true;
+                        cancelApplicationTabDrag(application, true);
+                    }
+                    return 0;
+                }
+            };
             // Do not turn the real Windows system gestures into terminal
             // input.  In particular DefWindowProc owns Alt+F4 and Alt+Space;
             // unbound Alt combinations remain terminal input below.
@@ -2181,6 +3002,12 @@ fn windowProcImpl(
             return 0;
         },
         wm.WM_CHAR, wm.WM_SYSCHAR => {
+            if (wparam == 0x1b) if (active_application) |application| {
+                if (application.suppress_drag_escape_character) {
+                    application.suppress_drag_escape_character = false;
+                    return 0;
+                }
+            };
             // WM_SYSCHAR is generated for system-menu mnemonics. Application
             // shortcuts have already accounted for their generated character;
             // ordinary Alt text is intentionally delivered to the terminal.
@@ -2263,14 +3090,22 @@ fn windowStateFromHwnd(window: foundation.HWND) ?*WindowState {
 /// not receive WM_CLOSE, so they must establish the same lifecycle boundary
 /// before DestroyWindow synchronously enters WM_DESTROY.
 fn beginWindowClose(window: foundation.HWND) void {
-    if (windowStateFromHwnd(window)) |state| {
+    const closing_state = windowStateFromHwnd(window);
+    const caller_state = if (app_window) |caller| windowStateFromHwnd(caller) else null;
+    if (closing_state) |state| {
+        if (caller_state != state) bindWindowState(state);
+        defer if (caller_state) |caller| {
+            if (caller != state and caller.model_window.lifecycle != .destroyed)
+                bindWindowState(caller);
+        };
+        cancelDragIfSource(state.application, state.model_window.id);
+        clearDragDestination(state.application, state.model_window.id);
         capturePerformanceSnapshot(state);
         switch (state.model_window.lifecycle) {
             .destroyed, .closing => return,
             .constructing, .live, .transferring => state.model_window.lifecycle = .closing,
         }
     }
-    cancelTabDrag();
     if (model_initialized) while (workspace_state.active_tab_id) |id| {
         const tab = workspace_state.tab(id) orelse break;
         retireTab(tab);
@@ -3390,6 +4225,11 @@ fn finishMultiSessionIntegration(window: foundation.HWND) void {
 fn logDebugCounters() void {
     if (!frame_trace.enabled or active_mode != .normal) return;
     const application = active_application orelse return;
+    const drag = application.tab_drag_diagnostics;
+    std.log.info(
+        "tab drag counters: candidates={d} started={d} canceled={d} completed={d} target_changes={d} indexed_transfers={d} tear_outs={d} rollback_attempts={d} rollback_failures={d} stale_requests={d}",
+        .{ drag.candidates, drag.started, drag.canceled, drag.completed, drag.target_changes, drag.indexed_transfers, drag.tear_outs, drag.rollback_attempts, drag.rollback_failures, drag.stale_requests },
+    );
     var captured: ?PerformanceSnapshot = null;
     for (application.windows.items) |state| if (state.performance_snapshot) |snapshot| {
         captured = snapshot;
@@ -3960,6 +4800,7 @@ fn isSmokeMode(mode: Mode) bool {
         mode == .smoke_rename or
         mode == .smoke_tab_interactions or
         mode == .smoke_tab_drag or
+        mode == .smoke_cross_window_drag or
         mode == .smoke_multi_window or
         mode == .smoke_transfer_hardening;
 }

@@ -32,6 +32,10 @@ test "tab drag reordering preserves native identities and active selection" {
     try app.run(.smoke_tab_drag);
 }
 
+test "cross-window indexed drops tear-out and cancellation preserve tab identity" {
+    try app.run(.smoke_cross_window_drag);
+}
+
 test "closing one native top-level window leaves its sibling live" {
     try app.run(.smoke_multi_window);
 }
