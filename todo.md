@@ -35,6 +35,13 @@ constraints, but they do not replace this tracker.
   independent windows, command-driven transfer, lifecycle routing, asynchronous
   retirement, automated `zig build verify` coverage, and the required manual
   mixed-DPI, accessibility, Windows-behavior, and renderer-fallback QA.
+- **Done** — [Bundled Nerd Font symbol fallback](docs/architecture/font-fallback-plan.md):
+  application-local Symbols Nerd Font Mono fallback for Private Use Area
+  glyphs, installed with the executable and covered by license attribution.
+- **Done** — [Terminal output and glyph rendering performance pass](docs/architecture/output-rendering-performance-plan.md):
+  bounded/coalesced ConPTY output delivery, retained damage and text-plan
+  caching, batched direct-glyph runs, detailed frame tracing, and an automated
+  live-output GPU smoke benchmark.
 
 ## Needs planning
 
@@ -58,8 +65,8 @@ constraints, but they do not replace this tracker.
   send bound keys through to the terminal.
 - A command palette backed by the hotkey action registry.
 - Terminal and application-chrome themes with built-in light/dark themes.
-- A better default terminal font with Nerd Font glyph coverage and a licensing
-  decision.
+- A better default primary terminal font. Nerd Font Private Use Area coverage
+  and its licensing decision are complete through the bundled symbol fallback.
 - Font zoom and reset behavior that remains correct across DPI changes.
 - Configurable visual and audible bells, including background-tab attention.
 
@@ -83,8 +90,9 @@ constraints, but they do not replace this tracker.
   session restoration or terminal-content disclosure.
 - Application icons, version metadata, release packaging, installer support,
   Scoop, and WinGet distribution.
-- Performance and stress tests for large scrollback, rapid resizing, sustained
-  output, many tabs/panes, device loss, and repeated session lifecycle; define
+- Broader performance and stress tests for large scrollback, rapid resizing,
+  sustained output, many tabs/panes, device loss, and repeated session
+  lifecycle; expand the existing live-output smoke threshold into defined
   resource/responsiveness limits and CI regression checks.
 - Scroll-aware retained-renderer back-buffer updates, including damage tracking,
   copy-versus-redraw decisions, resize/DPI invalidation, and benchmarks.
