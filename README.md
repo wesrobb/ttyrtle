@@ -142,6 +142,18 @@ Windows character path, but pre-edit composition and candidate positioning are
 not rendered yet. Selection is backed by Ghostty's retained screen state and
 can span scrollback and the live viewport.
 
+ConPTY can leave the shell cursor at the bottom row of a previously smaller
+window after the window is shrunk and then enlarged. New input consequently
+starts partway up the enlarged viewport. This is an upstream ConPTY resize and
+reflow limitation also reproduced by other Windows terminal hosts; ttyrtle
+does not attempt to move the displayed cursor independently because that would
+desynchronize it from ConPTY and the shell's line editor. For shells that
+support it, clearing or redrawing the prompt (commonly `Ctrl+L`) is the
+short-term workaround. The equivalent WezTerm report is tracked in
+[wezterm/wezterm#1265](https://github.com/wezterm/wezterm/issues/1265), with
+the related ConPTY resize behavior documented in
+[microsoft/terminal#16911](https://github.com/microsoft/terminal/issues/16911).
+
 The Direct2D renderer shapes one complete UTF-16 row at a time with persistent
 system font fallback plus bundled Symbols Nerd Font Mono fallback for Nerd Font
 Private Use Area glyphs. Ghostty graphemes retain exact one- or two-cell advances,
