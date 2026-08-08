@@ -6,6 +6,7 @@ const render_commands = @import("../render_commands.zig");
 const terminal = @import("../terminal.zig");
 const resource_cache = @import("resource_cache.zig");
 const text_plan = @import("text_plan.zig");
+const damage_bands = @import("damage_bands.zig");
 
 const foundation = win32.foundation;
 const d2d = win32.graphics.direct2d;
@@ -41,6 +42,8 @@ const RowLayout = struct {
     text: []u16,
     cell_widths: []u8,
     layout: *dwrite.IDWriteTextLayout,
+    overhang_top: f32,
+    overhang_bottom: f32,
     last_used: u64,
 
     fn deinit(self: *RowLayout) void {
@@ -81,6 +84,11 @@ pub const DeviceResources = struct {
     font_generation: u64,
     row_layouts: std.ArrayListUnmanaged(RowLayout),
     row_layout_fingerprints: std.ArrayListUnmanaged(u64),
+    scene_row_overhangs: std.ArrayListUnmanaged(damage_bands.RowOverhang),
+    pending_row_overhangs: std.ArrayListUnmanaged(damage_bands.RowOverhang),
+    dirty_row_scratch: std.ArrayListUnmanaged(bool),
+    damage_band_scratch: std.ArrayListUnmanaged(damage_bands.Band),
+    scene_max_overhang: damage_bands.RowOverhang,
     cell_width_scratch: std.ArrayListUnmanaged(u8),
     spacing_adjustment_scratch: std.ArrayListUnmanaged(text_plan.SpacingAdjustment),
     hit_test_scratch: std.ArrayListUnmanaged(dwrite.DWRITE_HIT_TEST_METRICS),
@@ -130,6 +138,11 @@ pub const DeviceResources = struct {
         resources.font_generation = 0;
         resources.row_layouts = .empty;
         resources.row_layout_fingerprints = .empty;
+        resources.scene_row_overhangs = .empty;
+        resources.pending_row_overhangs = .empty;
+        resources.dirty_row_scratch = .empty;
+        resources.damage_band_scratch = .empty;
+        resources.scene_max_overhang = .{};
         resources.cell_width_scratch = .empty;
         resources.spacing_adjustment_scratch = .empty;
         resources.hit_test_scratch = .empty;
@@ -378,8 +391,11 @@ pub const DeviceResources = struct {
 
         _ = try self.ensureTextFormat(metrics, dpi);
         try self.resizeRowFingerprints(cache.rows.items.len);
+        try self.resizeOverhangRows(cache.rows.items.len);
         self.rotateRowFingerprintsUp(cache.scroll_up_rows);
         self.rotateRowFingerprintsDown(cache.scroll_down_rows);
+        self.rotateRowOverhangsUp(cache.scroll_up_rows);
+        self.rotateRowOverhangsDown(cache.scroll_down_rows);
         try self.ensureSceneBitmap(cache, metrics, dpi);
         if (!self.scene_valid) {
             try self.drawScene(cache, .full, metrics, dpi);
@@ -421,6 +437,8 @@ pub const DeviceResources = struct {
     pub fn invalidateTerminalContent(self: *DeviceResources) void {
         self.scene_valid = false;
         @memset(self.row_layout_fingerprints.items, 0);
+        @memset(self.scene_row_overhangs.items, .{});
+        self.scene_max_overhang = .{};
     }
 
     pub fn simulateTargetLossForTesting(self: *DeviceResources) void {
@@ -500,6 +518,20 @@ pub const DeviceResources = struct {
             }
         }
         return true;
+    }
+
+    pub fn rowOverhangCoverageForTesting(self: *const DeviceResources, row: usize) ?[4]u16 {
+        if (row >= self.scene_row_overhangs.items.len) return null;
+        const row_count = self.scene_row_overhangs.items.len;
+        const overhang = self.scene_row_overhangs.items[row];
+        const destination_first: u16 = @intCast(row -| @as(usize, overhang.above));
+        const destination_end: u16 = @intCast(@min(row_count, row + 1 + @as(usize, overhang.below)));
+        return .{
+            destination_first,
+            destination_end,
+            destination_first -| self.scene_max_overhang.below,
+            @intCast(@min(row_count, @as(usize, destination_end) + self.scene_max_overhang.above)),
+        };
     }
 
     fn createTargetBitmap(
@@ -586,6 +618,8 @@ pub const DeviceResources = struct {
         self.scene_capacity_width = capacity_width;
         self.scene_capacity_height = capacity_height;
         self.scene_valid = false;
+        self.scene_max_overhang = .{};
+        @memset(self.scene_row_overhangs.items, .{});
         if (counters_enabled) self.scene_recreation_count +|= 1;
     }
 
@@ -611,29 +645,45 @@ pub const DeviceResources = struct {
         switch (damage) {
             .none => {},
             .full => {
+                self.scene_max_overhang = .{};
                 const background = toColor(cache.background);
                 target.Clear(&background);
                 for (cache.rows.items, 0..) |*row, row_index|
-                    try self.drawCachedRow(
-                        row_index,
-                        row,
-                        cache.columns,
-                        metrics,
-                        dpi,
-                        cache.settled_reflow,
-                    );
+                    try self.prepareRowLayout(row_index, row, cache.columns, metrics, dpi, cache.settled_reflow);
+                for (cache.rows.items) |*row| try self.drawRowRectangles(row, dpi);
+                try self.drawTextRowsClipped(cache, metrics, dpi, 0, @intCast(cache.rows.items.len), 0, @intCast(cache.rows.items.len), cache.settled_reflow);
             },
-            .partial => |rows| for (rows) |row_index| {
-                if (row_index >= cache.rows.items.len) continue;
-                try self.clearRow(cache, metrics, dpi, row_index);
-                try self.drawCachedRow(
-                    row_index,
-                    &cache.rows.items[row_index],
-                    cache.columns,
-                    metrics,
-                    dpi,
-                    false,
+            .partial => |rows| {
+                @memset(self.dirty_row_scratch.items, false);
+                @memcpy(self.pending_row_overhangs.items, self.scene_row_overhangs.items);
+                for (rows) |row_index| {
+                    if (row_index >= cache.rows.items.len) continue;
+                    self.dirty_row_scratch.items[row_index] = true;
+                    const retained = self.scene_row_overhangs.items[row_index];
+                    try self.prepareRowLayout(row_index, &cache.rows.items[row_index], cache.columns, metrics, dpi, false);
+                    self.pending_row_overhangs.items[row_index] = self.scene_row_overhangs.items[row_index];
+                    self.scene_row_overhangs.items[row_index] = retained;
+                }
+                try damage_bands.build(
+                    std.heap.smp_allocator,
+                    self.dirty_row_scratch.items,
+                    self.scene_row_overhangs.items,
+                    self.pending_row_overhangs.items,
+                    self.scene_max_overhang,
+                    &self.damage_band_scratch,
                 );
+                for (rows) |row_index| {
+                    if (row_index >= cache.rows.items.len) continue;
+                    self.scene_row_overhangs.items[row_index] = self.pending_row_overhangs.items[row_index];
+                }
+                for (self.damage_band_scratch.items) |band| {
+                    try self.clearBand(cache, metrics, dpi, band.destination_first, band.destination_end);
+                    for (band.destination_first..band.destination_end) |row_index|
+                        try self.drawRowRectangles(&cache.rows.items[row_index], dpi);
+                }
+                for (self.damage_band_scratch.items) |band| {
+                    try self.drawTextRowsClipped(cache, metrics, dpi, band.destination_first, band.destination_end, band.source_first, band.source_end, false);
+                }
             },
         }
 
@@ -643,16 +693,17 @@ pub const DeviceResources = struct {
         self.scene_valid = true;
     }
 
-    fn clearRow(
+    fn clearBand(
         self: *DeviceResources,
         cache: *const render_commands.RenderCache,
         metrics: geometry.Metrics,
         dpi: u32,
-        row_index: u16,
+        first: u16,
+        end: u16,
     ) !void {
         const scale = dipScale(dpi);
         const top_pixels = metrics.margin_y +
-            @as(u32, row_index) * metrics.cell_height;
+            @as(u32, first) * metrics.cell_height;
         const bounds: d2d_common.D2D_RECT_F = .{
             .left = @as(f32, @floatFromInt(metrics.margin_x)) * scale,
             .top = @as(f32, @floatFromInt(top_pixels)) * scale,
@@ -661,7 +712,7 @@ pub const DeviceResources = struct {
                     @as(u32, cache.columns) * metrics.cell_width,
             )) * scale,
             .bottom = @as(f32, @floatFromInt(
-                top_pixels + metrics.cell_height,
+                metrics.margin_y + @as(u32, end) * metrics.cell_height,
             )) * scale,
         };
         const brush = try self.getBrush(cache.background);
@@ -671,14 +722,10 @@ pub const DeviceResources = struct {
         );
     }
 
-    fn drawCachedRow(
+    fn drawRowRectangles(
         self: *DeviceResources,
-        row_index: usize,
         row: *const render_commands.CachedRow,
-        columns: u16,
-        metrics: geometry.Metrics,
         dpi: u32,
-        settled_reflow: bool,
     ) !void {
         const target = &self.d2d_context.ID2D1RenderTarget;
         const scale = dipScale(dpi);
@@ -701,30 +748,87 @@ pub const DeviceResources = struct {
                 target.FillRectangle(&bounds, @ptrCast(brush));
             }
         }
+    }
 
+    fn drawRowText(
+        self: *DeviceResources,
+        row_index: usize,
+        row: *const render_commands.CachedRow,
+        columns: u16,
+        metrics: geometry.Metrics,
+        dpi: u32,
+        settled_reflow: bool,
+    ) !void {
         const text_length = render_commands.shapedUtf16Length(row);
         if (text_length == 0) return;
+        const target = &self.d2d_context.ID2D1RenderTarget;
+        const scale = dipScale(dpi);
         const entry = try self.rowLayout(row, columns, metrics, dpi, settled_reflow);
-        self.row_layout_fingerprints.items[row_index] = entry.hash;
         defer self.clearDrawingEffects(entry.layout, text_length) catch {};
         try self.applyRowDrawingEffects(entry.layout, row, null);
 
         const row_top = metrics.margin_y + @as(u32, @intCast(row_index)) * metrics.cell_height;
-        const clip: d2d_common.D2D_RECT_F = .{
-            .left = @as(f32, @floatFromInt(metrics.margin_x)) * scale,
-            .top = @as(f32, @floatFromInt(row_top)) * scale,
-            .right = @as(f32, @floatFromInt(metrics.margin_x +
-                @as(u32, columns) * metrics.cell_width)) * scale,
-            .bottom = @as(f32, @floatFromInt(row_top + metrics.cell_height)) * scale,
-        };
-        target.PushAxisAlignedClip(&clip, .ALIASED);
-        defer target.PopAxisAlignedClip();
         const default_brush = try self.getBrush(.{ .red = 255, .green = 255, .blue = 255 });
         target.DrawTextLayout(.{
             .x = @as(f32, @floatFromInt(metrics.margin_x)) * scale,
             .y = @as(f32, @floatFromInt(row_top)) * scale,
         }, entry.layout, @ptrCast(default_brush), .{ .ENABLE_COLOR_FONT = 1 });
         if (counters_enabled) self.cached_row_draw_count +|= 1;
+    }
+
+    fn prepareRowLayout(
+        self: *DeviceResources,
+        row_index: usize,
+        row: *const render_commands.CachedRow,
+        columns: u16,
+        metrics: geometry.Metrics,
+        dpi: u32,
+        settled_reflow: bool,
+    ) !void {
+        const text_length = render_commands.shapedUtf16Length(row);
+        if (text_length == 0) {
+            self.row_layout_fingerprints.items[row_index] = 0;
+            self.scene_row_overhangs.items[row_index] = .{};
+            return;
+        }
+        const entry = try self.rowLayout(row, columns, metrics, dpi, settled_reflow);
+        self.row_layout_fingerprints.items[row_index] = entry.hash;
+        const overhang: damage_bands.RowOverhang = .{
+            .above = damage_bands.overhangRows(entry.overhang_top, metrics.cell_height, dpi),
+            .below = damage_bands.overhangRows(entry.overhang_bottom, metrics.cell_height, dpi),
+        };
+        self.scene_row_overhangs.items[row_index] = overhang;
+        self.scene_max_overhang.above = @max(self.scene_max_overhang.above, overhang.above);
+        self.scene_max_overhang.below = @max(self.scene_max_overhang.below, overhang.below);
+    }
+
+    fn pushBandClip(self: *DeviceResources, columns: u16, metrics: geometry.Metrics, dpi: u32, first: u16, end: u16) void {
+        const scale = dipScale(dpi);
+        const clip: d2d_common.D2D_RECT_F = .{
+            .left = @as(f32, @floatFromInt(metrics.margin_x)) * scale,
+            .top = @as(f32, @floatFromInt(metrics.margin_y + @as(u32, first) * metrics.cell_height)) * scale,
+            .right = @as(f32, @floatFromInt(metrics.margin_x + @as(u32, columns) * metrics.cell_width)) * scale,
+            .bottom = @as(f32, @floatFromInt(metrics.margin_y + @as(u32, end) * metrics.cell_height)) * scale,
+        };
+        self.d2d_context.ID2D1RenderTarget.PushAxisAlignedClip(&clip, .ALIASED);
+    }
+
+    fn drawTextRowsClipped(
+        self: *DeviceResources,
+        cache: *const render_commands.RenderCache,
+        metrics: geometry.Metrics,
+        dpi: u32,
+        clip_first: u16,
+        clip_end: u16,
+        source_first: u16,
+        source_end: u16,
+        settled_reflow: bool,
+    ) !void {
+        const target = &self.d2d_context.ID2D1RenderTarget;
+        self.pushBandClip(cache.columns, metrics, dpi, clip_first, clip_end);
+        defer target.PopAxisAlignedClip();
+        for (source_first..source_end) |row_index|
+            try self.drawRowText(row_index, &cache.rows.items[row_index], cache.columns, metrics, dpi, settled_reflow);
     }
 
     fn rowCellWidths(
@@ -827,6 +931,9 @@ pub const DeviceResources = struct {
             measureLayoutSpacing,
             applyLayoutSpacing,
         );
+        var overhang: dwrite.DWRITE_OVERHANG_METRICS = undefined;
+        if (layout.GetOverhangMetrics(&overhang).failed)
+            return error.MeasureTextOverhangFailed;
         const owned_text = try std.heap.smp_allocator.dupe(u16, text);
         errdefer std.heap.smp_allocator.free(owned_text);
         const owned_widths = try std.heap.smp_allocator.dupe(u8, widths);
@@ -842,6 +949,8 @@ pub const DeviceResources = struct {
             .text = owned_text,
             .cell_widths = owned_widths,
             .layout = layout,
+            .overhang_top = overhang.top,
+            .overhang_bottom = overhang.bottom,
             .last_used = self.layout_use_clock,
         });
         if (counters_enabled) {
@@ -1131,6 +1240,14 @@ pub const DeviceResources = struct {
         if (row_count > old_length) @memset(self.row_layout_fingerprints.items[old_length..], 0);
     }
 
+    fn resizeOverhangRows(self: *DeviceResources, row_count: usize) !void {
+        const old_length = self.scene_row_overhangs.items.len;
+        try self.scene_row_overhangs.resize(std.heap.smp_allocator, row_count);
+        if (row_count > old_length) @memset(self.scene_row_overhangs.items[old_length..], .{});
+        try self.pending_row_overhangs.resize(std.heap.smp_allocator, row_count);
+        try self.dirty_row_scratch.resize(std.heap.smp_allocator, row_count);
+    }
+
     fn rotateRowFingerprintsUp(self: *DeviceResources, count: u16) void {
         const rows = @min(@as(usize, count), self.row_layout_fingerprints.items.len);
         for (0..rows) |_| {
@@ -1147,6 +1264,22 @@ pub const DeviceResources = struct {
         }
     }
 
+    fn rotateRowOverhangsUp(self: *DeviceResources, count: u16) void {
+        const rows = @min(@as(usize, count), self.scene_row_overhangs.items.len);
+        for (0..rows) |_| {
+            const moved = self.scene_row_overhangs.orderedRemove(0);
+            self.scene_row_overhangs.appendAssumeCapacity(moved);
+        }
+    }
+
+    fn rotateRowOverhangsDown(self: *DeviceResources, count: u16) void {
+        const rows = @min(@as(usize, count), self.scene_row_overhangs.items.len);
+        for (0..rows) |_| {
+            const moved = self.scene_row_overhangs.pop().?;
+            self.scene_row_overhangs.insertAssumeCapacity(0, moved);
+        }
+    }
+
     fn clearRowLayouts(self: *DeviceResources) void {
         for (self.row_layouts.items) |*entry| entry.deinit();
         self.row_layouts.clearRetainingCapacity();
@@ -1154,6 +1287,10 @@ pub const DeviceResources = struct {
 
     fn releaseTextResources(self: *DeviceResources) void {
         self.row_layout_fingerprints.deinit(std.heap.smp_allocator);
+        self.scene_row_overhangs.deinit(std.heap.smp_allocator);
+        self.pending_row_overhangs.deinit(std.heap.smp_allocator);
+        self.dirty_row_scratch.deinit(std.heap.smp_allocator);
+        self.damage_band_scratch.deinit(std.heap.smp_allocator);
         self.clearRowLayouts();
         self.row_layouts.deinit(std.heap.smp_allocator);
         self.cell_width_scratch.deinit(std.heap.smp_allocator);

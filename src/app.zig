@@ -4520,7 +4520,7 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     // Every script keeps row-wide shaping while each grapheme is forced back
     // onto its terminal-cell boundary by the final spacing pass.
     try model.write(
-        "\x1b[1;1HASCII" ++
+        "\x1b[1;1Hgypq" ++
             "\x1b[2;1Hoffice" ++
             "\x1b[3;1He\xcc\x81" ++
             "\x1b[4;1H\xe7\x95\x8c" ++
@@ -4530,6 +4530,7 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
             "\x1b[8;1H\xee\x82\xb2",
     );
     try paintForTesting(window);
+    var saw_vertical_overhang = false;
     for (0..8) |row_index| {
         if (!active_renderer.rowGraphemeStartsOnGridForTesting(
             render_cache,
@@ -4537,7 +4538,15 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
             terminal_metrics.*,
             user32.GetDpiForWindow(window),
         )) return error.GraphemeStartDidNotMatchTerminalGrid;
+        const coverage = active_renderer.rowOverhangCoverageForTesting(row_index) orelse
+            return error.RowOverhangCoverageUnavailable;
+        if (coverage[0] > row_index or coverage[1] <= row_index or
+            coverage[2] > coverage[0] or coverage[3] < coverage[1])
+            return error.RowOverhangCoverageInvalid;
+        if (coverage[0] < row_index or coverage[1] > row_index + 1)
+            saw_vertical_overhang = true;
     }
+    if (!saw_vertical_overhang) return error.DirectWriteReportedNoVerticalOverhang;
 
     // Every same-grid WM_SIZE must update the presentation target immediately
     // while retaining the existing layouts and scene pixels.

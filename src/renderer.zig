@@ -219,6 +219,11 @@ pub const Renderer = struct {
         ) catch false;
     }
 
+    pub fn rowOverhangCoverageForTesting(self: *const Renderer, row: usize) ?[4]u16 {
+        const resources = &(self.gpu orelse return null);
+        return resources.rowOverhangCoverageForTesting(row);
+    }
+
     fn recreateGpu(
         self: *Renderer,
         width: u32,
