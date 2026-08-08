@@ -40,8 +40,9 @@ pub const Renderer = struct {
         surface_resize_trace: frame_trace.Stats,
         cursor_overlay_draws: u64,
         cursor_only_frames: u64,
-        direct_glyph_cells: u64,
-        direct_glyph_run_draws: u64,
+        rows_drawn_from_cached_layouts: u64,
+        cursor_redraws_from_cached_layouts: u64,
+        reflow_layout_builds: u64,
     };
 
     pub fn initialize(self: *Renderer, window: foundation.HWND) !void {
@@ -129,8 +130,9 @@ pub const Renderer = struct {
             .surface_resize_trace = .{},
             .cursor_overlay_draws = 0,
             .cursor_only_frames = 0,
-            .direct_glyph_cells = 0,
-            .direct_glyph_run_draws = 0,
+            .rows_drawn_from_cached_layouts = 0,
+            .cursor_redraws_from_cached_layouts = 0,
+            .reflow_layout_builds = 0,
         };
         const gpu_traces = if (self.gpu) |*resources| .{
             resources.paint_trace.snapshot(),
@@ -169,15 +171,16 @@ pub const Renderer = struct {
             .surface_resize_trace = gpu_traces[5],
             .cursor_overlay_draws = if (self.gpu) |resources| resources.cursor_overlay_draw_count else 0,
             .cursor_only_frames = if (self.gpu) |resources| resources.cursor_only_frame_count else 0,
-            .direct_glyph_cells = if (self.gpu) |resources| resources.direct_glyph_cell_count else 0,
-            .direct_glyph_run_draws = if (self.gpu) |resources| resources.direct_glyph_run_draw_count else 0,
+            .rows_drawn_from_cached_layouts = if (self.gpu) |resources| resources.cached_row_draw_count else 0,
+            .cursor_redraws_from_cached_layouts = if (self.gpu) |resources| resources.cached_cursor_redraw_count else 0,
+            .reflow_layout_builds = if (self.gpu) |resources| resources.reflow_layout_build_count else 0,
         };
     }
 
-    pub fn textPlanGenerationForTesting(self: *const Renderer, row: usize) ?u64 {
+    pub fn rowLayoutFingerprintForTesting(self: *const Renderer, row: usize) ?u64 {
         const resources = &(self.gpu orelse return null);
-        if (row >= resources.text_plans.items.len) return null;
-        return resources.text_plans.items[row].row_generation;
+        if (row >= resources.row_layout_fingerprints.items.len) return null;
+        return resources.row_layout_fingerprints.items[row];
     }
     pub fn invalidateGpuSceneForTesting(self: *Renderer) bool {
         const resources = &(self.gpu orelse return false);
@@ -185,10 +188,35 @@ pub const Renderer = struct {
         return true;
     }
 
-    pub fn simulateDeviceLossForTesting(self: *Renderer) bool {
+    pub fn simulateTargetLossForTesting(self: *Renderer) bool {
         const resources = &(self.gpu orelse return false);
-        resources.simulateDeviceLossForTesting();
+        resources.simulateTargetLossForTesting();
         return true;
+    }
+
+    pub fn nerdFontRightOverhangForTesting(
+        self: *Renderer,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) ?f32 {
+        const resources = &(self.gpu orelse return null);
+        return resources.nerdFontRightOverhangForTesting(metrics, dpi) catch null;
+    }
+
+    pub fn rowGraphemeStartsOnGridForTesting(
+        self: *Renderer,
+        cache: *const render_commands.RenderCache,
+        row: usize,
+        metrics: geometry.Metrics,
+        dpi: u32,
+    ) bool {
+        const resources = &(self.gpu orelse return false);
+        return resources.rowGraphemeStartsOnGridForTesting(
+            cache,
+            row,
+            metrics,
+            dpi,
+        ) catch false;
     }
 
     fn recreateGpu(

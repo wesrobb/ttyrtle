@@ -108,6 +108,8 @@ pub const RenderCache = struct {
     /// Positive means the terminal viewport scrolled downward by this many
     /// rows during the most recent full-damage update.
     scroll_down_rows: u16 = 0,
+    /// The most recent cache update committed new viewport or cell geometry.
+    settled_reflow: bool = false,
     dirty_row_count: if (counters_enabled) u64 else void,
     rebuilt_row_count: if (counters_enabled) u64 else void,
     rectangle_request_count: if (counters_enabled) u64 else void,
@@ -169,6 +171,7 @@ pub const RenderCache = struct {
         self.scroll_down_rows = 0;
 
         if (dimensions_changed or metrics_changed) {
+            self.settled_reflow = true;
             try self.rebuildAll(model, metrics);
             self.recordDirtyRows(self.rows.items.len);
             if (counters_enabled) self.full_rebuild_count +|= 1;
@@ -447,6 +450,12 @@ pub const RenderCache = struct {
             const moved = self.rows.orderedRemove(0);
             self.rows.appendAssumeCapacity(moved);
         }
+    }
+
+    /// Clear renderer-consumed state only after a frame was painted
+    /// successfully. Cache updates may occur between resize and WM_PAINT.
+    pub fn acknowledgeRendererPaint(self: *RenderCache) void {
+        self.settled_reflow = false;
     }
 
     fn rotateRowsDown(self: *RenderCache, count: usize) void {
@@ -984,6 +993,28 @@ test "cache resize drops stale rows and initializes new rows" {
     try std.testing.expectEqual(@as(usize, 5), cache.rows.items.len);
     for (cache.rows.items) |row|
         try std.testing.expectEqual(@as(usize, 12), row.cells.items.len);
+}
+
+test "settled reflow remains pending until renderer acknowledgement" {
+    var model: terminal.TerminalModel = undefined;
+    try model.init(std.testing.allocator, 2, 8);
+    defer model.deinit();
+    var cache = RenderCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const metrics: geometry.Metrics = .forDpi(96);
+    try cache.update(&model, metrics, model.damage());
+    cache.acknowledgeRendererPaint();
+    model.acknowledgeDamage();
+
+    try model.resize(3, 10, metrics.cell_width, metrics.cell_height);
+    try cache.update(&model, metrics, model.damage());
+    try std.testing.expect(cache.settled_reflow);
+    model.acknowledgeDamage();
+
+    _ = try cache.updateEffective(&model, metrics, model.damage());
+    try std.testing.expect(cache.settled_reflow);
+    cache.acknowledgeRendererPaint();
+    try std.testing.expect(!cache.settled_reflow);
 }
 
 fn expectGridMappedGraphemes(row: *const CachedRow) !void {

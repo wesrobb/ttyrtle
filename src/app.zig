@@ -4007,6 +4007,7 @@ fn paint(window: foundation.HWND) bool {
         queueRendererFailure(window, err);
         return false;
     };
+    if (rendered) render_cache.acknowledgeRendererPaint();
     if (rendered) if (windowStateFromHwnd(window)) |state| {
         if (state.oldest_pending_output_timestamp != 0) {
             state.output_to_present_trace.recordSince(state.oldest_pending_output_timestamp);
@@ -4241,11 +4242,11 @@ fn logDebugCounters() void {
     const renderer_counts = snapshot.renderer;
     std.log.info(
         "performance counters: batches={d} chunks={d} refreshes={d} core_resizes={d} " ++
-            "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} shaped_layout_cache_hits={d} shaped_layout_cache_evictions={d} " ++
+            "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} row_layout_cache_hits={d} row_layout_cache_evictions={d} " ++
             "rectangle_requests={d} rectangle_commands={d} " ++
             "frames_requested={d} frames_presented={d} " ++
             "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d} " ++
-            "direct_glyph_cells={d} direct_glyph_run_draws={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
+            "cached_row_layout_draws={d} cached_cursor_layout_redraws={d} reflow_layout_builds={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
         .{
             terminal_counts.output_batches,
             terminal_counts.chunks_parsed,
@@ -4269,8 +4270,9 @@ fn logDebugCounters() void {
             renderer_counts.surface_resize_count,
             renderer_counts.scene_recreation_count,
             renderer_counts.scene_redraw_count,
-            renderer_counts.direct_glyph_cells,
-            renderer_counts.direct_glyph_run_draws,
+            renderer_counts.rows_drawn_from_cached_layouts,
+            renderer_counts.cursor_redraws_from_cached_layouts,
+            renderer_counts.reflow_layout_builds,
             renderer_counts.cursor_overlay_draws,
             renderer_counts.cursor_only_frames,
             cache_counts.unchanged_dirty_rows_skipped,
@@ -4290,11 +4292,11 @@ fn logDebugCounters() void {
         writeTraceLine(
             trace_file,
             "performance counters: batches={d} chunks={d} refreshes={d} core_resizes={d} " ++
-                "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} shaped_layout_cache_hits={d} shaped_layout_cache_evictions={d} " ++
+                "dirty_rows={d} rebuilt_rows={d} scroll_reuses={d} scroll_reused_rows={d} full_rebuilds={d} layout_rebuilds={d} row_layout_cache_hits={d} row_layout_cache_evictions={d} " ++
                 "rectangle_requests={d} rectangle_commands={d} " ++
                 "frames_requested={d} frames_presented={d} " ++
                 "gpu_presents={d} device_recreations={d} resize_messages={d} surface_resizes={d} scene_recreations={d} scene_redraws={d} " ++
-                "direct_glyph_cells={d} direct_glyph_run_draws={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
+                "cached_row_layout_draws={d} cached_cursor_layout_redraws={d} reflow_layout_builds={d} cursor_overlays={d} cursor_only_frames={d} unchanged_rows_skipped={d}",
             .{
                 terminal_counts.output_batches,
                 terminal_counts.chunks_parsed,
@@ -4318,8 +4320,9 @@ fn logDebugCounters() void {
                 renderer_counts.surface_resize_count,
                 renderer_counts.scene_recreation_count,
                 renderer_counts.scene_redraw_count,
-                renderer_counts.direct_glyph_cells,
-                renderer_counts.direct_glyph_run_draws,
+                renderer_counts.rows_drawn_from_cached_layouts,
+                renderer_counts.cursor_redraws_from_cached_layouts,
+                renderer_counts.reflow_layout_builds,
                 renderer_counts.cursor_overlay_draws,
                 renderer_counts.cursor_only_frames,
                 cache_counts.unchanged_dirty_rows_skipped,
@@ -4496,6 +4499,46 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         clean.layout_build_count != initial.layout_build_count)
         return error.CleanPaintRebuiltLayouts;
 
+    // The bundled Powerline separator reaches the right edge of its cell and
+    // is followed by a blank. It must use the row layout path whose only
+    // normal clip is the viewport/row clip, not a layout- or cell-bound clip.
+    try model.write("\x1b[?25l\x1b[1;1H\xee\x82\xb2 ");
+    const before_nerd = active_renderer.diagnostics();
+    try paintForTesting(window);
+    const after_nerd = active_renderer.diagnostics();
+    if (after_nerd.layout_build_count > before_nerd.layout_build_count + 1 or
+        after_nerd.rows_drawn_from_cached_layouts <= before_nerd.rows_drawn_from_cached_layouts)
+        return error.NerdFontDidNotUseRowLayout;
+    const nerd_overhang = active_renderer.nerdFontRightOverhangForTesting(
+        terminal_metrics.*,
+        user32.GetDpiForWindow(window),
+    ) orelse return error.NerdFontOverhangProbeFailed;
+    // DirectWrite reports this bundled glyph's ink within one DIP of the cell
+    // boundary. A cell clip would visibly cut its antialiased right edge.
+    if (nerd_overhang <= -1.0) return error.NerdFontRightEdgeMissing;
+
+    // Every script keeps row-wide shaping while each grapheme is forced back
+    // onto its terminal-cell boundary by the final spacing pass.
+    try model.write(
+        "\x1b[1;1HASCII" ++
+            "\x1b[2;1Hoffice" ++
+            "\x1b[3;1He\xcc\x81" ++
+            "\x1b[4;1H\xe7\x95\x8c" ++
+            "\x1b[5;1H\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb" ++
+            "\x1b[6;1H\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85" ++
+            "\x1b[7;1H\xe0\xa4\x95\xe0\xa5\x8d\xe0\xa4\xb7" ++
+            "\x1b[8;1H\xee\x82\xb2",
+    );
+    try paintForTesting(window);
+    for (0..8) |row_index| {
+        if (!active_renderer.rowGraphemeStartsOnGridForTesting(
+            render_cache,
+            row_index,
+            terminal_metrics.*,
+            user32.GetDpiForWindow(window),
+        )) return error.GraphemeStartDidNotMatchTerminalGrid;
+    }
+
     // Every same-grid WM_SIZE must update the presentation target immediately
     // while retaining the existing layouts and scene pixels.
     var resize_outer: foundation.RECT = undefined;
@@ -4585,11 +4628,16 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         @intCast(crossed_surface.height),
     ) orelse return error.ResizeDimensionsUnavailable;
     _ = user32.SendMessageW(window, wm.WM_EXITSIZEMOVE, 0, 0);
+    try paintForTesting(window);
     const after_crossed = active_renderer.diagnostics();
     if (model.rows() != crossed_grid.rows or model.columns() != crossed_grid.columns)
         return error.LiveResizeDidNotSettle;
     if (after_crossed.scene_recreation_count > before_crossed.scene_recreation_count + 1)
         return error.LiveResizeRepeatedSceneAllocation;
+    const reflow_builds = after_crossed.reflow_layout_builds -
+        before_crossed.reflow_layout_builds;
+    if (reflow_builds == 0 or reflow_builds > model.rows())
+        return error.LiveResizeReflowDiagnosticsMismatch;
 
     model.startSelection(0, 0);
     const before_selection = active_renderer.diagnostics();
@@ -4606,8 +4654,8 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         after_selection.layout_build_count)
         return error.SelectionClearRebuiltLayout;
 
-    const clean_row_generation = active_renderer.textPlanGenerationForTesting(2) orelse
-        return error.RowLayoutGenerationUnavailable;
+    const clean_row_fingerprint = active_renderer.rowLayoutFingerprintForTesting(2) orelse
+        return error.RowLayoutFingerprintUnavailable;
     const chunks = [_][]const u8{
         "\x1b[2;1Hphase-",
         "six-batch",
@@ -4618,14 +4666,13 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     const after_batch = active_renderer.diagnostics();
     if (after_batch.gpu_present_count != before_batch.gpu_present_count + 1)
         return error.OutputBatchPresentedMoreThanOnce;
-    if (after_batch.layout_build_count != before_batch.layout_build_count)
+    if (after_batch.layout_build_count > before_batch.layout_build_count + 1)
         return error.DirtyRowLayoutRebuildWasNotProportional;
-    if (active_renderer.textPlanGenerationForTesting(2) != clean_row_generation)
-        return error.CleanRowLayoutGenerationChanged;
+    if (active_renderer.rowLayoutFingerprintForTesting(2) != clean_row_fingerprint)
+        return error.CleanRowLayoutFingerprintChanged;
 
-    // Warm a viewport made entirely of primary-font glyphs (including box
-    // drawing), then mutate one cell in every row for several frames. No
-    // DirectWrite layout should be constructed for these changes.
+    // ASCII and box drawing use the same row-wide shaping path. Mutating one
+    // cell in every row builds at most one new layout per changed row.
     var sequence_buffer: [64]u8 = undefined;
     try model.write("\x1b[?25l\x1b[2J");
     for (0..model.rows()) |row_index| {
@@ -4650,35 +4697,33 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         try paintForTesting(window);
     }
     const after_direct_mutations = active_renderer.diagnostics();
-    const expected_direct_runs = @as(u64, model.rows()) * 3;
     if (after_direct_mutations.gpu_present_count != before_direct_mutations.gpu_present_count + 3 or
-        after_direct_mutations.direct_glyph_cells <= before_direct_mutations.direct_glyph_cells or
-        after_direct_mutations.direct_glyph_run_draws !=
-            before_direct_mutations.direct_glyph_run_draws + expected_direct_runs or
-        after_direct_mutations.layout_build_count != before_direct_mutations.layout_build_count)
-        return error.DirectGlyphMutationBuiltLayout;
+        after_direct_mutations.layout_build_count >
+            before_direct_mutations.layout_build_count + @as(u64, model.rows()) * 3 or
+        after_direct_mutations.rows_drawn_from_cached_layouts <=
+            before_direct_mutations.rows_drawn_from_cached_layouts)
+        return error.RowLayoutMutationWasNotProportional;
     try model.write("\x1b[?25h");
 
-    // Identical combining spans in separate rows share one shaped cache key.
-    // Editing the neighboring direct glyph does not disturb that key; editing
-    // the complex span introduces exactly one new key.
-    try model.write("\x1b[1;1HAe\xcc\x81\x1b[2;1HBe\xcc\x81");
+    // Identical complete rows share one layout key. Editing either ordinary
+    // text or a combining sequence introduces exactly one new row key.
+    try model.write("\x1b[1;1HAe\xcc\x81\x1b[2;1HAe\xcc\x81");
     const before_mixed_warm = active_renderer.diagnostics();
     try paintForTesting(window);
     const after_mixed_warm = active_renderer.diagnostics();
     if (after_mixed_warm.layout_build_count != before_mixed_warm.layout_build_count + 1 or
         after_mixed_warm.layout_pool_hits <= before_mixed_warm.layout_pool_hits)
-        return error.IdenticalComplexSpansDidNotShareLayout;
+        return error.IdenticalRowsDidNotShareLayout;
     try model.write("\x1b[1;1HC");
     try paintForTesting(window);
     const after_direct_neighbor = active_renderer.diagnostics();
-    if (after_direct_neighbor.layout_build_count != after_mixed_warm.layout_build_count)
-        return error.DirectNeighborRebuiltComplexSpan;
+    if (after_direct_neighbor.layout_build_count != after_mixed_warm.layout_build_count + 1)
+        return error.RowTextMutationDidNotBuildOneLayout;
     try model.write("\x1b[1;2Ha\xcc\x81");
     try paintForTesting(window);
     if (active_renderer.diagnostics().layout_build_count !=
         after_direct_neighbor.layout_build_count + 1)
-        return error.ComplexMutationDidNotBuildOneLayout;
+        return error.CombiningMutationDidNotBuildOneLayout;
 
     for (0..3) |iteration| {
         _ = user32.SendMessageW(window, wm.WM_SIZE, wm.SIZE_MINIMIZED, 0);
@@ -4706,7 +4751,9 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
     if (after_invalidation.gpu_present_count !=
         before_invalidation.gpu_present_count + 1 or
         after_invalidation.layout_build_count !=
-            before_invalidation.layout_build_count)
+            before_invalidation.layout_build_count or
+        after_invalidation.reflow_layout_builds !=
+            before_invalidation.reflow_layout_builds)
         return error.FullInvalidationDiagnosticsMismatch;
 
     var suggested: foundation.RECT = undefined;
@@ -4774,14 +4821,17 @@ fn runPhase5Smoke(window: foundation.HWND) !void {
         return error.CursorFixtureRebuiltRetainedContent;
 
     const before_loss = active_renderer.diagnostics();
-    if (!active_renderer.simulateDeviceLossForTesting())
+    if (!active_renderer.simulateTargetLossForTesting())
         return error.GpuRendererUnavailable;
     try paintForTesting(window);
     const after_loss = active_renderer.diagnostics();
-    if (after_loss.gpu_recreation_count != before_loss.gpu_recreation_count + 1 or
+    if (after_loss.gpu_recreation_count != before_loss.gpu_recreation_count or
         after_loss.gpu_present_count != before_loss.gpu_present_count + 1 or
-        after_loss.scene_redraw_count == 0)
-        return error.DeviceLossRecoveryDiagnosticsMismatch;
+        after_loss.scene_recreation_count != before_loss.scene_recreation_count + 1 or
+        after_loss.layout_build_count != before_loss.layout_build_count or
+        after_loss.reflow_layout_builds != before_loss.reflow_layout_builds or
+        after_loss.layout_pool_hits <= before_loss.layout_pool_hits)
+        return error.TargetLossRecoveryDiagnosticsMismatch;
 }
 
 fn paintForTesting(window: foundation.HWND) !void {
