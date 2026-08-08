@@ -1122,4 +1122,8 @@ test "narrow then wide resize retains scrollback" {
     try model.resize(4, 20, 9, 18);
     try model.scrollViewportTop();
     try std.testing.expect(!model.viewportFollowsBottom());
+
+    var text: [32]u8 = undefined;
+    const length = try model.rowTextUtf8(0, &text);
+    try std.testing.expectEqualStrings("line-000", text[0..length]);
 }

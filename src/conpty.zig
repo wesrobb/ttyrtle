@@ -21,6 +21,25 @@ pub const output_message = win32.ui.windows_and_messaging.WM_APP + 1;
 pub const child_exit_message = win32.ui.windows_and_messaging.WM_APP + 2;
 pub const input_failure_message = win32.ui.windows_and_messaging.WM_APP + 3;
 
+const HResult = @typeInfo(@TypeOf(kernel32.CreatePseudoConsole)).@"fn".return_type.?;
+
+extern "conpty" fn ConptyCreatePseudoConsole(
+    size: console.COORD,
+    input: ?foundation.HANDLE,
+    output: ?foundation.HANDLE,
+    flags: u32,
+    pseudo_console: ?*?console.HPCON,
+) callconv(.winapi) HResult;
+
+extern "conpty" fn ConptyResizePseudoConsole(
+    pseudo_console: ?console.HPCON,
+    size: console.COORD,
+) callconv(.winapi) HResult;
+
+extern "conpty" fn ConptyClosePseudoConsole(
+    pseudo_console: ?console.HPCON,
+) callconv(.winapi) void;
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     /// Application-lifetime message-only receiver. This is never the owning
@@ -73,7 +92,7 @@ pub const Session = struct {
         errdefer closeHandle(&output_read);
         errdefer closeHandle(&output_write);
 
-        const create_result = kernel32.CreatePseudoConsole(
+        const create_result = ConptyCreatePseudoConsole(
             .{
                 .X = @intCast(dimensions.columns),
                 .Y = @intCast(dimensions.rows),
@@ -332,7 +351,7 @@ pub const Session = struct {
         if (std.meta.eql(self.dimensions, dimensions)) return false;
         const pseudo_console = self.pseudo_console orelse
             return error.SessionClosing;
-        const result = kernel32.ResizePseudoConsole(pseudo_console, .{
+        const result = ConptyResizePseudoConsole(pseudo_console, .{
             .X = @intCast(dimensions.columns),
             .Y = @intCast(dimensions.rows),
         });
@@ -532,7 +551,7 @@ fn closePseudoConsoleMain(pseudo_console: console.HPCON) void {
 }
 
 fn closePseudoConsoleValue(pseudo_console: console.HPCON) void {
-    kernel32.ClosePseudoConsole(pseudo_console);
+    ConptyClosePseudoConsole(pseudo_console);
 }
 
 fn defaultShellCommandLine(allocator: std.mem.Allocator) ![]u8 {
@@ -548,7 +567,7 @@ fn closeHandle(handle: *?foundation.HANDLE) void {
 
 fn closePseudoConsole(handle: *?console.HPCON) void {
     if (handle.*) |value| {
-        kernel32.ClosePseudoConsole(value);
+        ConptyClosePseudoConsole(value);
         handle.* = null;
     }
 }

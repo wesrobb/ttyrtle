@@ -56,6 +56,10 @@ test "hosted ConPTY child observes an exact window resize" {
     try app.run(.integration_resize);
 }
 
+test "repeated ConPTY resize preserves terminal scrollback content" {
+    try app.run(.integration_resize_history);
+}
+
 test "inactive ConPTY sessions retain output, OSC tab labels, and asynchronous completion" {
     try app.run(.integration_multi_session);
 }

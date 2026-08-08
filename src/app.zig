@@ -60,6 +60,7 @@ pub const Mode = enum {
     integration,
     integration_input,
     integration_resize,
+    integration_resize_history,
     integration_multi_session,
     integration_multi_resize,
     integration_host_close,
@@ -125,6 +126,9 @@ const integration_input_command =
     "\"set /p value=& echo " ++ integration_input_marker ++ " >CON\"";
 const integration_resize_ready = "CONPTY_STEP_3_RESIZE_READY";
 const integration_resize_marker = "CONPTY_STEP_3_RESIZE_OK";
+const integration_resize_history_ready = "CONPTY_RESIZE_HISTORY_READY";
+const integration_resize_history_marker = "CONPTY_RESIZE_HISTORY_OK";
+const integration_resize_history_line_count = 500;
 const integration_host_close_command =
     "cmd.exe /d /q /c " ++
     "\"for /L %i in (1,1,200) do @echo shutdown-output-%i >CON " ++
@@ -532,17 +536,32 @@ pub fn run(mode: Mode) !void {
 
     var integration_resize_command: ?[]u8 = null;
     defer if (integration_resize_command) |command| allocator.free(command);
-    if (mode == .integration_resize) {
+    if (mode == .integration_resize or mode == .integration_resize_history) {
         application.integration_resize_target = .{
             .columns = state.model().?.columns() +| 7,
             .rows = state.model().?.rows() +| 3,
         };
         integration_resize_target = application.integration_resize_target;
+    }
+    if (mode == .integration_resize or mode == .integration_resize_history) {
+        const ready = if (mode == .integration_resize_history)
+            integration_resize_history_ready
+        else
+            integration_resize_ready;
+        const marker = if (mode == .integration_resize_history)
+            integration_resize_history_marker
+        else
+            integration_resize_marker;
+        const history = if (mode == .integration_resize_history)
+            "& cmd.exe /d /q /c \"for /L %i in (0,1,499) do @echo CONPTY_HISTORY_%i > CON\"; "
+        else
+            "";
         const script = try std.fmt.allocPrint(
             allocator,
             "$ProgressPreference = 'SilentlyContinue'; " ++
-                "& cmd.exe /d /q /c \"echo " ++ integration_resize_ready ++
-                " > CON\"; $deadline = [DateTime]::UtcNow.AddSeconds(10); " ++
+                "{s}" ++
+                "& cmd.exe /d /q /c \"echo {s} > CON\"; " ++
+                "$deadline = [DateTime]::UtcNow.AddSeconds(10); " ++
                 "$columns = '(?<!\\d){d}(?!\\d)'; " ++
                 "$rows = '(?<!\\d){d}(?!\\d)'; $matched = $false; " ++
                 "do {{ $status = (& mode.com con | Out-String); " ++
@@ -550,12 +569,15 @@ pub fn run(mode: Mode) !void {
                 "{{ $matched = $true; break }}; Start-Sleep -Milliseconds 25 }} " ++
                 "while ([DateTime]::UtcNow -lt $deadline); " ++
                 "if ($matched) " ++
-                "{{ & cmd.exe /d /q /c \"echo " ++ integration_resize_marker ++
-                " > CON\" }} else {{ & cmd.exe /d /q /c " ++
+                "{{ & cmd.exe /d /q /c \"echo {s} > CON\" }} " ++
+                "else {{ & cmd.exe /d /q /c " ++
                 "\"echo CONPTY_STEP_3_RESIZE_MISMATCH > CON\"; exit 1 }}",
             .{
+                history,
+                ready,
                 application.integration_resize_target.columns,
                 application.integration_resize_target.rows,
+                marker,
             },
         );
         defer allocator.free(script);
@@ -571,7 +593,7 @@ pub fn run(mode: Mode) !void {
             switch (mode) {
                 .integration => integration_command,
                 .integration_input => integration_input_command,
-                .integration_resize => integration_resize_command.?,
+                .integration_resize, .integration_resize_history => integration_resize_command.?,
                 .integration_multi_session, .integration_multi_resize => integration_multi_first_command,
                 .integration_host_close, .integration_final_retirement => integration_host_close_command,
                 else => null,
@@ -4144,12 +4166,27 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
         applyTerminalEffectsForSession(window, session);
     }
 
-    if (workspace_state.activeSession() == session and active_mode == .integration_resize and
+    if (workspace_state.activeSession() == session and
+        (active_mode == .integration_resize or active_mode == .integration_resize_history) and
         !integration_resize_requested and
-        terminalContains(integration_resize_ready))
+        terminalContains(if (active_mode == .integration_resize_history)
+            integration_resize_history_ready
+        else
+            integration_resize_ready))
     {
         integration_resize_requested = true;
-        requestIntegrationResize(window) catch {
+        if (active_mode == .integration_resize_history and
+            !(integrationResizeHistoryIsOrdered() catch false))
+        {
+            std.log.err("ConPTY history was corrupt before the resize fixture", .{});
+            beginWindowClose(window);
+            return;
+        }
+        const resize_result = if (active_mode == .integration_resize_history)
+            requestRepeatedIntegrationResize(window)
+        else
+            requestIntegrationResize(window);
+        resize_result catch {
             std.log.err("failed to request integration resize", .{});
             beginWindowClose(window);
             return;
@@ -4187,10 +4224,14 @@ fn handleConptyOutput(window: foundation.HWND, session_id: workspace.SessionId) 
         const marker = switch (active_mode) {
             .integration_input => integration_input_marker,
             .integration_resize => integration_resize_marker,
+            .integration_resize_history => integration_resize_history_marker,
             else => integration_marker,
         };
         integration_succeeded = batch.failure == null and
             terminalContains(marker);
+        if (integration_succeeded and active_mode == .integration_resize_history) {
+            integration_succeeded = integrationResizeHistoryIsOrdered() catch false;
+        }
         beginWindowClose(window);
     } else if (batch.finished) {
         if (session.noteOutputFinished())
@@ -4869,6 +4910,7 @@ fn isIntegrationMode(mode: Mode) bool {
         .integration,
         .integration_input,
         .integration_resize,
+        .integration_resize_history,
         .integration_multi_session,
         .integration_multi_resize,
         => true,
@@ -4963,6 +5005,39 @@ fn expectAllSessionDimensions(window: foundation.HWND) !void {
 }
 
 fn requestIntegrationResize(window: foundation.HWND) !void {
+    try setIntegrationWindowDimensions(window, integration_resize_target);
+
+    if (model.columns() != integration_resize_target.columns or
+        model.rows() != integration_resize_target.rows)
+        return error.ResizeDimensionsMismatch;
+}
+
+fn requestRepeatedIntegrationResize(window: foundation.HWND) !void {
+    const original: geometry.Dimensions = .{
+        .columns = model.columns(),
+        .rows = model.rows(),
+    };
+    for (0..6) |_| {
+        try setIntegrationWindowDimensions(window, .{
+            .columns = original.columns -| 9,
+            .rows = original.rows +| 5,
+        });
+        try setIntegrationWindowDimensions(window, .{
+            .columns = original.columns +| 13,
+            .rows = @max(original.rows -| 3, 1),
+        });
+    }
+    try setIntegrationWindowDimensions(window, integration_resize_target);
+
+    if (model.columns() != integration_resize_target.columns or
+        model.rows() != integration_resize_target.rows)
+        return error.ResizeDimensionsMismatch;
+}
+
+fn setIntegrationWindowDimensions(
+    window: foundation.HWND,
+    dimensions: geometry.Dimensions,
+) !void {
     var client: foundation.RECT = undefined;
     if (user32.GetClientRect(window, &client) == 0)
         return error.GetClientRectFailed;
@@ -4975,11 +5050,11 @@ fn requestIntegrationResize(window: foundation.HWND) !void {
     const outer_width = outer.right - outer.left;
     const outer_height = outer.bottom - outer.top;
     const desired_client_width: i32 = @intCast(
-        @as(u32, integration_resize_target.columns) * terminal_metrics.cell_width +
+        @as(u32, dimensions.columns) * terminal_metrics.cell_width +
             terminal_metrics.margin_x * 2,
     );
     const desired_client_height: i32 = @intCast(
-        @as(u32, integration_resize_target.rows) * terminal_metrics.cell_height +
+        @as(u32, dimensions.rows) * terminal_metrics.cell_height +
             terminal_metrics.margin_y * 2,
     );
 
@@ -4992,10 +5067,6 @@ fn requestIntegrationResize(window: foundation.HWND) !void {
         outer_height + desired_client_height - client_height,
         .{ .NOMOVE = 1, .NOZORDER = 1, .NOACTIVATE = 1 },
     ) == 0) return error.SetWindowPosFailed;
-
-    if (model.columns() != integration_resize_target.columns or
-        model.rows() != integration_resize_target.rows)
-        return error.ResizeDimensionsMismatch;
 }
 
 fn encodedPowerShellCommand(
@@ -5018,6 +5089,65 @@ fn encodedPowerShellCommand(
 
 fn terminalContains(needle: []const u8) bool {
     return terminalContainsForSession(workspace_state.activeSession() orelse return false, needle);
+}
+
+fn integrationResizeHistoryIsOrdered() !bool {
+    try model.scrollViewportTop();
+    defer model.scrollViewportBottom() catch {};
+    if (model.viewportFollowsBottom()) return false;
+
+    var expected: usize = 0;
+    var first_row: ?usize = null;
+    for (0..model.rows()) |row| {
+        if (try historyRowEquals(row, expected)) {
+            first_row = row;
+            break;
+        }
+    }
+    var row = first_row orelse return false;
+    while (row < model.rows() and expected < integration_resize_history_line_count) : (row += 1) {
+        if (!try historyRowEquals(row, expected)) {
+            logHistoryRowMismatch(row, expected);
+            return false;
+        }
+        expected += 1;
+    }
+
+    while (expected < integration_resize_history_line_count) {
+        try model.scrollViewport(1);
+        const last_row = model.rows() - 1;
+        if (!try historyRowEquals(last_row, expected)) {
+            logHistoryRowMismatch(last_row, expected);
+            return false;
+        }
+        expected += 1;
+    }
+    return true;
+}
+
+fn logHistoryRowMismatch(row: usize, expected: usize) void {
+    var actual: [64]u8 = undefined;
+    const length = model.rowTextUtf8(row, &actual) catch 0;
+    std.log.err(
+        "ConPTY resize history mismatch: expected line {d} at viewport row {d}, found {s}",
+        .{ expected, row, actual[0..length] },
+    );
+}
+
+fn historyRowEquals(row: usize, expected: usize) !bool {
+    var expected_text: [32]u8 = undefined;
+    const formatted = try std.fmt.bufPrint(
+        &expected_text,
+        "CONPTY_HISTORY_{d}",
+        .{expected},
+    );
+    var actual: [64]u8 = undefined;
+    const length = try model.rowTextUtf8(row, &actual);
+    return std.mem.eql(
+        u8,
+        formatted,
+        std.mem.trimEnd(u8, actual[0..length], " "),
+    );
 }
 
 fn terminalContainsForSession(session: *workspace.TerminalSession, needle: []const u8) bool {

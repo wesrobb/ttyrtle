@@ -18,8 +18,10 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
     installBundledFonts(b, exe);
+    installBundledConpty(b, exe);
 
     const run = b.addRunArtifact(exe);
+    addConptyRuntimePath(b, run);
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the terminal").dependOn(&run.step);
@@ -36,6 +38,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    addConptyRuntimePath(b, run_unit_tests);
     const test_step = b.step("test", "Run fast unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
@@ -53,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
     const run_app_tests = b.addRunArtifact(app_tests);
+    addConptyRuntimePath(b, run_app_tests);
     test_step.dependOn(&run_app_tests.step);
     const integration_root = b.createModule(.{
         .root_source_file = b.path("test/integration.zig"),
@@ -76,6 +80,7 @@ pub fn build(b: *std.Build) void {
         "run integration-tests",
     );
     run_integration_tests.addArtifactArg(integration_tests);
+    addConptyRuntimePath(b, run_integration_tests);
     run_integration_tests.stdio = .inherit;
     const integration_step = b.step(
         "test-integration",
@@ -92,6 +97,7 @@ pub fn build(b: *std.Build) void {
     });
     installBundledFonts(b, smoke_exe);
     const run_smoke = b.addRunArtifact(smoke_exe);
+    addConptyRuntimePath(b, run_smoke);
     const smoke_step = b.step(
         "smoke",
         "Create, paint, and close a hidden terminal window",
@@ -141,6 +147,31 @@ fn installBundledFonts(b: *std.Build, exe: *std.Build.Step.Compile) void {
         "assets/fonts/LICENSE_OFL.txt",
     );
     exe.step.dependOn(&install_license.step);
+}
+
+fn installBundledConpty(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    const install_dll = b.addInstallFileWithDir(
+        b.path("assets/conpty/conpty.dll"),
+        .bin,
+        "conpty.dll",
+    );
+    exe.step.dependOn(&install_dll.step);
+    const install_host = b.addInstallFileWithDir(
+        b.path("assets/conpty/x64/OpenConsole.exe"),
+        .bin,
+        "x64/OpenConsole.exe",
+    );
+    exe.step.dependOn(&install_host.step);
+    const install_license = b.addInstallFileWithDir(
+        b.path("assets/conpty/LICENSE.txt"),
+        .bin,
+        "assets/conpty/LICENSE.txt",
+    );
+    exe.step.dependOn(&install_license.step);
+}
+
+fn addConptyRuntimePath(b: *std.Build, run: *std.Build.Step.Run) void {
+    run.addPathDir(b.pathFromRoot("assets/conpty"));
 }
 
 const ExecutableOptions = struct {
@@ -214,6 +245,8 @@ fn createModule(
     if (options.include_win32) {
         const win32 = b.dependency("win32", .{});
         module.addImport("win32", win32.module("win32"));
+        module.addLibraryPath(b.path("assets/conpty"));
+        module.linkSystemLibrary("conpty", .{ .use_pkg_config = .no });
     }
 
     return module;
